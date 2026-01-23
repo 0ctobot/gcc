@@ -447,7 +447,7 @@ private:
   void record_allocation_failure (T);
 
   allocno_group_info *create_allocno_group (unsigned int, unsigned int);
-  allocno_subgroup get_allocno_subgroup (rtx);
+  allocno_subgroup get_allocno_subgroup (rtx, bool = false);
   void record_fpr_use (unsigned int);
   void record_fpr_def (unsigned int);
   void record_allocno_use (allocno_info *);
@@ -1430,14 +1430,18 @@ early_ra::create_allocno_group (unsigned int regno, unsigned int size)
 // If REG refers to a pseudo register that might be allocated to FPRs,
 // return the associated range of allocnos, creating new ones if necessary.
 // Return an empty range otherwise.
+// If DEBUG_INSN is true, then for subreg just return the subgroup
+// of the REG without adjustments.
 early_ra::allocno_subgroup
-early_ra::get_allocno_subgroup (rtx reg)
+early_ra::get_allocno_subgroup (rtx reg, bool debug_insn)
 {
   if (GET_CODE (reg) == SUBREG)
     {
       allocno_subgroup inner = get_allocno_subgroup (SUBREG_REG (reg));
       if (!inner)
 	return {};
+      if (debug_insn)
+	return inner;
 
       if (!targetm.can_change_mode_class (GET_MODE (SUBREG_REG (reg)),
 					  GET_MODE (reg), FP_REGS))
@@ -1463,7 +1467,11 @@ early_ra::get_allocno_subgroup (rtx reg)
       subreg_info info;
       subreg_get_info (V0_REGNUM, GET_MODE (SUBREG_REG (reg)),
 		       SUBREG_BYTE (reg), GET_MODE (reg), &info);
-      if (!info.representable_p)
+      // A paradoxical subreg needs FPRs outside the group: on big-endian it
+      // starts before the group and on little-endian it extends past the end.
+      if (!info.representable_p
+	  || info.offset < 0
+	  || info.offset + info.nregs > (int) inner.count)
 	{
 	  record_live_range_failure ([&](){
 	    fprintf (dump_file, "subreg of r%d is invalid for V0",
@@ -2084,6 +2092,7 @@ void
 early_ra::record_insn_defs (rtx_insn *insn)
 {
   df_ref ref;
+  gcc_checking_assert (!DEBUG_INSN_P (insn));
 
   FOR_EACH_INSN_DEF (ref, insn)
     if (IN_RANGE (DF_REF_REGNO (ref), V0_REGNUM, V31_REGNUM))
@@ -2134,6 +2143,7 @@ void
 early_ra::record_insn_uses (rtx_insn *insn)
 {
   df_ref ref;
+  gcc_checking_assert (!DEBUG_INSN_P (insn));
 
   FOR_EACH_INSN_USE (ref, insn)
     if (IN_RANGE (DF_REF_REGNO (ref), V0_REGNUM, V31_REGNUM))
@@ -3240,7 +3250,7 @@ early_ra::replace_regs (rtx_insn *insn, df_ref refs)
   bool changed = false;
   for (df_ref ref = refs; ref; ref = DF_REF_NEXT_LOC (ref))
     {
-      auto range = get_allocno_subgroup (DF_REF_REG (ref));
+      auto range = get_allocno_subgroup (DF_REF_REG (ref), DEBUG_INSN_P (insn));
       if (!range)
 	continue;
 
@@ -3253,7 +3263,23 @@ early_ra::replace_regs (rtx_insn *insn, df_ref refs)
 	  INSN_VAR_LOCATION_LOC (insn) = gen_rtx_UNKNOWN_VAR_LOC ();
 	  return true;
 	}
-      *DF_REF_LOC (ref) = gen_rtx_REG (GET_MODE (DF_REF_REG (ref)), new_regno);
+      rtx x = DF_REF_REG (ref);
+      rtx new_rtx;
+      if (DEBUG_INSN_P (insn) && SUBREG_P (x))
+	{
+	  // Any subreg is valid in a debug insn, including one that refers to
+	  // FPRs outside the group.  Apply it to the register that the inner
+	  // pseudo got, falling back to an explicit subreg when the result
+	  // doesn't correspond to a valid hard register.
+	  rtx inner = gen_rtx_REG (GET_MODE (SUBREG_REG (x)), new_regno);
+	  new_rtx = simplify_gen_subreg (GET_MODE (x), inner, GET_MODE (inner),
+					 SUBREG_BYTE (x));
+	  if (!new_rtx)
+	    new_rtx = gen_rtx_raw_SUBREG (GET_MODE (x), inner, SUBREG_BYTE (x));
+	}
+      else
+	new_rtx = gen_rtx_REG (GET_MODE (x), new_regno);
+      *DF_REF_LOC (ref) = new_rtx;
       changed = true;
     }
   return changed;
