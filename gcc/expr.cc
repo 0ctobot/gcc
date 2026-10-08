@@ -12395,8 +12395,9 @@ expand_expr_real_1 (tree exp, rtx target, machine_mode tmode,
 			 || (mode == BLKmode
 			     && !int_mode_for_size (bitsize, 1).exists ());
 
+	/* A volatile access must read the object itself.  */
 	const enum expand_modifier tem_modifier
-	  = must_force_mem
+	  = must_force_mem || volatilep
 	    ? EXPAND_MEMORY
 	    : modifier == EXPAND_SUM ? EXPAND_NORMAL : modifier;
 
