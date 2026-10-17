@@ -3221,6 +3221,20 @@ is_self_write (im_mem_ref *load_ref, im_mem_ref *store_ref)
      https://gcc.gnu.org/pipermail/gcc-patches/2025-December/704155.html
      For more context on TODOs above.  */
 
+  /* Use access alignment to rule out partial overlaps.  */
+  HOST_WIDE_INT size;
+  if (!(load_ref->mem.max_size_known_p ()
+	&& store_ref->mem.max_size_known_p ()
+	&& known_eq (load_ref->mem.max_size, load_ref->mem.size)
+	&& known_eq (store_ref->mem.max_size, store_ref->mem.size))
+      && (!load_ref->mem.size.is_constant (&size)
+	  || size <= 0
+	  || (unsigned HOST_WIDE_INT) size
+	       > get_object_alignment (gimple_assign_rhs1 (load_stmt))
+	  || (unsigned HOST_WIDE_INT) size
+	       > get_object_alignment (gimple_assign_lhs (store_stmt))))
+    return false;
+
   /* They may alias.  Verify exact same location.  */
   return (operand_equal_p (load_ref->mem.base, store_ref->mem.base, 0)
 	  && known_eq (load_ref->mem.size, store_ref->mem.size)
