@@ -2514,6 +2514,35 @@ count_auto_inc (rtx, rtx, rtx, rtx, rtx, void *arg)
   return 0;
 }
 
+/* Return true if insn pattern X reads volatile memory.  */
+
+static bool
+volatile_reads_p (rtx x)
+{
+  /* Only a MEM that is itself the destination of a SET or CLOBBER is not
+     read.  Its address still is, and so is a MEM under a ZERO_EXTRACT
+     destination, since a bit-field store keeps the rest of the word.  An
+     asm template may access its operands in any order, though, so there a
+     store counts too.  */
+  bool is_asm = asm_noperands (x) >= 0;
+  int n = GET_CODE (x) == PARALLEL ? XVECLEN (x, 0) : 1;
+  subrtx_iterator::array_type array;
+  FOR_EACH_SUBRTX (iter, array, x, NONCONST)
+    if (MEM_P (*iter) && MEM_VOLATILE_P (*iter))
+      {
+	bool stored = false;
+	for (int i = 0; i < n && !is_asm && !stored; i++)
+	  {
+	    rtx elt = GET_CODE (x) == PARALLEL ? XVECEXP (x, 0, i) : x;
+	    stored = ((GET_CODE (elt) == SET || GET_CODE (elt) == CLOBBER)
+		      && SET_DEST (elt) == *iter);
+	  }
+	if (!stored)
+	  return true;
+      }
+  return false;
+}
+
 /* Try to combine the insns I0, I1 and I2 into I3.
    Here I0, I1 and I2 appear earlier than I3.
    I0 and I1 can be zero; then we combine just I2 into I3, or I1 and I2 into
@@ -2709,6 +2738,25 @@ try_combine (rtx_insn *i3, rtx_insn *i2, rtx_insn *i1, rtx_insn *i0,
     std::swap (i0, i1);
   if (i1 && DF_INSN_LUID (i1) > DF_INSN_LUID (i2))
     std::swap (i1, i2);
+
+  /* Refuse to combine insns of which more than one reads volatile memory.
+     Their reads would end up in one insn, which gives them no order, or
+     be split back into two insns in an order nothing guarantees: combine
+     may reassociate (a + x) + y into (a + y) + x and put y first.  */
+  {
+    rtx_insn *insns[4] = { i0, i1, i2, i3 };
+    int n_vol_insns = 0;
+    for (int k = 0; k < 4; k++)
+      if (insns[k] && volatile_reads_p (PATTERN (insns[k])))
+	n_vol_insns++;
+    if (n_vol_insns > 1)
+      {
+	if (dump_file && (dump_flags & TDF_DETAILS))
+	  fprintf (dump_file, "Can't combine insns that each read volatile "
+		   "memory\n");
+	return 0;
+      }
+  }
 
   added_links_insn = 0;
   added_notes_insn = 0;
