@@ -13,7 +13,8 @@
 **...
 **	barrier
 **...
-**	addl	bar(|\(%rip\)), %eax
+**	movl	bar(|\(%rip\)), %[a-z0-9]+
+**	addl	%[a-z0-9]+, %eax
 **	subl	bar(|\(%rip\)), %eax
 **	ret
 **	.cfi_endproc
@@ -28,7 +29,8 @@
 *D...
 *D	barrier
 *D...
-*D	addl	\(%rdx\), %eax
+*D	movl	\(%rdx\), %[a-z0-9]+
+*D	addl	%[a-z0-9]+, %eax
 *D	subl	\(%rdx\), %eax
 *D	ret
 *D...
