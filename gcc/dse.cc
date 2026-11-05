@@ -2288,17 +2288,9 @@ check_mem_read_rtx (rtx *loc, bb_info_t bb_info, bool used_in_call = false)
 	  while (!store_info->is_set)
 	    store_info = store_info->next;
 
-	  /* There are three cases here.  */
-	  if (store_info->group_id < 0)
-	    /* We have a cselib store followed by a read from a
-	       const base. */
-	    remove
-	      = canon_true_dependence (store_info->mem,
-				       GET_MODE (store_info->mem),
-				       store_info->mem_addr,
-				       mem, mem_addr);
-
-	  else if (group_id == store_info->group_id)
+	  /* There are two cases here: either the bases have the same group,
+	     or they have different groups (including cselib bases).  */
+	  if (group_id == store_info->group_id)
 	    {
 	      /* This is a block mode load.  We may get lucky and
 		 canon_true_dependence may save the day.  */
@@ -2332,11 +2324,15 @@ check_mem_read_rtx (rtx *loc, bb_info_t bb_info, bool used_in_call = false)
 		    remove = true;
 		}
 	    }
-
-	  /* else
-	     The else case that is missing here is that the
-	     bases are constant but different.  There is nothing
-	     to do here because there is no overlap.  */
+	  else
+	    /* The bases are different, or we have a cselib store followed
+	       by a read from a const base.  Different bases can still overlap
+	       if they alias or if cselib values conflict.  */
+	    remove
+	      = canon_true_dependence (store_info->mem,
+				       GET_MODE (store_info->mem),
+				       store_info->mem_addr,
+				       mem, mem_addr);
 
 	  if (remove)
 	    {
@@ -3149,17 +3145,12 @@ scan_reads (insn_info_t insn_info, bitmap gen, bitmap kill)
 		}
 	      else
 		{
-		  /* The groups are different, if the alias sets
-		     conflict, clear the entire group.  We only need
-		     to apply this test if the read_info is a cselib
-		     read.  Anything with a constant base cannot alias
-		     something else with a different constant
-		     base.  */
-		  if ((read_info->group_id < 0)
-		      && canon_true_dependence (group->base_mem,
-						GET_MODE (group->base_mem),
-						group->canon_base_addr,
-						read_info->mem, NULL_RTX))
+		  /* The groups are different; if the references conflict,
+		     clear the entire group.  */
+		  if (canon_true_dependence (group->base_mem,
+					     GET_MODE (group->base_mem),
+					     group->canon_base_addr,
+					     read_info->mem, NULL_RTX))
 		    {
 		      if (kill)
 			bitmap_ior_into (kill, group->group_kill);
