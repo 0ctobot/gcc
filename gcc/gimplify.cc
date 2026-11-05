@@ -125,6 +125,10 @@ tree_associate_condition_with_expr (tree stmt, unsigned uid)
 /* Hash set of poisoned variables in a bind expr.  */
 static hash_set<tree> *asan_poisoned_variables = NULL;
 
+/* Hash set of compound literal decls whose DECL_EXPR was already gimplified
+   in the current function.  */
+static hash_set<tree> *gimplified_compound_literals = NULL;
+
 /* Hash set of already-resolved calls to OpenMP "declare variant"
    functions.  A call can resolve to the original function and
    we don't want to repeat the resolution multiple times.  */
@@ -6542,18 +6546,35 @@ gimplify_compound_literal_expr (tree *expr_p, gimple_seq *pre_p,
      after we gimplify the initialization expression.  */
   if (TREE_ADDRESSABLE (*expr_p))
     TREE_ADDRESSABLE (decl) = 1;
-  /* Otherwise, if we don't need an lvalue and have a literal directly
+
+  /* The front end reuses one literal for both the read and the write when it
+     lowers a compound assignment or a bool increment or decrement, and to find
+     the count of a counted_by member, so we can get here twice for one
+     evaluation of the literal.  The decl already holds the value by the second
+     time, and its initializer is gone, which would make gimplify_decl_expr
+     treat it as an uninitialized declaration and put the
+     -ftrivial-auto-var-init initialization over the value.  Using the decl as
+     is can't skip the initialization on a later iteration of a loop, since each
+     iteration runs the initialization emitted the first time around.  */
+  if (gimplified_compound_literals
+      && gimplified_compound_literals->contains (decl))
+    {
+      *expr_p = decl;
+      return GS_OK;
+    }
+
+  /* If we don't need an lvalue and have a literal directly
      substitute it.  Check if it matches the gimple predicate, as
      otherwise we'd generate a new temporary, and we can as well just
      use the decl we already have.  A literal with static or thread storage
      duration is one object that keeps its value between evaluations, so its
      initializer can only stand in for it when the object is const.  */
-  else if (!TREE_ADDRESSABLE (decl)
-	   && !TREE_THIS_VOLATILE (decl)
-	   && init
-	   && (fallback & fb_lvalue) == 0
-	   && (!TREE_STATIC (decl) || TREE_READONLY (decl))
-	   && gimple_test_f (init))
+  if (!TREE_ADDRESSABLE (decl)
+      && !TREE_THIS_VOLATILE (decl)
+      && init
+      && (fallback & fb_lvalue) == 0
+      && (!TREE_STATIC (decl) || TREE_READONLY (decl))
+      && gimple_test_f (init))
     {
       *expr_p = init;
       return GS_OK;
@@ -6577,6 +6598,8 @@ gimplify_compound_literal_expr (tree *expr_p, gimple_seq *pre_p,
     gimple_add_tmp_var (decl);
 
   gimplify_and_add (decl_s, pre_p);
+  if (gimplified_compound_literals)
+    gimplified_compound_literals->add (decl);
   *expr_p = decl;
   return GS_OK;
 }
@@ -22493,9 +22516,12 @@ gimplify_function_tree (tree fndecl)
     asan_poisoned_variables = new hash_set<tree> ();
   if (flag_openmp)
     omp_resolved_variant_calls = new hash_set<tree> ();
+  gimplified_compound_literals = new hash_set<tree> ();
 
   bind = gimplify_body (fndecl, true);
 
+  delete gimplified_compound_literals;
+  gimplified_compound_literals = NULL;
   if (omp_resolved_variant_calls)
     {
       delete omp_resolved_variant_calls;
