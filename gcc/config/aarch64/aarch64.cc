@@ -30955,6 +30955,10 @@ aarch64_ldpstp_operand_mode_p (machine_mode mode)
 bool
 aarch64_mergeable_load_pair_p (machine_mode mode, rtx mem1, rtx mem2)
 {
+  /* A volatile read must remain one access of its own size.  */
+  if (MEM_VOLATILE_P (mem1) || MEM_VOLATILE_P (mem2))
+    return false;
+
   if (STRICT_ALIGNMENT && MEM_ALIGN (mem1) < GET_MODE_ALIGNMENT (mode))
     return false;
   return aarch64_check_consecutive_mems (&mem1, &mem2, nullptr);
