@@ -895,6 +895,22 @@ create_access_1 (tree base, HOST_WIDE_INT offset, HOST_WIDE_INT size)
 
 static bool maybe_add_sra_candidate (tree);
 
+/* Return true if objects of TYPE have to stay in memory, which is the case for
+   large and huge _BitInt once _BitInt lowering has run.  A replacement of such
+   a type would be renamed into SSA form, and then the next update of the
+   address-taken bits would mark its variable as not being a GIMPLE register
+   (see maybe_optimize_var) while its SSA names are still live.  Expansion would
+   then give the variable and its SSA names separate stack slots.  */
+
+static bool
+bitint_stays_in_memory_p (tree type)
+{
+  return (TREE_CODE (type) == BITINT_TYPE
+	  && TYPE_PRECISION (type) > MAX_FIXED_MODE_SIZE
+	  && cfun
+	  && (cfun->curr_properties & PROP_gimple_lbitint) != 0);
+}
+
 /* Create and insert access for EXPR. Return created access, or NULL if it is
    not possible.  Also scan for uses of constant pool as we go along and add
    to candidates.  */
@@ -971,6 +987,12 @@ create_access (tree expr, gimple *stmt, bool write)
   if (BITINT_TYPE_P (TREE_TYPE (expr)) && size > WIDE_INT_MAX_PRECISION - 1)
     {
       disqualify_candidate (base, "Encountered too large _BitInt access.");
+      return NULL;
+    }
+  if (bitint_stays_in_memory_p (TREE_TYPE (expr)))
+    {
+      disqualify_candidate (base, "Encountered large _BitInt access after "
+			    "_BitInt lowering.");
       return NULL;
     }
 
@@ -1072,6 +1094,8 @@ totally_scalarizable_type_p (tree type, bool const_decl,
 			     HOST_WIDE_INT total_offset,
 			     sra_padding_collecting *pc)
 {
+  if (bitint_stays_in_memory_p (type))
+    return false;
   if (is_gimple_reg_type (type))
     {
       if (pc)
