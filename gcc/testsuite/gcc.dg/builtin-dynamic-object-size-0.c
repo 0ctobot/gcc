@@ -775,13 +775,19 @@ main (int argc, char **argv)
     FAIL ();
   if (test_loop (arr, 42, 0, 32, 1) != 10 * sizeof (int))
     FAIL ();
-  if (test_loop (arr, 42, 32, -1, -1) != 0)
+  /* The access attribute only describes the bytes from OBJ onward, so OBJ may
+     point into the middle of its object and OBJ - 1 has 43 elements left.  */
+  if (test_loop (arr, 42, 32, -1, -1) != 43 * sizeof (int))
     FAIL ();
   if (test_loop (arr, 42, 32, 10, -1) != 32 * sizeof (int))
     FAIL ();
   if (test_loop (arr, 42, 42, 0, -1) != 42 * sizeof (int))
     FAIL ();
-  if (test_loop (arr, 42, 44, 0, -1) != 0)
+  /* A pointer past the end has a size of 0 however far past the end it is, so
+     stepping back from OBJ + 44 counts as stepping back from OBJ + 42 and ends
+     2 elements over.  That's too large, which is safe for a maximum, whereas
+     too small isn't.  */
+  if (test_loop (arr, 42, 44, 0, -1) != 44 * sizeof (int))
     FAIL ();
   if (test_loop (arr, 42, 20, 52, 1) != 0)
     FAIL ();

@@ -56,11 +56,16 @@ struct GTY(()) object_size
   tree size;
   /* Estimate of the size of the whole object.  */
   tree wholesize;
+  /* For a maximum dynamic subobject size, NULL when SIZE is always a size, or
+     else nonzero when SIZE may be one of the encodings of a pointer outside
+     of its subobject that size_below_subobject describes.  */
+  tree encoded;
 };
 
 static tree compute_object_offset (tree, const_tree);
 static bool addr_object_size (struct object_size_info *,
-			      const_tree, int, tree *, tree *t = NULL);
+			      const_tree, int, tree *, tree *t = NULL,
+			      tree * = NULL);
 static tree alloc_object_size (const gcall *, int);
 static tree access_with_size_object_size (const gcall *, int);
 static tree pass_through_call (const gcall *);
@@ -129,6 +134,16 @@ static inline bool
 size_usable_p (tree val)
 {
   return TREE_CODE (val) == SSA_NAME || TREE_CODE (val) == INTEGER_CST;
+}
+
+/* Return true if sizes for OBJECT_SIZE_TYPE may encode a pointer outside of
+   its subobject.  */
+
+static inline bool
+object_size_encodes_p (int object_size_type)
+{
+  return ((object_size_type & (OST_DYNAMIC | OST_SUBOBJECT | OST_MINIMUM))
+	  == (OST_DYNAMIC | OST_SUBOBJECT));
 }
 
 /* Return a tree with initial value for OBJECT_SIZE_TYPE.  */
@@ -214,16 +229,32 @@ object_sizes_get (struct object_size_info *osi, unsigned varno,
   return ret;
 }
 
+/* Return the flag for VARNO corresponding to OSI that tells whether its size
+   may be an encoding, like object_sizes_get does for the size.  */
+
+static inline tree
+object_sizes_get_encoded (struct object_size_info *osi, unsigned varno)
+{
+  tree ret = object_sizes[osi->object_size_type][varno].encoded;
+
+  if (ret && TREE_CODE (ret) == MODIFY_EXPR)
+    return TREE_OPERAND (ret, 0);
+  else if (ret && TREE_CODE (ret) == TREE_VEC)
+    return TREE_VEC_ELT (ret, TREE_VEC_LENGTH (ret) - 1);
+  return ret;
+}
+
 /* Set size for VARNO corresponding to OSI to VAL.  */
 
 static inline void
 object_sizes_initialize (struct object_size_info *osi, unsigned varno,
-			 tree val, tree wholeval)
+			 tree val, tree wholeval, tree encoded = NULL_TREE)
 {
   int object_size_type = osi->object_size_type;
 
   object_sizes[object_size_type][varno].size = val;
   object_sizes[object_size_type][varno].wholesize = wholeval;
+  object_sizes[object_size_type][varno].encoded = encoded;
 }
 
 /* Return a MODIFY_EXPR for cases where SSA and EXPR have the same type.  The
@@ -250,11 +281,12 @@ bundle_sizes (tree name, tree expr)
    gimple variable, a MODIFY_EXPR or a TREE_VEC.  The MODIFY_EXPR is for
    expressions that need to be gimplified.  TREE_VECs are special, they're
    emitted only for GIMPLE_PHI and the PHI result variable is the last element
-   of the vector.  */
+   of the vector.  ENCODED is the flag that tells whether VAL may be an
+   encoding, and it's handled like VAL.  */
 
 static bool
 object_sizes_set (struct object_size_info *osi, unsigned varno, tree val,
-		  tree wholeval)
+		  tree wholeval, tree encoded = NULL_TREE)
 {
   int object_size_type = osi->object_size_type;
   object_size osize = object_sizes[object_size_type][varno];
@@ -263,12 +295,20 @@ object_sizes_set (struct object_size_info *osi, unsigned varno, tree val,
   tree oldval = osize.size;
   tree old_wholeval = osize.wholesize;
 
+  if (!object_size_encodes_p (object_size_type)
+      || size_unknown_p (val, object_size_type)
+      || (encoded && integer_zerop (encoded)))
+    encoded = NULL_TREE;
+
   if (object_size_type & OST_DYNAMIC)
     {
       if (bitmap_bit_p (osi->reexamine, varno))
 	{
 	  val = bundle_sizes (oldval, val);
 	  wholeval = bundle_sizes (old_wholeval, wholeval);
+	  if (osize.encoded)
+	    encoded = bundle_sizes (osize.encoded,
+				    encoded ? encoded : size_zero_node);
 	}
       else
 	{
@@ -294,6 +334,14 @@ object_sizes_set (struct object_size_info *osi, unsigned varno, tree val,
 	     reexamination.  */
 	  else if (TREE_CODE (val) == SSA_NAME && !SSA_NAME_DEF_STMT (val))
 	    bitmap_set_bit (osi->reexamine, varno);
+	  if (encoded && !size_usable_p (encoded))
+	    {
+	      bitmap_set_bit (osi->reexamine, varno);
+	      encoded = bundle_sizes (make_ssa_name (sizetype), encoded);
+	    }
+	  else if (encoded && TREE_CODE (encoded) == SSA_NAME
+		   && !SSA_NAME_DEF_STMT (encoded))
+	    bitmap_set_bit (osi->reexamine, varno);
 	}
     }
   else
@@ -309,6 +357,7 @@ object_sizes_set (struct object_size_info *osi, unsigned varno, tree val,
 
   object_sizes[object_size_type][varno].size = val;
   object_sizes[object_size_type][varno].wholesize = wholeval;
+  object_sizes[object_size_type][varno].encoded = encoded;
 
   return changed;
 }
@@ -325,7 +374,9 @@ object_sizes_set_temp (struct object_size_info *osi, unsigned varno)
     {
       val = make_ssa_name (sizetype);
       tree wholeval = make_ssa_name (sizetype);
-      object_sizes_set (osi, varno, val, wholeval);
+      tree encoded = (object_size_encodes_p (osi->object_size_type)
+		      ? make_ssa_name (sizetype) : NULL_TREE);
+      object_sizes_set (osi, varno, val, wholeval, encoded);
     }
 }
 
@@ -553,6 +604,179 @@ get_wholesize_for_memref (tree memref, tree wholesize)
   return wholesize;
 }
 
+/* Return true if the static sizes computed for PTR may come from more than one
+   pointer.  A PHI or COND_EXPR takes the maximum of the sizes and the maximum
+   of the whole sizes independently, so the resulting pair may not describe any
+   single pointer and a net offset derived from it means nothing.  */
+
+static bool
+object_size_merged_p (tree ptr)
+{
+  /* Give up on a long chain, since assuming a merge only loses precision.  */
+  for (int i = 0; i < param_ssa_name_def_chain_limit; i++)
+    {
+      if (TREE_CODE (ptr) == ADDR_EXPR)
+	{
+	  tree base = TREE_OPERAND (ptr, 0);
+	  while (handled_component_p (base))
+	    base = TREE_OPERAND (base, 0);
+	  if (TREE_CODE (base) != MEM_REF)
+	    return false;
+	  ptr = TREE_OPERAND (base, 0);
+	  continue;
+	}
+
+      if (TREE_CODE (ptr) != SSA_NAME)
+	return false;
+
+      gimple *stmt = SSA_NAME_DEF_STMT (ptr);
+      switch (gimple_code (stmt))
+	{
+	case GIMPLE_PHI:
+	  if (gimple_phi_num_args (stmt) != 1)
+	    return true;
+	  ptr = gimple_phi_arg_def (stmt, 0);
+	  break;
+
+	case GIMPLE_CALL:
+	  ptr = pass_through_call (as_a <gcall *> (stmt));
+	  if (!ptr)
+	    return false;
+	  break;
+
+	case GIMPLE_ASSIGN:
+	  if (gimple_assign_rhs_code (stmt) == COND_EXPR)
+	    return true;
+	  if (gimple_assign_rhs_code (stmt) != POINTER_PLUS_EXPR
+	      && !gimple_assign_single_p (stmt)
+	      && !gimple_assign_unary_nop_p (stmt))
+	    return false;
+	  ptr = gimple_assign_rhs1 (stmt);
+	  break;
+
+	default:
+	  return false;
+	}
+    }
+
+  return true;
+}
+
+/* Return true if every pointer that PTR may come from is a parameter or the
+   result of .ACCESS_WITH_SIZE.  A static size gives up on a PHI reached twice
+   since it may be a loop, where a pointer walking below the parameter would
+   grow with each step and keep compute_builtin_object_size from ever reaching
+   a fixed point.  A dynamic size has no fixed point to reach, since it gets
+   its own PHI that grows with each step at run time.  */
+
+static bool
+object_size_open_start_p (tree ptr, int object_size_type)
+{
+  auto_bitmap visited;
+  auto_vec<tree, 8> worklist;
+
+  worklist.safe_push (ptr);
+  while (!worklist.is_empty ())
+    {
+      ptr = worklist.pop ();
+      if (TREE_CODE (ptr) == ADDR_EXPR)
+	{
+	  tree base = TREE_OPERAND (ptr, 0);
+	  while (handled_component_p (base))
+	    base = TREE_OPERAND (base, 0);
+	  if (TREE_CODE (base) != MEM_REF)
+	    return false;
+	  worklist.safe_push (TREE_OPERAND (base, 0));
+	  continue;
+	}
+
+      if (TREE_CODE (ptr) != SSA_NAME)
+	return false;
+
+      gimple *stmt = SSA_NAME_DEF_STMT (ptr);
+      if (!bitmap_set_bit (visited, SSA_NAME_VERSION (ptr)))
+	{
+	  if (gimple_code (stmt) == GIMPLE_PHI
+	      && !(object_size_type & OST_DYNAMIC))
+	    return false;
+	  continue;
+	}
+
+      switch (gimple_code (stmt))
+	{
+	case GIMPLE_NOP:
+	  if (!SSA_NAME_VAR (ptr)
+	      || TREE_CODE (SSA_NAME_VAR (ptr)) != PARM_DECL)
+	    return false;
+	  break;
+
+	case GIMPLE_PHI:
+	  for (unsigned i = 0; i < gimple_phi_num_args (stmt); i++)
+	    worklist.safe_push (gimple_phi_arg_def (stmt, i));
+	  break;
+
+	case GIMPLE_CALL:
+	  if (!gimple_call_internal_p (stmt, IFN_ACCESS_WITH_SIZE))
+	    {
+	      ptr = pass_through_call (as_a <gcall *> (stmt));
+	      if (!ptr)
+		return false;
+	      worklist.safe_push (ptr);
+	    }
+	  break;
+
+	case GIMPLE_ASSIGN:
+	  if (gimple_assign_rhs_code (stmt) == COND_EXPR)
+	    {
+	      worklist.safe_push (gimple_assign_rhs2 (stmt));
+	      worklist.safe_push (gimple_assign_rhs3 (stmt));
+	    }
+	  else if (gimple_assign_rhs_code (stmt) == POINTER_PLUS_EXPR
+		   || gimple_assign_single_p (stmt)
+		   || gimple_assign_unary_nop_p (stmt))
+	    worklist.safe_push (gimple_assign_rhs1 (stmt));
+	  else
+	    return false;
+	  break;
+
+	default:
+	  return false;
+	}
+    }
+
+  return true;
+}
+
+/* Return the whole size to use for computing the size at a possibly negative
+   offset from PTR, whose whole size is WHOLESIZE.  An access attribute or
+   counted_by only describes the bytes from the pointer onward, so such a
+   pointer may be anywhere in the object and a whole size equal to its size
+   would wrongly claim that it's at the start, turning a negative offset into a
+   size of 0.  Use offset_limit, the most that any object can have, as the whole
+   size instead.  A valid negative offset can't step back further than the
+   object extends before the pointer, which is at most offset_limit minus the
+   size, so its net offset in size_for_offset is never negative.  A valid
+   positive offset leaves a net offset of at most offset_limit, and
+   size_for_offset then yields the size minus the offset in either direction.
+   Anything smaller than offset_limit would turn a valid step back further than
+   it into a size of 0.  This is only right for a maximum size, since a minimum
+   size must stay at unknown when the bytes before the pointer aren't known to
+   exist.  The result isn't a real whole size, so it must not be recorded for
+   PTR + OFFSET.  */
+
+static tree
+wholesize_for_offset (tree ptr, tree wholesize, int object_size_type)
+{
+  if ((object_size_type & OST_MINIMUM)
+      || size_unknown_p (wholesize, object_size_type)
+      || (TREE_CODE (wholesize) == INTEGER_CST
+	  && compare_tree_int (wholesize, offset_limit) >= 0)
+      || !object_size_open_start_p (ptr, object_size_type))
+    return wholesize;
+
+  return build_int_cstu (sizetype, offset_limit);
+}
+
 /* Returns the size of the object designated by DECL considering its
    initializer if it either has one or if it would not affect its size,
    otherwise the size of the object without the initializer when MIN
@@ -592,14 +816,17 @@ decl_init_size (tree decl, bool min)
 
 /* Compute __builtin_object_size for PTR, which is a ADDR_EXPR.
    OBJECT_SIZE_TYPE is the second argument from __builtin_object_size.
-   If unknown, return size_unknown (object_size_type).  */
+   If unknown, return size_unknown (object_size_type).  If PENCODED isn't
+   null, set it to the flag that tells whether the size may be an encoding,
+   as described for struct object_size.  */
 
 static bool
 addr_object_size (struct object_size_info *osi, const_tree ptr,
-		  int object_size_type, tree *psize, tree *pwholesize)
+		  int object_size_type, tree *psize, tree *pwholesize,
+		  tree *pencoded)
 {
   tree pt_var, pt_var_size = NULL_TREE, pt_var_wholesize = NULL_TREE;
-  tree var_size, bytes, wholebytes;
+  tree var_size, bytes, wholebytes, encoded = NULL_TREE;
 
   gcc_assert (TREE_CODE (ptr) == ADDR_EXPR);
 
@@ -608,6 +835,8 @@ addr_object_size (struct object_size_info *osi, const_tree ptr,
   *psize = size_unknown (object_size_type);
   if (pwholesize)
     *pwholesize = size_unknown (object_size_type);
+  if (pencoded)
+    *pencoded = NULL_TREE;
 
   pt_var = TREE_OPERAND (ptr, 0);
   while (handled_component_p (pt_var))
@@ -623,9 +852,14 @@ addr_object_size (struct object_size_info *osi, const_tree ptr,
       if (!osi || (object_size_type & OST_SUBOBJECT) != 0
 	  || TREE_CODE (TREE_OPERAND (pt_var, 0)) != SSA_NAME)
 	{
+	  /* Keep the whole size of the enclosing object, since the size of the
+	     base alone cannot tell how far a negative offset may go.  */
 	  compute_builtin_object_size (TREE_OPERAND (pt_var, 0),
-				       object_size_type & ~OST_SUBOBJECT, &sz);
-	  wholesize = get_wholesize_for_memref (pt_var, sz);
+				       object_size_type & ~OST_SUBOBJECT, &sz,
+				       &wholesize);
+	  if (size_unknown_p (wholesize, object_size_type))
+	    wholesize = sz;
+	  wholesize = get_wholesize_for_memref (pt_var, wholesize);
 	}
       else
 	{
@@ -642,8 +876,19 @@ addr_object_size (struct object_size_info *osi, const_tree ptr,
 	  else
 	    sz = wholesize = size_unknown (object_size_type);
 	}
+      /* A static maximum merged from several pointers may have a net offset
+	 that's negative for the pair even though it's valid for the pointer
+	 actually used, so stay at the merged size instead of returning 0.  */
       if (!size_unknown_p (sz, object_size_type))
-	sz = size_for_offset (sz, TREE_OPERAND (pt_var, 1), wholesize);
+	{
+	  tree base = TREE_OPERAND (pt_var, 0);
+	  bool strict = ((object_size_type & (OST_DYNAMIC | OST_MINIMUM))
+			 || !object_size_merged_p (base));
+	  sz = size_for_offset (sz, TREE_OPERAND (pt_var, 1),
+				wholesize_for_offset (base, wholesize,
+						      object_size_type),
+				strict);
+	}
 
       if (!size_unknown_p (sz, object_size_type)
 	  && (TREE_CODE (sz) != INTEGER_CST
@@ -845,6 +1090,8 @@ addr_object_size (struct object_size_info *osi, const_tree ptr,
       *psize = bytes;
       if (pwholesize)
 	*pwholesize = wholebytes;
+      if (pencoded)
+	*pencoded = encoded;
       return true;
     }
 
@@ -1054,18 +1301,25 @@ pass_through_call (const gcall *call)
   return NULL_TREE;
 }
 
-/* Emit PHI nodes for size expressions fo.  */
+/* Emit PHI nodes for size expressions fo.  ENCODED is the flag for SIZE,
+   which needs a PHI node of its own when it's a TREE_VEC.  */
 
 static void
-emit_phi_nodes (gimple *stmt, tree size, tree wholesize)
+emit_phi_nodes (gimple *stmt, tree size, tree wholesize, tree encoded)
 {
   tree phires;
-  gphi *wholephi = NULL;
+  gphi *wholephi = NULL, *encphi = NULL;
 
   if (wholesize != size)
     {
       phires = TREE_VEC_ELT (wholesize, TREE_VEC_LENGTH (wholesize) - 1);
       wholephi = create_phi_node (phires, gimple_bb (stmt));
+    }
+
+  if (encoded && TREE_CODE (encoded) == TREE_VEC)
+    {
+      phires = TREE_VEC_ELT (encoded, TREE_VEC_LENGTH (encoded) - 1);
+      encphi = create_phi_node (phires, gimple_bb (stmt));
     }
 
   phires = TREE_VEC_ELT (size, TREE_VEC_LENGTH (size) - 1);
@@ -1091,6 +1345,13 @@ emit_phi_nodes (gimple *stmt, tree size, tree wholesize)
 	  sz = force_gimple_operand (sz, &s, true, NULL);
 	  gimple_seq_add_seq (&seq, s);
 	}
+      tree enc = encphi ? TREE_VEC_ELT (encoded, i) : NULL_TREE;
+      if (enc && TREE_CODE (enc) != SSA_NAME)
+	{
+	  gimple_seq s;
+	  enc = force_gimple_operand (enc, &s, true, NULL);
+	  gimple_seq_add_seq (&seq, s);
+	}
 
       if (seq)
 	gsi_insert_seq_on_edge (gimple_phi_arg_edge (obj_phi, i), seq);
@@ -1103,6 +1364,11 @@ emit_phi_nodes (gimple *stmt, tree size, tree wholesize)
       add_phi_arg (phi, sz,
 		   gimple_phi_arg_edge (obj_phi, i),
 		   gimple_phi_arg_location (obj_phi, i));
+
+      if (encphi)
+	add_phi_arg (encphi, enc,
+		     gimple_phi_arg_edge (obj_phi, i),
+		     gimple_phi_arg_location (obj_phi, i));
     }
 }
 
@@ -1194,7 +1460,11 @@ gimplify_size_expressions (object_size_info *osi)
 			      object_size_type)
 	      || size_unknown_p (propagate_unknowns (osi, cur.wholesize,
 						     unknowns),
-				 object_size_type))
+				 object_size_type)
+	      || (cur.encoded
+		  && size_unknown_p (propagate_unknowns (osi, cur.encoded,
+							 unknowns),
+				     object_size_type)))
 	    {
 	      /* Record the SSAs we're overwriting to propagate the
 		 unknowns.  */
@@ -1203,6 +1473,14 @@ gimplify_size_expressions (object_size_info *osi)
 
 	      bitmap_set_bit (unknowns, SSA_NAME_VERSION (oldval));
 	      bitmap_set_bit (unknowns, SSA_NAME_VERSION (old_wholeval));
+	      /* The flag can be the name of another variable, so only take
+		 the one this variable defines.  */
+	      if (cur.encoded && (TREE_CODE (cur.encoded) == MODIFY_EXPR
+				  || TREE_CODE (cur.encoded) == TREE_VEC))
+		{
+		  tree old_encoded = object_sizes_get_encoded (osi, i);
+		  bitmap_set_bit (unknowns, SSA_NAME_VERSION (old_encoded));
+		}
 	      object_sizes_initialize (osi, i,
 				       size_unknown (object_size_type),
 				       size_unknown (object_size_type));
@@ -1233,7 +1511,7 @@ gimplify_size_expressions (object_size_info *osi)
 
       /* PHI nodes need special attention.  */
       if (code == GIMPLE_PHI)
-	emit_phi_nodes (stmt, osize.size, osize.wholesize);
+	emit_phi_nodes (stmt, osize.size, osize.wholesize, osize.encoded);
       else
 	{
 	  tree size_expr = NULL_TREE;
@@ -1246,6 +1524,9 @@ gimplify_size_expressions (object_size_info *osi)
 				    osize.size);
 	  else if (!size_usable_p (osize.size))
 	    size_expr = osize.size;
+	  if (osize.encoded && !size_usable_p (osize.encoded))
+	    size_expr = size_binop (COMPOUND_EXPR, osize.encoded,
+				    size_expr ? size_expr : osize.size);
 
 	  if (size_expr)
 	    {
@@ -1263,32 +1544,67 @@ gimplify_size_expressions (object_size_info *osi)
       /* We're done, so replace the MODIFY_EXPRs with the SSA names.  */
       object_sizes_initialize (osi, i,
 			       object_sizes_get (osi, i),
-			       object_sizes_get (osi, i, true));
+			       object_sizes_get (osi, i, true),
+			       object_sizes_get_encoded (osi, i));
     }
+}
+
+/* Return SIZE for OBJECT_SIZE_TYPE as the user sees it.  ENCODED is the flag
+   that tells whether SIZE may be an encoding of a pointer outside of its
+   subobject, which only exists for later offsets and turns into the unknown
+   size of (size_t) -1 here.  Where a size gets flagged, an encoding is never
+   below offset_limit and any other size is, so the flag and the size tell
+   which one it is at run time.  */
+
+static tree
+object_size_decode (int object_size_type, tree size, tree encoded)
+{
+  if (!object_size_encodes_p (object_size_type)
+      || !encoded
+      || integer_zerop (encoded)
+      || size_unknown_p (size, object_size_type))
+    return size;
+
+  tree enc = fold_build2 (GE_EXPR, boolean_type_node, size,
+			  build_int_cstu (sizetype, offset_limit));
+  enc = size_binop (MULT_EXPR, unshare_expr (encoded),
+		    fold_convert (sizetype, enc));
+  return size_binop (BIT_IOR_EXPR, unshare_expr (size),
+		     size_binop (MINUS_EXPR, size_zero_node, enc));
 }
 
 /* Compute __builtin_object_size value for PTR and set *PSIZE to
    the resulting value.  If the declared object is known and PDECL
    is nonnull, sets *PDECL to the object's DECL.  OBJECT_SIZE_TYPE
-   is the second argument   to __builtin_object_size.
+   is the second argument   to __builtin_object_size.  If PWHOLESIZE
+   is nonnull, set *PWHOLESIZE to the size of the whole object when
+   it's known, or to unknown otherwise.
    Returns true on success and false when the object size could not
    be determined.  */
 
 bool
 compute_builtin_object_size (tree ptr, int object_size_type,
-			     tree *psize)
+			     tree *psize, tree *pwholesize)
 {
   gcc_assert (object_size_type >= 0 && object_size_type < OST_END);
 
   /* Set to unknown and overwrite just before returning if the size
      could be determined.  */
   *psize = size_unknown (object_size_type);
+  if (pwholesize)
+    *pwholesize = size_unknown (object_size_type);
 
   if (! offset_limit)
     init_offset_limit ();
 
   if (TREE_CODE (ptr) == ADDR_EXPR)
-    return addr_object_size (NULL, ptr, object_size_type, psize);
+    {
+      tree encoded;
+      bool ret = addr_object_size (NULL, ptr, object_size_type, psize,
+				   pwholesize, &encoded);
+      *psize = object_size_decode (object_size_type, *psize, encoded);
+      return ret;
+    }
 
   if (TREE_CODE (ptr) != SSA_NAME
       || !POINTER_TYPE_P (TREE_TYPE (ptr)))
@@ -1455,7 +1771,12 @@ compute_builtin_object_size (tree ptr, int object_size_type,
     }
 
   *psize = object_sizes_get (&osi, SSA_NAME_VERSION (ptr));
-  return !size_unknown_p (*psize, object_size_type);
+  if (pwholesize)
+    *pwholesize = object_sizes_get (&osi, SSA_NAME_VERSION (ptr), true);
+  bool known = !size_unknown_p (*psize, object_size_type);
+  tree encoded = object_sizes_get_encoded (&osi, SSA_NAME_VERSION (ptr));
+  *psize = object_size_decode (object_size_type, *psize, encoded);
+  return known;
 }
 
 /* Compute object_sizes for PTR, defined to VALUE, which is not an SSA_NAME.  */
@@ -1465,7 +1786,7 @@ expr_object_size (struct object_size_info *osi, tree ptr, tree value)
 {
   int object_size_type = osi->object_size_type;
   unsigned int varno = SSA_NAME_VERSION (ptr);
-  tree bytes, wholesize;
+  tree bytes, wholesize, encoded = NULL_TREE;
 
   gcc_assert (!object_sizes_unknown_p (object_size_type, varno));
   gcc_assert (osi->pass == 0);
@@ -1478,11 +1799,12 @@ expr_object_size (struct object_size_info *osi, tree ptr, tree value)
 	      || !POINTER_TYPE_P (TREE_TYPE (value)));
 
   if (TREE_CODE (value) == ADDR_EXPR)
-    addr_object_size (osi, value, object_size_type, &bytes, &wholesize);
+    addr_object_size (osi, value, object_size_type, &bytes, &wholesize,
+		      &encoded);
   else
     bytes = wholesize = size_unknown (object_size_type);
 
-  object_sizes_set (osi, varno, bytes, wholesize);
+  object_sizes_set (osi, varno, bytes, wholesize, encoded);
 }
 
 
@@ -1552,13 +1874,97 @@ merge_object_sizes (struct object_size_info *osi, tree dest, tree orig)
 
   orig_bytes = object_sizes_get (osi, SSA_NAME_VERSION (orig));
   wholesize = object_sizes_get (osi, SSA_NAME_VERSION (orig), true);
+  tree encoded = object_sizes_get_encoded (osi, SSA_NAME_VERSION (orig));
 
-  if (object_sizes_set (osi, varno, orig_bytes, wholesize))
+  if (object_sizes_set (osi, varno, orig_bytes, wholesize, encoded))
     osi->changed = true;
 
   return bitmap_bit_p (osi->reexamine, SSA_NAME_VERSION (orig));
 }
 
+
+/* OP0 has a maximum subobject size of *PBYTES in a subobject of *PWHOLESIZE
+   bytes, and OP1 is a negative or runtime offset.  If OP0 + OP1 lands below the
+   start of the subobject, e.g., container_of on a member, then the subobject
+   says nothing about it and the only upper bound left comes from the enclosing
+   object.  Update *PBYTES and *PWHOLESIZE to account for this and return true,
+   or return false if OP0 + OP1 is known to stay in the subobject.  *PENCODED
+   is the flag that tells whether *PBYTES may be an encoding, which is updated
+   along with it.  */
+
+static bool
+size_below_subobject (int object_size_type, tree op0, tree op1,
+		      tree *pbytes, tree *pwholesize, tree *pencoded)
+{
+  bool dynamic = (object_size_type & OST_DYNAMIC) != 0;
+  tree bytes = *pbytes;
+  tree wholesize = *pwholesize;
+
+  /* This is the same net offset as in size_for_offset.  */
+  tree net = size_binop (MAX_EXPR, wholesize, bytes);
+  net = fold_build2 (PLUS_EXPR, sizetype, net, fold_convert (sizetype, op1));
+  net = fold_build2 (MINUS_EXPR, sizetype, net, bytes);
+  tree below = fold_build2 (GT_EXPR, boolean_type_node, net,
+			    build_int_cstu (sizetype, offset_limit));
+
+  /* The net offset of a static pair merged from several pointers is meaningless
+     and may look like it stays in the subobject when it doesn't for the pointer
+     actually used.  */
+  if (integer_zerop (below) && (dynamic || !object_size_merged_p (op0)))
+    return false;
+
+  tree sz, whole;
+  compute_builtin_object_size (op0, object_size_type & ~OST_SUBOBJECT, &sz,
+			       &whole);
+  bool known = !size_unknown_p (sz, object_size_type);
+  if (size_unknown_p (whole, object_size_type))
+    whole = sz;
+
+  /* A static maximum goes easy on a negative offset here, like the whole object
+     case in plus_stmt_object_size does.  */
+  tree res = (known
+	      ? size_for_offset (sz, op1,
+				 wholesize_for_offset (op0, whole,
+						       object_size_type),
+				 dynamic)
+	      : sz);
+
+  if (!dynamic || integer_onep (below))
+    {
+      *pbytes = res;
+      *pwholesize = whole;
+      *pencoded = NULL_TREE;
+      return true;
+    }
+
+  /* Only the run time can tell, so pick between the two results without a
+     branch: the size for the subobject is 0 whenever BELOW holds.  The whole
+     size stays that of the subobject when the enclosing object is known, since
+     size_for_offset uses the larger of the size and the whole size, which
+     still leaves the right result for further offsets in both cases.  An
+     unknown enclosing object's size of (size_t) -1 doesn't work that way: in
+     the subobject's whole size, it puts the pointer at the start of an object
+     of that size, where a later negative offset wraps the size around to a
+     tiny one.  Such a pointer gets a size of offset_limit in a whole size of
+     (size_t) -1 instead, which leaves more than any object can have after any
+     valid offset.  That size is only for later offsets, so it's flagged to
+     become (size_t) -1 for the user.  A pointer that stays inside gets less
+     than its subobject's size, which is below offset_limit, so the flag only
+     catches the encoding.  */
+  if (!known)
+    {
+      res = build_int_cstu (sizetype, offset_limit);
+      tree all = size_binop (MULT_EXPR,
+			     fold_convert (sizetype, unshare_expr (below)),
+			     size_unknown (object_size_type));
+      *pwholesize = size_binop (MAX_EXPR, wholesize, all);
+      *pencoded = size_one_node;
+    }
+  *pbytes = size_binop (PLUS_EXPR, size_for_offset (bytes, op1, wholesize),
+			size_binop (MULT_EXPR, fold_convert (sizetype, below),
+				    res));
+  return true;
+}
 
 /* Compute object_sizes for VAR, defined to the result of an assignment
    with operator POINTER_PLUS_EXPR.  Return true if the object size might
@@ -1569,7 +1975,7 @@ plus_stmt_object_size (struct object_size_info *osi, tree var, gimple *stmt)
 {
   int object_size_type = osi->object_size_type;
   unsigned int varno = SSA_NAME_VERSION (var);
-  tree bytes, wholesize;
+  tree bytes, wholesize, encoded = NULL_TREE;
   tree op0, op1;
   bool reexamine = false;
 
@@ -1601,6 +2007,7 @@ plus_stmt_object_size (struct object_size_info *osi, tree var, gimple *stmt)
 
 	  bytes = object_sizes_get (osi, SSA_NAME_VERSION (op0));
 	  wholesize = object_sizes_get (osi, SSA_NAME_VERSION (op0), true);
+	  encoded = object_sizes_get_encoded (osi, SSA_NAME_VERSION (op0));
 	  reexamine = bitmap_bit_p (osi->reexamine, SSA_NAME_VERSION (op0));
 	}
       else
@@ -1608,24 +2015,44 @@ plus_stmt_object_size (struct object_size_info *osi, tree var, gimple *stmt)
 	  /* op0 will be ADDR_EXPR here.  We should never come here during
 	     reexamination.  */
 	  gcc_checking_assert (osi->pass == 0);
-	  addr_object_size (osi, op0, object_size_type, &bytes, &wholesize);
+	  addr_object_size (osi, op0, object_size_type, &bytes, &wholesize,
+			    &encoded);
 	}
 
       bool pos_offset = (size_valid_p (op1, 0)
 			 && compare_tree_int (op1, offset_limit) <= 0);
+
+      tree offwhole = wholesize;
+      if (!pos_offset && !size_unknown_p (bytes, 0))
+	offwhole = wholesize_for_offset (op0, wholesize, object_size_type);
 
       /* size_for_offset doesn't make sense for -1 size, but it does for size 0
 	 since the wholesize could be non-zero and a negative offset could give
 	 a non-zero size.  */
       if (size_unknown_p (bytes, 0))
 	;
+      /* A static non-constant offset is presumed to stay in the subobject,
+	 since a static maximum subobject size would be of no use for such
+	 pointers otherwise.  The same goes for a static pointer stepped in a
+	 loop, whose sizes only settle at the fixed point.  Anything else may
+	 leave the subobject downward.  */
+      else if (!pos_offset
+	       && ((object_size_type & (OST_SUBOBJECT | OST_MINIMUM))
+		   == OST_SUBOBJECT)
+	       && ((object_size_type & OST_DYNAMIC)
+		   || (TREE_CODE (op1) == INTEGER_CST
+		       && !reexamine
+		       && osi->pass == 0))
+	       && size_below_subobject (object_size_type, op0, op1, &bytes,
+					&wholesize, &encoded))
+	;
       /* In the static case, We want SIZE_FOR_OFFSET to go a bit easy on us if
 	 it sees a negative offset since BYTES could have been
 	 overestimated.  */
       else if ((object_size_type & OST_DYNAMIC)
-	       || bytes != wholesize
+	       || bytes != offwhole
 	       || pos_offset)
-	bytes = size_for_offset (bytes, op1, wholesize,
+	bytes = size_for_offset (bytes, op1, offwhole,
 				 ((object_size_type & OST_DYNAMIC)
 				  || pos_offset));
       /* In the static case, with a negative offset, the best estimate for
@@ -1652,21 +2079,23 @@ plus_stmt_object_size (struct object_size_info *osi, tree var, gimple *stmt)
       || !size_valid_p (wholesize, object_size_type))
     bytes = wholesize = size_unknown (object_size_type);
 
-  if (object_sizes_set (osi, varno, bytes, wholesize))
+  if (object_sizes_set (osi, varno, bytes, wholesize, encoded))
     osi->changed = true;
   return reexamine;
 }
 
 /* Compute the dynamic object size for VAR.  Return the result in SIZE and
-   WHOLESIZE.  */
+   WHOLESIZE, and the flag that tells whether SIZE may be an encoding in
+   ENCODED.  */
 
 static bool
 dynamic_object_size (struct object_size_info *osi, tree var,
-		     tree *size, tree *wholesize)
+		     tree *size, tree *wholesize, tree *encoded)
 {
   int object_size_type = osi->object_size_type;
   bool reexamine = false;
 
+  *encoded = NULL_TREE;
   if (TREE_CODE (var) == SSA_NAME)
     {
       unsigned varno = SSA_NAME_VERSION (var);
@@ -1674,10 +2103,11 @@ dynamic_object_size (struct object_size_info *osi, tree var,
       collect_object_sizes_for (osi, var);
       *size = object_sizes_get (osi, varno);
       *wholesize = object_sizes_get (osi, varno, true);
+      *encoded = object_sizes_get_encoded (osi, varno);
       reexamine = bitmap_bit_p (osi->reexamine, varno);
     }
   else if (TREE_CODE (var) == ADDR_EXPR)
-    addr_object_size (osi, var, object_size_type, size, wholesize);
+    addr_object_size (osi, var, object_size_type, size, wholesize, encoded);
   else
     *size = *wholesize = size_unknown (object_size_type);
 
@@ -1707,14 +2137,15 @@ cond_expr_object_size (struct object_size_info *osi, tree var, gimple *stmt)
   if (object_size_type & OST_DYNAMIC)
     {
       tree then_size, then_wholesize, else_size, else_wholesize;
+      tree then_enc, else_enc = NULL_TREE;
 
       reexamine |= dynamic_object_size (osi, then_, &then_size,
-					&then_wholesize);
+					&then_wholesize, &then_enc);
       if (!size_unknown_p (then_size, object_size_type))
 	reexamine |= dynamic_object_size (osi, else_, &else_size,
-					  &else_wholesize);
+					  &else_wholesize, &else_enc);
 
-      tree cond_size, cond_wholesize;
+      tree cond_size, cond_wholesize, cond_enc = NULL_TREE;
       if (size_unknown_p (then_size, object_size_type)
 	  || size_unknown_p (else_size, object_size_type))
 	cond_size = cond_wholesize = size_unknown (object_size_type);
@@ -1726,9 +2157,14 @@ cond_expr_object_size (struct object_size_info *osi, tree var, gimple *stmt)
 	  cond_wholesize = fold_build3 (COND_EXPR, sizetype,
 					gimple_assign_rhs1 (stmt),
 					then_wholesize, else_wholesize);
+	  if (then_enc || else_enc)
+	    cond_enc = fold_build3 (COND_EXPR, sizetype,
+				    gimple_assign_rhs1 (stmt),
+				    then_enc ? then_enc : size_zero_node,
+				    else_enc ? else_enc : size_zero_node);
 	}
 
-      object_sizes_set (osi, varno, cond_size, cond_wholesize);
+      object_sizes_set (osi, varno, cond_size, cond_wholesize, cond_enc);
 
       return reexamine;
     }
@@ -1823,6 +2259,11 @@ phi_dynamic_object_size (struct object_size_info *osi, tree var)
      sets for us.  */
   tree sizes = make_tree_vec (num_args + 1);
   tree wholesizes = make_tree_vec (num_args + 1);
+  tree encodeds = make_tree_vec (num_args + 1);
+  /* A dependency loop through this PHI has handed out a placeholder for the
+     flag, which then needs a PHI to define it.  */
+  bool encoded_needed
+    = object_sizes[object_size_type][varno].encoded != NULL_TREE;
 
   /* Bail out if the size of any of the PHI arguments cannot be
      determined.  */
@@ -1833,18 +2274,29 @@ phi_dynamic_object_size (struct object_size_info *osi, tree var)
 	break;
 
       tree rhs = gimple_phi_arg_def (stmt, i);
-      tree size, wholesize;
+      tree size, wholesize, encoded;
 
-      dynamic_object_size (osi, rhs, &size, &wholesize);
+      dynamic_object_size (osi, rhs, &size, &wholesize, &encoded);
 
       if (size_unknown_p (size, object_size_type))
        break;
 
       if (size != wholesize)
 	wholesize_needed = true;
+      if (!encoded)
+	encoded = size_zero_node;
+      else if (!integer_zerop (encoded))
+	encoded_needed = true;
 
       TREE_VEC_ELT (sizes, i) = size;
       TREE_VEC_ELT (wholesizes, i) = wholesize;
+      TREE_VEC_ELT (encodeds, i) = encoded;
+    }
+
+  if (i < num_args || !encoded_needed)
+    {
+      ggc_free (encodeds);
+      encodeds = NULL_TREE;
     }
 
   if (i < num_args)
@@ -1862,7 +2314,7 @@ phi_dynamic_object_size (struct object_size_info *osi, tree var)
       wholesizes = sizes;
     }
 
-  object_sizes_set (osi, varno, sizes, wholesizes);
+  object_sizes_set (osi, varno, sizes, wholesizes, encodeds);
 }
 
 /* Compute object sizes for VAR.
@@ -2227,6 +2679,77 @@ do_valueize (tree t)
   return t;
 }
 
+/* Return true if PTR is computed with a non-constant offset anywhere in its
+   chain of definitions.  */
+
+static bool
+object_size_variable_offset_p (tree ptr)
+{
+  auto_bitmap visited;
+  auto_vec<tree, 8> worklist;
+
+  worklist.safe_push (ptr);
+  while (!worklist.is_empty ())
+    {
+      ptr = worklist.pop ();
+      if (TREE_CODE (ptr) == ADDR_EXPR)
+	{
+	  tree base = TREE_OPERAND (ptr, 0);
+	  while (handled_component_p (base))
+	    base = TREE_OPERAND (base, 0);
+	  if (TREE_CODE (base) == MEM_REF)
+	    worklist.safe_push (TREE_OPERAND (base, 0));
+	  continue;
+	}
+
+      if (TREE_CODE (ptr) != SSA_NAME
+	  || !bitmap_set_bit (visited, SSA_NAME_VERSION (ptr)))
+	continue;
+
+      gimple *stmt = SSA_NAME_DEF_STMT (ptr);
+      switch (gimple_code (stmt))
+	{
+	case GIMPLE_PHI:
+	  for (unsigned i = 0; i < gimple_phi_num_args (stmt); i++)
+	    worklist.safe_push (gimple_phi_arg_def (stmt, i));
+	  break;
+
+	case GIMPLE_CALL:
+	  ptr = pass_through_call (as_a <gcall *> (stmt));
+	  if (ptr)
+	    worklist.safe_push (ptr);
+	  break;
+
+	case GIMPLE_ASSIGN:
+	  switch (gimple_assign_rhs_code (stmt))
+	    {
+	    case POINTER_PLUS_EXPR:
+	      if (TREE_CODE (gimple_assign_rhs2 (stmt)) != INTEGER_CST)
+		return true;
+	      worklist.safe_push (gimple_assign_rhs1 (stmt));
+	      break;
+
+	    case COND_EXPR:
+	      worklist.safe_push (gimple_assign_rhs2 (stmt));
+	      worklist.safe_push (gimple_assign_rhs3 (stmt));
+	      break;
+
+	    default:
+	      if (gimple_assign_single_p (stmt)
+		  || gimple_assign_unary_nop_p (stmt))
+		worklist.safe_push (gimple_assign_rhs1 (stmt));
+	      break;
+	    }
+	  break;
+
+	default:
+	  break;
+	}
+    }
+
+  return false;
+}
+
 /* Process a __builtin_object_size or __builtin_dynamic_object_size call in
    CALL early for subobjects before any object information is lost due to
    optimization.  Insert a MIN or MAX expression of the result and
@@ -2251,6 +2774,15 @@ early_object_sizes_execute_one (gimple_stmt_iterator *i, gimple *call)
     return;
 
   if (TREE_CODE (ptr) != ADDR_EXPR && TREE_CODE (ptr) != SSA_NAME)
+    return;
+
+  /* The static estimate for a non-constant offset presumes that the offset
+     stays in the subobject.  __builtin_dynamic_object_size can see where the
+     offset actually goes when it's expanded later, so don't let the estimate
+     cap it.  */
+  if (object_size_type == 1
+      && gimple_call_builtin_p (call, BUILT_IN_DYNAMIC_OBJECT_SIZE)
+      && object_size_variable_offset_p (ptr))
     return;
 
   tree type = TREE_TYPE (lhs);
