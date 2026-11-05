@@ -699,11 +699,21 @@ vect_widened_op_tree (vec_info *vinfo, stmt_vec_info stmt_info, tree_code code,
 	      stmt_vec_info def_stmt_info
 		= vect_get_internal_def (vinfo, this_unprom->op);
 
+	      /* COMMON_TYPE has to hold the earlier operands too, and the
+		 subtree's first leaf would overwrite it.  Get a separate common
+		 type for the subtree and merge the two.  */
+	      tree op_common_type;
 	      nops = vect_widened_op_tree (vinfo, def_stmt_info, code,
 					   widened_code, shift_p, max_nops,
-					   this_unprom, common_type,
+					   this_unprom, &op_common_type,
 					   subtype);
 	      if (nops == 0)
+		return 0;
+
+	      if (i == 0)
+		*common_type = op_common_type;
+	      else if (!vect_joust_widened_type (type, op_common_type,
+						 common_type))
 		return 0;
 
 	      max_nops -= nops;
