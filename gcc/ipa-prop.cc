@@ -6488,11 +6488,14 @@ ipcp_modif_dom_walker::before_dom_children (basic_block bb)
       gcc_checking_assert (is_gimple_ip_invariant (v));
       if (!useless_type_conversion_p (TREE_TYPE (rhs), TREE_TYPE (v)))
 	{
-	  if (fold_convertible_p (TREE_TYPE (rhs), v))
-	    val = fold_build1 (NOP_EXPR, TREE_TYPE (rhs), v);
-	  else if (TYPE_SIZE (TREE_TYPE (rhs))
-		   == TYPE_SIZE (TREE_TYPE (v)))
+	  /* This load reinterprets the bytes of V, so it must keep those bytes
+	     whenever the sizes match.  A NOP_EXPR converts the value instead,
+	     which gives real and vector constants different bits, and which
+	     fold can't do at all for a float vector loaded as an int vector.  */
+	  if (TYPE_SIZE (TREE_TYPE (rhs)) == TYPE_SIZE (TREE_TYPE (v)))
 	    val = fold_build1 (VIEW_CONVERT_EXPR, TREE_TYPE (rhs), v);
+	  else if (fold_convertible_p (TREE_TYPE (rhs), v))
+	    val = fold_build1 (NOP_EXPR, TREE_TYPE (rhs), v);
 	  else
 	    {
 	      if (dump_file)
