@@ -4189,6 +4189,12 @@ can_move_insns_across (rtx_insn *from, rtx_insn *to,
 	      memrefs_in_across |= MEMREF_VOLATILE;
 	      mem_sets_in_across |= MEMREF_VOLATILE;
 	    }
+	  /* A trapping insn can't move above a call that may not return,
+	     since it would fault on a path that never reached it originally.
+	     Only a non-looping const or pure call is known to return.  */
+	  if (!RTL_CONST_OR_PURE_CALL_P (insn)
+	      || RTL_LOOPING_CONST_OR_PURE_CALL_P (insn))
+	    trapping_insns_in_across = true;
 	}
       if (NONDEBUG_INSN_P (insn))
 	{
@@ -4198,7 +4204,11 @@ can_move_insns_across (rtx_insn *from, rtx_insn *to,
 	  note_stores (insn, find_memory_stores, &mem_sets_in_across);
 	  /* This is used just to find sets of the stack pointer.  */
 	  memrefs_in_across |= mem_sets_in_across;
-	  trapping_insns_in_across |= may_trap_p (PATTERN (insn));
+	  /* A volatile access must happen before any later trap, so it stops
+	     a trapping insn from moving just like a call that may not return.
+	     Volatile asms and UNSPEC_VOLATILEs were rejected above.  */
+	  trapping_insns_in_across |= (may_trap_p (PATTERN (insn))
+				       || volatile_refs_p (PATTERN (insn)));
 	}
       next = PREV_INSN (insn);
       if (insn == across_from)
