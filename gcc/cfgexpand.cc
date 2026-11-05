@@ -755,6 +755,16 @@ vars_ssa_cache::operator() (tree name)
 	  unsigned idx = decl_stack_index (op);
 	  if (idx != INVALID_STACK_INDEX)
 	    add_one (old_name, idx);
+	  /* &p_1->f points into whatever p_1 points to, so walk the pointer
+	     operands of the base too.  LIM can hoist an address like this out
+	     of a loop, which leaves it as the only mention of those variables
+	     inside the loop.  */
+	  else if (op
+		   && (TREE_CODE (op) == MEM_REF
+		       || TREE_CODE (op) == TARGET_MEM_REF))
+	    for (int i = 0; i < TREE_OPERAND_LENGTH (op); i++)
+	      if (tree base = TREE_OPERAND (op, i))
+		work_list.safe_push (std::make_pair (base, old_name));
 	  continue;
 	}
 
