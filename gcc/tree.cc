@@ -15281,6 +15281,35 @@ is_empty_type (const_tree type)
   return false;
 }
 
+/* Helper for type_has_volatile_member_p.  VISITED holds the aggregates that
+   were already walked, since a type that repeats a member type would otherwise
+   take exponential time.  */
+
+static bool
+type_has_volatile_member_1 (tree type, hash_set<tree> *visited)
+{
+  type = strip_array_types (type);
+  if (TYPE_VOLATILE (type))
+    return true;
+  if (!RECORD_OR_UNION_TYPE_P (type) || visited->add (type))
+    return false;
+  for (tree field = TYPE_FIELDS (type); field; field = DECL_CHAIN (field))
+    if (TREE_CODE (field) == FIELD_DECL
+	&& (TREE_THIS_VOLATILE (field)
+	    || type_has_volatile_member_1 (TREE_TYPE (field), visited)))
+      return true;
+  return false;
+}
+
+/* Return true if TYPE is volatile or has a volatile subobject.  */
+
+bool
+type_has_volatile_member_p (tree type)
+{
+  hash_set<tree> visited;
+  return type_has_volatile_member_1 (type, &visited);
+}
+
 /* Implement TARGET_EMPTY_RECORD_P.  Return true if TYPE is an empty type
    that shouldn't be passed via stack.  */
 

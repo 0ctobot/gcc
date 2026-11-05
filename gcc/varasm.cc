@@ -1099,6 +1099,19 @@ decode_reg_name (const char *name)
 }
 
 
+/* Return true if DECL is read-only only because IPA found no writes to it, and
+   it has a volatile member.  Such an object stays in the writable section it
+   was going to get in the first place, since a volatile access has to reach
+   the storage that a linker script may have mapped onto a device.  */
+
+static bool
+promoted_decl_with_volatile_member_p (const_tree decl)
+{
+  return (TREE_READONLY (decl)
+	  && !TYPE_READONLY (strip_array_types (TREE_TYPE (decl)))
+	  && type_has_volatile_member_p (TREE_TYPE (decl)));
+}
+
 /* Return true if DECL's initializer is suitable for a BSS section.  */
 
 bool
@@ -1106,7 +1119,8 @@ bss_initializer_p (const_tree decl, bool named)
 {
   /* Do not put non-common constants into the .bss section, they belong in
      a readonly section, except when NAMED is true.  */
-  return ((!TREE_READONLY (decl) || DECL_COMMON (decl) || named)
+  return ((!TREE_READONLY (decl) || DECL_COMMON (decl) || named
+	   || promoted_decl_with_volatile_member_p (decl))
 	  && (DECL_INITIAL (decl) == NULL
 	      /* In LTO we have no errors in program; error_mark_node is used
 	         to mark offlined constructors.  */
@@ -7409,6 +7423,7 @@ categorize_decl_for_section (const_tree decl, int reloc)
       if (bss_initializer_p (decl))
 	ret = SECCAT_BSS;
       else if (! TREE_READONLY (decl)
+	       || promoted_decl_with_volatile_member_p (decl)
 	       || (DECL_INITIAL (decl)
 		   && ! TREE_CONSTANT (DECL_INITIAL (decl))))
 	{
