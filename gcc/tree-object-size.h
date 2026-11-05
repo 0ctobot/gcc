@@ -32,7 +32,8 @@ enum
 
 extern void init_object_sizes (void);
 extern void fini_object_sizes (void);
-extern bool compute_builtin_object_size (tree, int, tree *);
+extern bool compute_builtin_object_size (tree, int, tree *,
+					 tree *pwholesize = NULL);
 extern tree decl_init_size (tree, bool);
 
 #endif  // GCC_TREE_OBJECT_SIZE_H
