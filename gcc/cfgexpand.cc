@@ -1908,7 +1908,16 @@ adjust_one_expanded_partition_var (tree var)
 
   gcc_assert (x);
 
+  /* set_rtl can raise the alignment of a MEM to the DECL_ALIGN of VAR's
+     variable.  That variable may not be the one the stack slot was laid out
+     for, so its alignment says nothing about this address.  Keep what the
+     slot's placement proved.  */
+  unsigned int align = MEM_P (x) ? MEM_ALIGN (x) : 0;
+
   set_rtl (var, x);
+
+  if (MEM_P (x))
+    set_mem_align (x, align);
 
   if (!REG_P (x))
     return;
