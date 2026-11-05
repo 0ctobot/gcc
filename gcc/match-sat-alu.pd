@@ -189,8 +189,12 @@ along with GCC; see the file COPYING3.  If not see
   (if (types_match (type, @0, @1))))
  (match (unsigned_integer_sat_sub @0 @1)
   (cond^ (le:c @0 @1) integer_zerop
-	 (convert? (minus (convert1? @0) (convert1? @1))))
-  (if (TYPE_UNSIGNED (TREE_TYPE (@0)) && types_match (@0, @1))))
+	 (convert? (minus@2 (convert1? @0) (convert1? @1))))
+  /* As for X >= Y ? X - Y : 0 above.  */
+  (if (TYPE_UNSIGNED (TREE_TYPE (@0)) && types_match (@0, @1)
+       && TYPE_PRECISION (type) <= TYPE_PRECISION (TREE_TYPE (@0))
+       && TYPE_PRECISION (type) <= TYPE_PRECISION (TREE_TYPE (@2))
+       && type_has_mode_precision_p (type))))
  /* The wrapped difference exceeds the minuend exactly when the subtraction
     borrows, so a source that names the difference and then tests it against
     the minuend is a saturating subtract.  */
