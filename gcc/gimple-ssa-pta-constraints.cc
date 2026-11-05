@@ -715,6 +715,16 @@ get_constraint_for_address_of (tree t, vec<ce_s> *results)
 
   get_constraint_for_1 (t, results, true, true);
 
+  /* In IPA mode the variable for an ifunc symbol holds what the resolver
+     returns.  A pointer to the symbol ends up calling that, not the variable,
+     so the pointer needs the variable's contents rather than its address.  */
+  cgraph_node *node;
+  if (in_ipa_mode
+      && TREE_CODE (t) == FUNCTION_DECL
+      && (node = cgraph_node::get (t))
+      && node->ifunc_on_alias_chain_p ())
+    return;
+
   FOR_EACH_VEC_ELT (*results, i, c)
     {
       if (c->type == DEREF)
