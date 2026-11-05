@@ -1048,6 +1048,9 @@ ipcp_bits_lattice::meet_with (ipcp_bits_lattice& other, unsigned precision,
     return false;
 
   widest_int adjusted_value, adjusted_mask;
+  /* The lattice may mark bits above PRECISION as unknown.  */
+  widest_int value = wi::ext (other.get_value (), precision, sgn);
+  widest_int mask = wi::ext (other.get_mask (), precision, sgn);
 
   if (TREE_CODE_CLASS (code) == tcc_binary)
     {
@@ -1056,7 +1059,7 @@ ipcp_bits_lattice::meet_with (ipcp_bits_lattice& other, unsigned precision,
       get_value_and_mask (operand, &o_value, &o_mask);
 
       bit_value_binop (code, sgn, precision, &adjusted_value, &adjusted_mask,
-		       sgn, precision, other.get_value (), other.get_mask (),
+		       sgn, precision, value, mask,
 		       TYPE_SIGN (type), TYPE_PRECISION (type), o_value, o_mask);
 
       if (wi::sext (adjusted_mask, precision) == -1)
@@ -1066,8 +1069,7 @@ ipcp_bits_lattice::meet_with (ipcp_bits_lattice& other, unsigned precision,
   else if (TREE_CODE_CLASS (code) == tcc_unary)
     {
       bit_value_unop (code, sgn, precision, &adjusted_value,
-		      &adjusted_mask, sgn, precision, other.get_value (),
-		      other.get_mask ());
+		      &adjusted_mask, sgn, precision, value, mask);
 
       if (wi::sext (adjusted_mask, precision) == -1)
 	return set_to_bottom ();
