@@ -45,6 +45,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "gimplify-me.h"
 #include "tree-ssa-loop-ivopts.h"
 #include "tree-ssa-loop-manip.h"
+#include "tree-ssa-loop-niter.h"
 #include "tree-ssa-loop.h"
 #include "cfgloop.h"
 #include "tree-scalar-evolution.h"
@@ -3932,6 +3933,67 @@ vect_vfa_segment_size (dr_vec_info *dr_info, tree length_factor)
 		     length_factor);
 }
 
+/* Return an upper bound on LOOP_VINFO_NITERSM1 (LOOP_VINFO).  The bound
+   recorded for the loop doesn't work here since it can come from another exit
+   in a loop with an early break, while NITERSM1 describes the main exit.  */
+
+static widest_int
+vect_max_nitersm1 (loop_vec_info loop_vinfo)
+{
+  class tree_niter_desc desc;
+  if (number_of_iterations_exit_assumptions (LOOP_VINFO_LOOP (loop_vinfo),
+					     LOOP_VINFO_MAIN_EXIT (loop_vinfo),
+					     &desc, NULL))
+    return desc.max;
+
+  tree type = TREE_TYPE (LOOP_VINFO_NITERSM1 (loop_vinfo));
+  return wi::to_widest (TYPE_MAX_VALUE (type));
+}
+
+/* Return a value suitable for the dr_with_seg_len::seg_len field that covers
+   all scalar iterations of LOOP_VINFO.  MAX_NITERSM1 is the result of
+   vect_max_nitersm1.
+
+   This is DR_STEP * NITERSM1.  We still prefer to use DR_STEP * (NITERS - 1) if
+   the two are equal, since adding the access size to it folds to the simpler
+   DR_STEP * NITERS.  They aren't equal if NITERS wraps to 0 in a type narrower
+   than sizetype, where NITERS - 1 becomes SIZE_MAX rather than the real count,
+   as in a do-while loop running 2^32 times on an unsigned int counter.  */
+
+static tree
+vect_vfa_niters_segment_size (loop_vec_info loop_vinfo, dr_vec_info *dr_info,
+			      const widest_int &max_nitersm1)
+{
+  tree nitersm1 = LOOP_VINFO_NITERSM1 (loop_vinfo);
+  tree type = TREE_TYPE (nitersm1);
+  if (TYPE_PRECISION (type) >= TYPE_PRECISION (sizetype)
+      || max_nitersm1 < wi::to_widest (TYPE_MAX_VALUE (type)))
+    return vect_vfa_segment_size (dr_info, LOOP_VINFO_NITERS (loop_vinfo));
+
+  return size_binop (MULT_EXPR, fold_convert (sizetype, DR_STEP (dr_info->dr)),
+		     fold_convert (sizetype, nitersm1));
+}
+
+/* Return true if the first and last lanes of DR_INFO in one vector iteration
+   can be further apart than PTRDIFF_MAX bytes, given that the vectorization
+   factor is VF.  Those lanes can't all run in one object, and the test for a
+   pair with equal steps compares the ends of segments that cover all of the
+   lanes, without allowing for an end that wraps.  A variable step counts if
+   DR_INFO is masked, since the masks are then all that says which lanes run and
+   nothing limits the step.  */
+
+static bool
+vect_lanes_may_wrap_p (dr_vec_info *dr_info, poly_uint64 vf)
+{
+  tree step = DR_STEP (dr_info->dr);
+  if (TREE_CODE (step) != INTEGER_CST)
+    return DR_IS_CONDITIONAL_IN_STMT (dr_info->dr);
+
+  widest_int span = (wi::abs (wi::to_widest (step))
+		     * (estimated_poly_value (vf, POLY_VALUE_MAX) - 1));
+  return span > wi::to_widest (TYPE_MAX_VALUE (ssizetype));
+}
+
 /* Return a value that, when added to abs (vect_vfa_segment_size (DR_INFO)),
    gives the worst-case number of bytes covered by the segment.  */
 
@@ -4013,8 +4075,15 @@ vect_compile_time_alias (dr_vec_info *a, dr_vec_info *b,
 			      offset_b, const_length_b))
     return 1;
 
+  /* Addresses wrap, so ranges that together span more than the address space
+     can overlap even though they look disjoint here.  Leave those to the
+     run-time test.  */
   if (!ranges_maybe_overlap_p (offset_a, const_length_a,
-			       offset_b, const_length_b))
+			       offset_b, const_length_b)
+      && known_le (upper_bound (offset_a + const_length_a,
+				offset_b + const_length_b)
+		   - lower_bound (offset_a, offset_b),
+		   wi::lshift (offset_int (1), TYPE_PRECISION (sizetype))))
     return 0;
 
   return -1;
@@ -4195,6 +4264,8 @@ vect_prune_runtime_alias_test_list (loop_vec_info loop_vinfo)
 
   DUMP_VECT_SCOPE ("vect_prune_runtime_alias_test_list");
 
+  LOOP_VINFO_ALIAS_NITERSM1_LIMIT (loop_vinfo) = NULL_TREE;
+
   /* Step values are irrelevant for aliasing if the number of vector
      iterations is equal to the number of scalar iterations (which can
      happen for fully-SLP loops).  */
@@ -4213,6 +4284,11 @@ vect_prune_runtime_alias_test_list (loop_vec_info loop_vinfo)
 
   comp_alias_ddrs.create (may_alias_ddrs.length ());
 
+  widest_int max_nitersm1 = 0;
+  if (TREE_CODE (scalar_loop_iters) != SCEV_NOT_KNOWN)
+    max_nitersm1 = vect_max_nitersm1 (loop_vinfo);
+  widest_int seg_max_iters = max_nitersm1;
+
   unsigned int loop_depth
     = index_in_loop_nest (LOOP_VINFO_LOOP (loop_vinfo)->num,
 			  LOOP_VINFO_LOOP_NEST (loop_vinfo));
@@ -4224,6 +4300,7 @@ vect_prune_runtime_alias_test_list (loop_vec_info loop_vinfo)
       tree segment_length_a, segment_length_b;
       unsigned HOST_WIDE_INT access_size_a, access_size_b;
       unsigned HOST_WIDE_INT align_a, align_b;
+      bool seg_may_wrap_p = false;
 
       /* Ignore the alias if the VF we chose ended up being no greater
 	 than the dependence distance.  */
@@ -4333,21 +4410,85 @@ vect_prune_runtime_alias_test_list (loop_vec_info loop_vinfo)
 	  if (!operand_equal_p (DR_STEP (dr_info_a->dr),
 				DR_STEP (dr_info_b->dr), 0))
 	    {
-	      length_factor = scalar_loop_iters;
-	      if (TREE_CODE (length_factor) == SCEV_NOT_KNOWN)
+	      if (TREE_CODE (scalar_loop_iters) == SCEV_NOT_KNOWN)
 		return opt_result::failure_at (vect_location,
 					       "Unsupported alias check on"
 					       " uncounted loop\n");
+
+	      /* The scalar iteration count is only an upper bound on how far
+		 a reference gets if the loop can break out early or if the
+		 reference is masked.  The bytes past the real accesses can be
+		 anywhere, so the length and the segment can wrap.  */
+	      seg_may_wrap_p = (LOOP_VINFO_EARLY_BREAKS (loop_vinfo)
+				|| DR_IS_CONDITIONAL_IN_STMT (dr_info_a->dr)
+				|| DR_IS_CONDITIONAL_IN_STMT (dr_info_b->dr));
+
+	      /* Limiting the iteration count for a variable step would need a
+		 run-time division, which isn't worth it.  */
+	      if (seg_may_wrap_p
+		  && (TREE_CODE (DR_STEP (dr_info_a->dr)) != INTEGER_CST
+		      || TREE_CODE (DR_STEP (dr_info_b->dr)) != INTEGER_CST))
+		return opt_result::failure_at (vect_location,
+					       "Unsupported alias check on"
+					       " variable step that might not"
+					       " run in every iteration\n");
+
+	      segment_length_a
+		= vect_vfa_niters_segment_size (loop_vinfo, dr_info_a,
+						max_nitersm1);
+	      segment_length_b
+		= vect_vfa_niters_segment_size (loop_vinfo, dr_info_b,
+						max_nitersm1);
 	    }
 	  else
-	    length_factor = size_int (vect_factor);
-	  segment_length_a = vect_vfa_segment_size (dr_info_a, length_factor);
-	  segment_length_b = vect_vfa_segment_size (dr_info_b, length_factor);
+	    {
+	      /* A stride this large can't happen outside of masked references
+		 with a bizarre base, so there's nothing to gain from a test
+		 that allows for it.  */
+	      if (vect_lanes_may_wrap_p (dr_info_a, vect_factor)
+		  || vect_lanes_may_wrap_p (dr_info_b, vect_factor))
+		return opt_result::failure_at (vect_location,
+					       "Unsupported alias check on"
+					       " lanes that are too far apart"
+					       "\n");
+
+	      length_factor = size_int (vect_factor);
+	      segment_length_a = vect_vfa_segment_size (dr_info_a,
+							length_factor);
+	      segment_length_b = vect_vfa_segment_size (dr_info_b,
+							length_factor);
+	    }
 	}
       access_size_a = vect_vfa_access_size (loop_vinfo, dr_info_a);
       access_size_b = vect_vfa_access_size (loop_vinfo, dr_info_b);
       align_a = vect_vfa_align (dr_info_a);
       align_b = vect_vfa_align (dr_info_b);
+
+      /* The test for a segment that wraps is only exact if the segment stays
+	 smaller than the address space.  Limit the count to that at run time,
+	 with one comparison for all of the pairs.  A constant count has to be
+	 within the limit already since vect_compile_time_alias works on the
+	 ends of the segments.  */
+      if (seg_may_wrap_p)
+	{
+	  if (access_size_a >= dr_seg_access_limit ()
+	      || access_size_b >= dr_seg_access_limit ())
+	    return opt_result::failure_at (vect_location,
+					   "Unsupported alias check on large"
+					   " access that might not run in"
+					   " every iteration\n");
+
+	  seg_max_iters = wi::smin (seg_max_iters,
+				    dr_seg_max_iters (DR_STEP (dr_info_a->dr)));
+	  seg_max_iters = wi::smin (seg_max_iters,
+				    dr_seg_max_iters (DR_STEP (dr_info_b->dr)));
+	  tree nitersm1 = LOOP_VINFO_NITERSM1 (loop_vinfo);
+	  if (TREE_CODE (nitersm1) == INTEGER_CST
+	      && wi::to_widest (nitersm1) > seg_max_iters)
+	    return opt_result::failure_at (vect_location,
+					   "Unsupported alias check on segment"
+					   " as large as the address space\n");
+	}
 
       /* See whether the alias is known at compilation time.  */
       if (operand_equal_p (DR_BASE_ADDRESS (dr_info_a->dr),
@@ -4408,8 +4549,20 @@ vect_prune_runtime_alias_test_list (loop_vec_info loop_vinfo)
 	(dr_a, dr_b, (preserves_scalar_order_p
 		      ? dr_with_seg_len_pair_t::WELL_ORDERED
 		      : dr_with_seg_len_pair_t::REORDERED));
+      if (seg_may_wrap_p)
+	dr_with_seg_len_pair.flags |= DR_ALIAS_SEG_MAY_WRAP;
 
       comp_alias_ddrs.safe_push (dr_with_seg_len_pair);
+    }
+
+  if (seg_max_iters < max_nitersm1)
+    {
+      tree nitersm1_type = TREE_TYPE (LOOP_VINFO_NITERSM1 (loop_vinfo));
+      tree limit = wide_int_to_tree (nitersm1_type, seg_max_iters);
+      LOOP_VINFO_ALIAS_NITERSM1_LIMIT (loop_vinfo) = limit;
+      if (dump_enabled_p ())
+	dump_printf_loc (MSG_NOTE, vect_location,
+			 "alias checks need NITERSM1 <= %T\n", limit);
     }
 
   prune_runtime_alias_test_list (&comp_alias_ddrs, vect_factor);

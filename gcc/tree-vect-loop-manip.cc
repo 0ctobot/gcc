@@ -43,6 +43,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "tree-ssa-loop-ivopts.h"
 #include "gimple-fold.h"
 #include "tree-ssa-loop-niter.h"
+#include "tree-eh.h"
 #include "internal-fn.h"
 #include "stor-layout.h"
 #include "optabs-query.h"
@@ -4317,6 +4318,15 @@ vect_create_cond_for_alias_checks (loop_vec_info loop_vinfo, tree * cond_expr)
 
   create_runtime_alias_checks (LOOP_VINFO_LOOP (loop_vinfo),
 			       &comp_alias_ddrs, cond_expr);
+
+  if (tree limit = LOOP_VINFO_ALIAS_NITERSM1_LIMIT (loop_vinfo))
+    {
+      tree nitersm1 = unshare_expr (LOOP_VINFO_NITERSM1 (loop_vinfo));
+      nitersm1 = rewrite_to_non_trapping_overflow (nitersm1);
+      chain_cond_expr (cond_expr, fold_build2 (LE_EXPR, boolean_type_node,
+					       nitersm1, limit));
+    }
+
   if (dump_enabled_p ())
     dump_printf_loc (MSG_NOTE, vect_location,
 		     "created %u versioning for alias checks.\n",
