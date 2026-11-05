@@ -1860,6 +1860,11 @@ eliminate_tail_call (struct tailcall *t, class loop *&new_loop)
 	{
 	  if (param == gimple_call_arg (stmt, idx))
 	    continue;
+	  /* The next iteration's argument gets stored into param's memory, so
+	     param cannot stay TREE_READONLY.  IPA-CP and the inliner take that
+	     flag to mean param holds its incoming value for the whole
+	     function, and they don't look for stores to it.  */
+	  TREE_READONLY (param) = 0;
 	  /* First check if param isn't used by any of the following
 	     call arguments.  If it is, we need to copy first to
 	     a temporary and only after doing all the assignments copy it
