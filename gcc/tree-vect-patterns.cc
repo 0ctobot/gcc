@@ -3560,6 +3560,16 @@ vect_recog_mulhs_pattern (vec_info *vinfo,
 	return NULL;
     }
 
+  /* A .MULHS or .MULHRS result doesn't always fit in NEW_TYPE: 0xff * 0xff >> 7
+     needs 9 bits.  That's only fine when the users ignore the upper bits, which
+     TARGET_PRECISION can't tell us when vect_recog_over_widening_pattern has
+     already narrowed the shift, since only the original statement has a
+     min_output_precision.  */
+  if (ifn != IFN_MULH
+      && (vect_orig_stmt (last_stmt_info)->min_output_precision
+	  > mult_precision))
+    return NULL;
+
   vect_pattern_detected ("vect_recog_mulhs_pattern", last_stmt);
 
   /* Check for target support.  */
