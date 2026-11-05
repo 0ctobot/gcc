@@ -1291,9 +1291,14 @@ crc_optimization::optimize_crc_loop (class loop *loop, gphi *output_crc)
   gimple_stmt_iterator tmp_gsi = gsi_for_stmt (output_crc);
   remove_phi_node (&tmp_gsi, false);
 
-  /* Alter the exit condition of the loop to always exit.  */
-  gcond* loop_exit_cond = get_loop_exit_condition (m_crc_loop);
-  gimple_cond_make_false (loop_exit_cond);
+  /* Alter the exit condition of the loop to always exit.  The exit can be
+     either edge of the condition, so use the value that takes it.  */
+  edge loop_exit = single_exit (m_crc_loop);
+  gcond *loop_exit_cond = get_loop_exit_condition (loop_exit);
+  if (loop_exit->flags & EDGE_TRUE_VALUE)
+    gimple_cond_make_true (loop_exit_cond);
+  else
+    gimple_cond_make_false (loop_exit_cond);
   update_stmt (loop_exit_cond);
   return true;
 }
