@@ -3351,6 +3351,13 @@ hoist_code (void)
 	      int insn_inserted_p;
 	      occr_t occr;
 
+	      /* EXPR is inserted before BB's final jump, so punt if that
+		 jump modifies one of EXPR's operands, e.g. an asm goto
+		 output or memory clobbered by an asm goto.  */
+	      if (JUMP_P (BB_END (bb))
+		  && modified_in_p (expr->expr, BB_END (bb)))
+		continue;
+
 	      /* If an expression is computed in BB and is available at end of
 		 BB, hoist all occurrences dominated by BB to BB.  */
 	      if (bitmap_bit_p (comp[bb->index], i))
