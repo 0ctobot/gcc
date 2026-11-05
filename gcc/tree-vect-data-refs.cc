@@ -165,9 +165,12 @@ vect_preserves_scalar_order_p (loop_vec_info loop_vinfo,
   stmt_vec_info stmtinfo_a = dr_info_a->stmt;
   stmt_vec_info stmtinfo_b = dr_info_b->stmt;
   class loop *loop = LOOP_VINFO_LOOP (loop_vinfo);
+  /* Gather and scatter accesses can have a null DR_STEP.  */
   bool zero_step_read_a = (DR_IS_READ (dr_info_a->dr)
+			   && DR_STEP (dr_info_a->dr)
 			   && integer_zerop (DR_STEP (dr_info_a->dr)));
   bool zero_step_read_b = (DR_IS_READ (dr_info_b->dr)
+			   && DR_STEP (dr_info_b->dr)
 			   && integer_zerop (DR_STEP (dr_info_b->dr)));
 
   /* Single statements are always kept in their original order, except for a
@@ -242,6 +245,8 @@ vect_analyze_possibly_independent_ddr (data_dependence_relation *ddr,
 				       int loop_depth, unsigned int *max_vf)
 {
   class loop *loop = LOOP_VINFO_LOOP (loop_vinfo);
+  dr_vec_info *dr_info_a = loop_vinfo->lookup_dr (DDR_A (ddr));
+  dr_vec_info *dr_info_b = loop_vinfo->lookup_dr (DDR_B (ddr));
   for (lambda_vector &dist_v : DDR_DIST_VECTS (ddr))
     {
       int dist = dist_v[loop_depth];
@@ -270,11 +275,65 @@ vect_analyze_possibly_independent_ddr (data_dependence_relation *ddr,
 
 	     Note that the alias checks will be removed if the VF ends up
 	     being small enough.  */
-	  dr_vec_info *dr_info_a = loop_vinfo->lookup_dr (DDR_A (ddr));
-	  dr_vec_info *dr_info_b = loop_vinfo->lookup_dr (DDR_B (ddr));
 	  return (!STMT_VINFO_GATHER_SCATTER_P (dr_info_a->stmt)
 		  && !STMT_VINFO_GATHER_SCATTER_P (dr_info_b->stmt)
 		  && vect_mark_for_runtime_alias_test (ddr, loop_vinfo));
+	}
+
+      /* The distance is zero or negative, so the bases being the same object is
+	 only harmful if vectorizing changes the order of the accesses.  That
+	 happens to grouped accesses, since a group of loads is emitted at its
+	 first load and a group of stores at its last store.  An alias check is
+	 enough to keep vectorizing: the bases can't partially overlap under the
+	 strict aliasing that DDR_COULD_BE_INDEPENDENT_P implies, and unequal
+	 bases rule out every distance.  If we can't emit the check, the
+	 caller's use of the distances rejects the loop.  */
+      bool reordered_p
+	= !vect_preserves_scalar_order_p (loop_vinfo, dr_info_a, dr_info_b);
+
+      if (dist != 0)
+	{
+	  /* An outer loop needs the backward inner loop distance check from the
+	     caller, see PR81740.  */
+	  bool inner_backward_p = false;
+	  if (nested_in_vect_loop_p (loop, dr_info_a->stmt)
+	      || nested_in_vect_loop_p (loop, dr_info_b->stmt))
+	    {
+	      unsigned inner_depth = index_in_loop_nest (loop->inner->num,
+							 DDR_LOOP_NEST (ddr));
+	      inner_backward_p = dist_v[inner_depth] < 0;
+	    }
+
+	  /* Both problems are between different iterations here, so they're
+	     covered by the same safelen assertion as a positive distance.  */
+	  if ((reordered_p || inner_backward_p)
+	      && loop->safelen >= 2
+	      && abs_hwi (dist) <= loop->safelen)
+	    {
+	      if ((unsigned int) loop->safelen < *max_vf)
+		*max_vf = loop->safelen;
+	      LOOP_VINFO_NO_DATA_DEPENDENCIES (loop_vinfo) = false;
+	      continue;
+	    }
+
+	  if (inner_backward_p)
+	    return false;
+	}
+
+      /* A zero distance is within one iteration, which safelen says nothing
+	 about, so it always needs the alias check here.  */
+      if (reordered_p)
+	return vect_mark_for_runtime_alias_test (ddr, loop_vinfo);
+
+      /* A zero step would make a zero distance apply to every pair of
+	 iterations rather than just to one.  */
+      if (dist == 0 && loop->safelen < 2)
+	{
+	  tree indicator = dr_zero_step_indicator (DDR_A (ddr));
+	  if (!indicator || integer_zerop (indicator))
+	    return false;
+	  if (TREE_CODE (indicator) != INTEGER_CST)
+	    vect_check_nonzero_value (loop_vinfo, indicator);
 	}
     }
   return true;
@@ -307,10 +366,25 @@ vect_analyze_data_ref_dependence (struct data_dependence_relation *ddr,
   unsigned int loop_depth;
 
   /* If user asserted safelen consecutive iterations can be
-     executed concurrently, assume independence.  */
+     executed concurrently, assume independence.  That doesn't say anything
+     about two accesses in the same iteration, so they still have to stay in
+     scalar order unless one of them is an invariant read.  An invariant read
+     that overlaps the other access in one iteration overlaps it in the other
+     iterations too, which the assertion rules out.  */
+  auto invariant_read_p = [&](dr_vec_info *dr_info)
+    {
+      return (DR_IS_READ (dr_info->dr)
+	      && DR_STEP (dr_info->dr)
+	      && integer_zerop (DR_STEP (dr_info->dr))
+	      && !nested_in_vect_loop_p (loop, dr_info->stmt));
+    };
   auto apply_safelen = [&]()
     {
-      if (loop->safelen >= 2)
+      if (loop->safelen >= 2
+	  && (invariant_read_p (dr_info_a)
+	      || invariant_read_p (dr_info_b)
+	      || vect_preserves_scalar_order_p (loop_vinfo, dr_info_a,
+						dr_info_b)))
 	{
 	  if ((unsigned int) loop->safelen < *max_vf)
 	    *max_vf = loop->safelen;
@@ -3946,11 +4020,14 @@ vect_compile_time_alias (dr_vec_info *a, dr_vec_info *b,
   return -1;
 }
 
-/* Return true if the minimum nonzero dependence distance for loop LOOP_DEPTH
-   in DDR is >= VF.  */
+/* Return true if the minimum dependence distance for loop LOOP_DEPTH in DDR is
+   >= VF, so that an alias check isn't needed.  Zero and negative distances only
+   count if vectorizing reorders the accesses of DDR.  LOOP_VINFO is the loop
+   being vectorized.  */
 
 static bool
-dependence_distance_ge_vf (data_dependence_relation *ddr,
+dependence_distance_ge_vf (loop_vec_info loop_vinfo,
+			   data_dependence_relation *ddr,
 			   unsigned int loop_depth, poly_uint64 vf)
 {
   if (DDR_ARE_DEPENDENT (ddr) != NULL_TREE
@@ -3960,14 +4037,17 @@ dependence_distance_ge_vf (data_dependence_relation *ddr,
   /* If the dependence is exact, we should have limited the VF instead.  */
   gcc_checking_assert (DDR_COULD_BE_INDEPENDENT_P (ddr));
 
+  dr_vec_info *dr_info_a = loop_vinfo->lookup_dr (DDR_A (ddr));
+  dr_vec_info *dr_info_b = loop_vinfo->lookup_dr (DDR_B (ddr));
   unsigned int i;
   lambda_vector dist_v;
   FOR_EACH_VEC_ELT (DDR_DIST_VECTS (ddr), i, dist_v)
     {
       HOST_WIDE_INT dist = dist_v[loop_depth];
-      if (dist != 0
-	  && !(dist > 0 && DDR_REVERSED_P (ddr))
-	  && maybe_lt ((unsigned HOST_WIDE_INT) abs_hwi (dist), vf))
+      if (maybe_lt ((unsigned HOST_WIDE_INT) abs_hwi (dist), vf)
+	  && ((dist != 0 && !(dist > 0 && DDR_REVERSED_P (ddr)))
+	      || !vect_preserves_scalar_order_p (loop_vinfo, dr_info_a,
+						 dr_info_b)))
 	return false;
     }
 
@@ -4147,7 +4227,7 @@ vect_prune_runtime_alias_test_list (loop_vec_info loop_vinfo)
 
       /* Ignore the alias if the VF we chose ended up being no greater
 	 than the dependence distance.  */
-      if (dependence_distance_ge_vf (ddr, loop_depth, vect_factor))
+      if (dependence_distance_ge_vf (loop_vinfo, ddr, loop_depth, vect_factor))
 	continue;
 
       if (DDR_OBJECT_A (ddr))
