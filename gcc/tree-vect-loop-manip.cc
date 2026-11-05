@@ -3274,6 +3274,35 @@ vect_get_main_loop_result (loop_vec_info loop_vinfo, tree main_loop_value,
   return phi_result;
 }
 
+/* Return true if the conditions guarding the loop of LOOP_VINFO prove that its
+   NITERS isn't 0, which means that computing it as NITERSM1 + 1 can't have
+   overflowed.  */
+
+bool
+vect_niters_nonzero_p (loop_vec_info loop_vinfo)
+{
+  class loop *loop = LOOP_VINFO_LOOP (loop_vinfo);
+  tree niters = LOOP_VINFO_NITERS (loop_vinfo);
+  tree cond = fold_build2 (NE_EXPR, boolean_type_node, niters,
+			   build_zero_cst (TREE_TYPE (niters)));
+  if (integer_nonzerop (simplify_using_initial_conditions (loop, cond)))
+    return true;
+
+  /* The count for a loop stepping a byte pointer is the difference between the
+     integer values of the pointers.  Folding keeps those conversions, which
+     stops the check above from matching a guard that compares the pointers.  */
+  if (TREE_CODE (niters) != MINUS_EXPR)
+    return false;
+  tree op0 = TREE_OPERAND (niters, 0);
+  tree op1 = TREE_OPERAND (niters, 1);
+  STRIP_NOPS (op0);
+  STRIP_NOPS (op1);
+  if (!POINTER_TYPE_P (TREE_TYPE (op0)) || !POINTER_TYPE_P (TREE_TYPE (op1)))
+    return false;
+  cond = fold_build2 (NE_EXPR, boolean_type_node, op0, op1);
+  return integer_nonzerop (simplify_using_initial_conditions (loop, cond));
+}
+
 /* Function vect_do_peeling.
 
    Input:
@@ -3428,6 +3457,13 @@ vect_do_peeling (loop_vec_info loop_vinfo, tree niters, tree nitersm1,
   class loop *prolog = NULL, *epilog = NULL;
   class loop *first_loop = loop;
   bool irred_flag = loop_preheader_edge (loop)->flags & EDGE_IRREDUCIBLE_LOOP;
+
+  /* Find out if NITERS can be 0 at run time while the loop is still intact and
+     before the prolog code below rewrites NITERS.  */
+  bool niters_maybe_zero = (!uncounted_p
+			    && !niters_no_overflow
+			    && prolog_peeling < 0
+			    && !vect_niters_nonzero_p (loop_vinfo));
 
   /* SSA form needs to be up-to-date since we are going to manually
      update SSA form in slpeel_tree_duplicate_loop_to_edge_cfg and delete all
@@ -3639,12 +3675,22 @@ vect_do_peeling (loop_vec_info loop_vinfo, tree niters, tree nitersm1,
       bool new_var_p = false;
       niters = vect_build_loop_niters (loop_vinfo, &new_var_p);
       /* It's guaranteed that vector loop bound before vectorization is at
-	 least VF, so set range information for newly generated var.  */
+	 least VF, so set range information for newly generated var.  The one
+	 exception is a NITERS that overflowed to 0 with a runtime prolog count
+	 of 0: nothing changes NITERS then, so it's still 0 and stands for the
+	 full range of the type.  Leaving 0 out of the range when it can happen
+	 would let VRP replace the wrap-safe vector bound with NITERS / VF.  */
       if (new_var_p)
 	{
-	  int_range<1> vr (type,
+	  int_range<2> vr (type,
 			   wi::to_wide (build_int_cst (type, lowest_vf)),
 			   wi::to_wide (TYPE_MAX_VALUE (type)));
+	  if (niters_maybe_zero)
+	    {
+	      int_range<1> zero;
+	      zero.set_zero (type);
+	      vr.union_ (zero);
+	    }
 	  set_range_info (niters, vr);
 	}
 
