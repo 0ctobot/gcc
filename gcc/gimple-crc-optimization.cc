@@ -74,7 +74,7 @@ class crc_optimization {
   /* This is the main function that checks whether the given LOOP
      calculates CRC and extracts details of the CRC calculation.
 
-     The main idea is to find the innermost loop with 8, 16, 24, 32, 64
+     The main idea is to find the innermost loop with 8, 16, 32, 64
      iterations and xor instruction (xor is the key operation for naive CRC
      calculation). Then, checks that the variable is shifted by one before/after
      being used in xor.
@@ -98,7 +98,7 @@ class crc_optimization {
 						unsigned loop_num_nodes);
 
   /* Checks the FUNC_LOOP loop's iteration number.
-     The loop for CRC calculation may do 8, 16, 24, 32, 64 iterations.  */
+     The loop for CRC calculation may do 8, 16, 32, 64 iterations.  */
   bool satisfies_crc_loop_iteration_count (class loop *func_loop);
 
   /* This function checks if the XOR_STMT is used for CRC calculation.
@@ -885,7 +885,7 @@ crc_optimization::loop_contains_two_conditional_bb (basic_block *loop_bbs,
 }
 
 /* Checks the FUNC_LOOP loop's iteration number.
-   The loop for CRC calculation may do 8, 16, 24, 32, 64 iterations.  */
+   The loop for CRC calculation may do 8, 16, 32, 64 iterations.  */
 
 bool
 crc_optimization::satisfies_crc_loop_iteration_count (class loop *func_loop)
@@ -911,8 +911,7 @@ crc_optimization::satisfies_crc_loop_iteration_count (class loop *func_loop)
 		 HOST_WIDE_INT_PRINT_UNSIGNED ".\n", loop_iteration_number);
 
       if ((loop_iteration_number == 7 || loop_iteration_number == 15
-	   || loop_iteration_number == 23 || loop_iteration_number == 31
-	   || loop_iteration_number == 63))
+	   || loop_iteration_number == 31 || loop_iteration_number == 63))
 	return true;
     }
   if (stderr && (dump_flags & TDF_DETAILS))
@@ -923,7 +922,7 @@ crc_optimization::satisfies_crc_loop_iteration_count (class loop *func_loop)
 /* This is the main function that checks whether the given LOOP
    calculates CRC and extracts details of the CRC calculation.
 
-   The main idea is to find the innermost loop with 8, 16, 24, 32, 64
+   The main idea is to find the innermost loop with 8, 16, 32, 64
    iterations and xor instruction (xor is the key operation for naive CRC
    calculation). Then, checks that the variable is shifted by one before/after
    being used in xor.
