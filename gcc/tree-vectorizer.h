@@ -976,6 +976,9 @@ public:
   tree num_iters_unchanged;
   /* Condition under which this loop is analyzed and versioned.  */
   tree num_iters_assumptions;
+  /* The largest LOOP_VINFO_NITERSM1 for which the alias checks are valid, or
+     null if they are valid for all of them.  */
+  tree alias_nitersm1_limit;
 
   /* The cost of the vector code.  */
   class vector_costs *vector_costs;
@@ -1315,6 +1318,7 @@ public:
    cost model.  */
 #define LOOP_VINFO_NITERS_UNCHANGED(L)     (L)->num_iters_unchanged
 #define LOOP_VINFO_NITERS_ASSUMPTIONS(L)   (L)->num_iters_assumptions
+#define LOOP_VINFO_ALIAS_NITERSM1_LIMIT(L) (L)->alias_nitersm1_limit
 #define LOOP_VINFO_COST_MODEL_THRESHOLD(L) (L)->th
 #define LOOP_VINFO_VERSIONING_THRESHOLD(L) (L)->versioning_threshold
 #define LOOP_VINFO_VECTORIZABLE_P(L)       (L)->vectorizable
