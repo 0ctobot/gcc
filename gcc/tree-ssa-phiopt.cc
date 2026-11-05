@@ -3855,7 +3855,41 @@ cond_store_replacement_limited (basic_block middle_bb, basic_block join_bb,
 	     always safely move down the store.  */
 	  if (lhs_could_trap_p (lhs))
 	    return false;
+	  /* As in cond_store_replacement, the memory doesn't have to hold a
+	     valid value of the store's type on the path that skips the store.
+	     Load a _Bool through an integer type of its whole mode, and keep
+	     the store conditional for any other type without mode precision
+	     that isn't a bit-field.  */
+	  tree type = TREE_TYPE (lhs);
+	  tree full_type = NULL_TREE;
+	  if (INTEGRAL_TYPE_P (type)
+	      && !type_has_mode_precision_p (type)
+	      && TREE_CODE (lhs) != BIT_FIELD_REF
+	      && (TREE_CODE (lhs) != COMPONENT_REF
+		  || !DECL_BIT_FIELD (TREE_OPERAND (lhs, 1))))
+	    {
+	      if (TREE_CODE (type) != BOOLEAN_TYPE)
+		return false;
+	      full_type
+		= build_nonstandard_integer_type (GET_MODE_BITSIZE
+						    (SCALAR_INT_TYPE_MODE (type)),
+						  1);
+	    }
 	  lhs = copy_mem_with_alias_set_zero (lhs);
+	  if (full_type)
+	    {
+	      lhs = fold_build1 (VIEW_CONVERT_EXPR, full_type, lhs);
+	      if (TREE_CODE (rhs) == SSA_NAME)
+		{
+		  tree name = make_temp_ssa_name (full_type, NULL, "cstore");
+		  new_stmt = gimple_build_assign (name, NOP_EXPR, rhs);
+		  gimple_set_location (new_stmt, locus);
+		  gsi_insert_on_edge (e0, new_stmt);
+		  rhs = name;
+		}
+	      else
+		rhs = fold_convert (full_type, rhs);
+	    }
 	  /* Insert a load from the memory of the store to the temporary
 	     on the edge which did not contain the store.  */
 	  other_rhs = make_temp_ssa_name (TREE_TYPE (lhs), NULL, "cstore");
