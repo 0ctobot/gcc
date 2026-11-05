@@ -1210,13 +1210,62 @@ struct noce_cc_reg_set
   HARD_REG_SET set;
   unsigned int fixed_regno1;
   unsigned int fixed_regno2;
+  /* The jump that the sequence goes in front of.  */
+  rtx_insn *jump;
+  /* The sequence, and the insn in it whose stores are being recorded.  */
+  rtx_insn *seq;
+  rtx_insn *insn;
 };
 
-/* If DEST is a hard condition-code register, add it to the set in DATA.
-   PAT is the SET or CLOBBER that writes DEST.  */
+/* Return true if PAT, the store to DEST made by CC_REGS->insn, repeats the
+   comparison that set DEST ahead of CC_REGS->jump.  DEST then keeps the value
+   it already held at the jump, so nothing that reads it can tell.  */
+
+static bool
+noce_repeats_cc_comparison_p (const noce_cc_reg_set *cc_regs, rtx dest,
+			      const_rtx pat)
+{
+  if (GET_CODE (pat) != SET
+      || SET_DEST (pat) != dest
+      || side_effects_p (SET_SRC (pat)))
+    return false;
+
+  rtx_insn *jump = cc_regs->jump;
+  rtx_insn *head = BB_HEAD (BLOCK_FOR_INSN (jump));
+  rtx_insn *setter = jump;
+  do
+    {
+      if (setter == head)
+	return false;
+      setter = PREV_INSN (setter);
+    }
+  while (!NONDEBUG_INSN_P (setter) || !reg_set_p (dest, setter));
+
+  /* The check on SETTER itself rejects a comparison that reads DEST, such as
+     a conditional compare, whose repeat wouldn't see the same input.  */
+  rtx setter_set = single_set (setter);
+  if (!setter_set
+      || !rtx_equal_p (SET_DEST (setter_set), dest)
+      || !rtx_equal_p (SET_SRC (setter_set), SET_SRC (pat))
+      || modified_in_p (SET_SRC (pat), setter)
+      || modified_between_p (SET_SRC (pat), setter, jump))
+    return false;
+
+  /* The sequence writes the conditional move's target as it goes, and that
+     can be one of the registers being compared.  */
+  for (rtx_insn *insn = cc_regs->seq; insn != cc_regs->insn;
+       insn = NEXT_INSN (insn))
+    if (modified_in_p (SET_SRC (pat), insn))
+      return false;
+
+  return true;
+}
+
+/* If DEST is a hard condition-code register whose value changes, add it to
+   the set in DATA.  PAT is the SET or CLOBBER that writes DEST.  */
 
 static void
-noce_record_cc_reg_set (rtx dest, const_rtx pat ATTRIBUTE_UNUSED, void *data)
+noce_record_cc_reg_set (rtx dest, const_rtx pat, void *data)
 {
   noce_cc_reg_set *cc_regs = (noce_cc_reg_set *) data;
 
@@ -1224,21 +1273,28 @@ noce_record_cc_reg_set (rtx dest, const_rtx pat ATTRIBUTE_UNUSED, void *data)
       && (GET_MODE_CLASS (GET_MODE (dest)) == MODE_CC
 	  || REGNO (dest) == targetm.flags_regnum
 	  || REGNO (dest) == cc_regs->fixed_regno1
-	  || REGNO (dest) == cc_regs->fixed_regno2))
+	  || REGNO (dest) == cc_regs->fixed_regno2)
+      && !noce_repeats_cc_comparison_p (cc_regs, dest, pat))
     add_to_hard_reg_set (&cc_regs->set, GET_MODE (dest), REGNO (dest));
 }
 
-/* Return true if SEQ writes a condition-code register that still holds a
-   value which is live on exit from TEST_BB.
+/* Return true if SEQ, which goes immediately before JUMP, changes the value
+   of a condition-code register that is live on exit from JUMP's block.
 
-   An if-converted sequence is emitted immediately before the jump that ends
-   TEST_BB, and the conversion then removes that jump, so a condition code
-   that is live out of TEST_BB is one which a later block still reads.
-   Expanding a conditional move can emit a fresh comparison, and that would
-   destroy it.  */
+   The conversion removes JUMP, so a condition code that is live on exit is
+   one that a later block, or an arm being converted, still reads.  Expanding
+   a conditional move can emit a fresh comparison, which would destroy it.
+   Usually though, that comparison is a copy of the one JUMP tests and a later
+   pass deletes it, so it isn't treated as a change.
+
+   find_cond_trap puts SEQ in front of the earliest insn of the condition
+   instead.  That's JUMP itself unless noce_get_condition traced the
+   condition back through the insn that set the condition code JUMP tests.
+   That insn then stays between SEQ and JUMP, so the condition code has the
+   same value on exit from JUMP's block whatever SEQ writes to it.  */
 
 static bool
-noce_clobbers_live_cc_p (basic_block test_bb, rtx_insn *seq)
+noce_clobbers_live_cc_p (rtx_insn *jump, rtx_insn *seq)
 {
   noce_cc_reg_set cc_regs;
   CLEAR_HARD_REG_SET (cc_regs.set);
@@ -1246,10 +1302,15 @@ noce_clobbers_live_cc_p (basic_block test_bb, rtx_insn *seq)
   cc_regs.fixed_regno2 = INVALID_REGNUM;
   targetm.fixed_condition_code_regs (&cc_regs.fixed_regno1,
 				     &cc_regs.fixed_regno2);
+  cc_regs.jump = jump;
+  cc_regs.seq = seq;
   for (rtx_insn *insn = seq; insn; insn = NEXT_INSN (insn))
-    note_stores (insn, noce_record_cc_reg_set, &cc_regs);
+    {
+      cc_regs.insn = insn;
+      note_stores (insn, noce_record_cc_reg_set, &cc_regs);
+    }
 
-  bitmap live_out = df_get_live_out (test_bb);
+  bitmap live_out = df_get_live_out (BLOCK_FOR_INSN (jump));
   hard_reg_set_iterator hrsi;
   unsigned int regno;
   EXECUTE_IF_SET_IN_HARD_REG_SET (cc_regs.set, 0, regno, hrsi)
@@ -1294,7 +1355,7 @@ end_ifcvt_sequence (noce_if_info *if_info)
       return NULL;
 
   /* CC above only covers the condition code read by the converted branch.  */
-  if (noce_clobbers_live_cc_p (if_info->test_bb, seq))
+  if (noce_clobbers_live_cc_p (if_info->jump, seq))
     return NULL;
 
   return seq;
@@ -4232,7 +4293,7 @@ noce_convert_multiple_sets (noce_if_info *if_info)
 
   /* This path does not go through end_ifcvt_sequence, so apply the same rule
      about condition codes that outlive the if-region.  */
-  if (noce_clobbers_live_cc_p (test_bb, seq))
+  if (noce_clobbers_live_cc_p (jump, seq))
     return false;
 
   emit_insn_before_setloc (seq, if_info->jump, sequence_location);
@@ -6115,7 +6176,7 @@ find_cond_trap (basic_block test_bb, edge then_edge, edge else_edge)
 	: recog_memoized (x) < 0)
       return false;
 
-  if (noce_clobbers_live_cc_p (test_bb, seq))
+  if (noce_clobbers_live_cc_p (jump, seq))
     return false;
 
   /* Emit the new insns before cond_earliest.  */
