@@ -3355,6 +3355,36 @@ cond_store_replacement (basic_block middle_bb, basic_block join_bb, edge e0,
 	return false;
     }
 
+  /* The load below reads whatever is in memory on the path that skips the
+     store, and that doesn't have to be a valid value of the store's type.  The
+     store can be to a _Bool member of a union whose other member of the same
+     size was written last, or it can go through a type-punned pointer.  A _Bool
+     is loaded without any masking and all later code assumes it holds 0 or 1,
+     so an arbitrary byte flowing through the PHI miscompiles any later read of
+     that memory.  Masking the load isn't an option since the value gets stored
+     back.  Therefore, access the whole mode with an integer type, which keeps
+     every bit and doesn't promise anything about the value.
+
+     Keep the store conditional for any other integer type narrower than its
+     mode.  In particular, a _BitInt gets masked or extended when it's loaded,
+     even through a VIEW_CONVERT_EXPR, and storing that value back clobbers the
+     padding bits.  A bit-field store only touches the bits of the field, so
+     it's fine as is.  */
+  tree type = TREE_TYPE (lhs);
+  tree full_type = NULL_TREE;
+  if (INTEGRAL_TYPE_P (type)
+      && !type_has_mode_precision_p (type)
+      && TREE_CODE (lhs) != BIT_FIELD_REF
+      && (TREE_CODE (lhs) != COMPONENT_REF
+	  || !DECL_BIT_FIELD (TREE_OPERAND (lhs, 1))))
+    {
+      if (TREE_CODE (type) != BOOLEAN_TYPE)
+	return false;
+      full_type
+	= build_nonstandard_integer_type (GET_MODE_BITSIZE
+					    (SCALAR_INT_TYPE_MODE (type)), 1);
+    }
+
   /* Now we've checked the constraints, so do the transformation:
      1) Remove the single store.  */
   gsi = gsi_for_stmt (assign);
@@ -3377,6 +3407,23 @@ cond_store_replacement (basic_block middle_bb, basic_block join_bb, edge e0,
     *basep = build2 (MEM_REF, TREE_TYPE (*basep),
 		     build_fold_addr_expr (*basep),
 		     build_zero_cst (ptr_type_node));
+
+  /* The load, the PHI and the store below all take their type from LHS, which
+     leaves only the value being stored to convert.  */
+  if (full_type)
+    {
+      lhs = fold_build1 (VIEW_CONVERT_EXPR, full_type, lhs);
+      if (TREE_CODE (rhs) == SSA_NAME)
+	{
+	  name = make_temp_ssa_name (full_type, NULL, "cstore");
+	  new_stmt = gimple_build_assign (name, NOP_EXPR, rhs);
+	  gimple_set_location (new_stmt, locus);
+	  gsi_insert_on_edge (e0, new_stmt);
+	  rhs = name;
+	}
+      else
+	rhs = fold_convert (full_type, rhs);
+    }
 
   /* 2) Insert a load from the memory of the store to the temporary
         on the edge which did not contain the store.  */
