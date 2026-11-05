@@ -4951,7 +4951,8 @@ expand_debug_expr (tree exp)
   switch (TREE_CODE (exp))
     {
     case STRING_CST:
-      if (!lookup_constant_def (exp))
+      op0 = lookup_constant_def (exp);
+      if (!op0)
 	{
 	  if (strlen (TREE_STRING_POINTER (exp)) + 1
 	      != (size_t) TREE_STRING_LENGTH (exp))
@@ -4961,7 +4962,10 @@ expand_debug_expr (tree exp)
 	  set_mem_attributes (op0, exp, 0);
 	  return op0;
 	}
-      /* Fall through.  */
+      /* Use the copy that was found.  expand_expr would ask for one aligned
+	 enough for this function and could place a new copy just for the debug
+	 info, which would make the labels of later constants depend on -g.  */
+      return op0;
 
     case INTEGER_CST:
       if (BITINT_TYPE_P (TREE_TYPE (exp))

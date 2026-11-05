@@ -3487,6 +3487,12 @@ operand_compare::operand_equal_p (tree type0, const_tree arg0,
 				    flags));
 
       case STRING_CST:
+	/* The addresses of strings with the same bytes aren't interchangeable
+	   if their types differ in alignment (e.g., "\0\0\0" and L"").  */
+	if ((flags & OEP_ADDRESS_OF)
+	    && (TYPE_ALIGN (TREE_TYPE (arg0))
+		!= TYPE_ALIGN (TREE_TYPE (arg1))))
+	  return false;
 	return (TREE_STRING_LENGTH (arg0) == TREE_STRING_LENGTH (arg1)
 		&& ! memcmp (TREE_STRING_POINTER (arg0),
 			     TREE_STRING_POINTER (arg1),
