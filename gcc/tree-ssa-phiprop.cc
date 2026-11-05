@@ -22,6 +22,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "system.h"
 #include "coretypes.h"
 #include "backend.h"
+#include "target.h"
 #include "tree.h"
 #include "gimple.h"
 #include "tree-pass.h"
@@ -31,6 +32,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "tree-eh.h"
 #include "tree-dfa.h"
 #include "gimple-iterator.h"
+#include "gimple-fold.h"
 #include "stor-layout.h"
 #include "tree-ssa-loop.h"
 #include "tree-cfg.h"
@@ -103,12 +105,14 @@ struct phiprop_d
 /* Insert a new phi node for the dereference of PHI at basic_block
    BB with the virtual operands from USE_STMT. The vuse for
    the load will be set to OTHER_VUSE unless there is virtual op
-   phi for BB.  */
+   phi for BB.  When TRUNCATE is true, each inserted load reads the
+   whole mode of the loaded boolean and truncates it to the precision
+   of the boolean.  */
 
 static tree
 phiprop_insert_phi (basic_block bb, gphi *phi, gimple *use_stmt,
 		    struct phiprop_d *phivn, size_t n,
-		    bitmap dce_ssa_names, tree other_vuse)
+		    bitmap dce_ssa_names, tree other_vuse, bool truncate)
 {
   tree res;
   gphi *new_phi = NULL;
@@ -198,16 +202,24 @@ phiprop_insert_phi (basic_block bb, gphi *phi, gimple *use_stmt,
 	  if (vuse)
 	    gimple_set_vuse (tmp, vuse);
 
-	  gsi_insert_on_edge (e, tmp);
-	  update_stmt (tmp);
+	  gimple_seq seq = NULL;
+	  if (truncate && gimple_needing_rewrite_undefined (tmp))
+	    seq = rewrite_to_defined_unconditional (tmp);
+	  else
+	    gimple_seq_add_stmt (&seq, tmp);
+	  for (gimple_stmt_iterator si = gsi_start (seq); !gsi_end_p (si);
+	       gsi_next (&si))
+	    update_stmt (gsi_stmt (si));
 
 	  if (dump_file && (dump_flags & TDF_DETAILS))
 	    {
 	      fprintf (dump_file, "  for edge defining ");
 	      print_generic_expr (dump_file, PHI_ARG_DEF_FROM_EDGE (phi, e));
 	      fprintf (dump_file, " inserting load ");
-	      print_gimple_stmt (dump_file, tmp, 0);
+	      print_gimple_seq (dump_file, seq, 0, TDF_NONE);
 	    }
+
+	  gsi_insert_seq_on_edge (e, seq);
 	}
 
       if (new_phi)
@@ -399,6 +411,17 @@ phiprop_load_exceeds_object_p (tree addr, tree type)
 		   wi::to_poly_offset (size));
 }
 
+/* Return true if a speculated load of type TYPE needs to load the whole mode
+   and truncate it to the precision of TYPE, which is what
+   rewrite_to_defined_unconditional does for a boolean load.  */
+
+static bool
+phiprop_truncated_load_p (tree type)
+{
+  return (TREE_CODE (type) == BOOLEAN_TYPE
+	  && !type_has_mode_precision_p (type));
+}
+
 /* Return true if a load of type TYPE can run on paths where the program doesn't
    perform it.  ADDRS holds the ADDR_EXPR arguments of the PHI, which are the
    places a new load gets inserted for.  tree_could_trap_p only looks at the
@@ -408,6 +431,23 @@ phiprop_load_exceeds_object_p (tree addr, tree type)
 static bool
 phiprop_can_speculate_load_p (tree type, const vec<tree> &addrs)
 {
+  /* Every PHI argument already has its value loaded, so nothing new runs.  */
+  if (addrs.is_empty ())
+    return true;
+
+  /* Do not speculate a load when that's not a noop, either because the mode
+     cannot be transferred or because there's UB involved for out-of-bound
+     values.  Memory that's readable can still hold bytes that aren't a valid
+     value of TYPE when the program doesn't load it, and later passes assume
+     that whatever gets loaded is within the range of TYPE.  A boolean is fine
+     since the speculated load reads the whole mode and truncates it, which
+     always gives a valid value.  */
+  if (!mode_can_transfer_bits (TYPE_MODE (type))
+      || (INTEGRAL_TYPE_P (type)
+	  && !type_has_mode_precision_p (type)
+	  && !phiprop_truncated_load_p (type)))
+    return false;
+
   for (tree addr : addrs)
     if (phiprop_load_exceeds_object_p (addr, type))
       return false;
@@ -546,23 +586,28 @@ propagate_with_phi (basic_block bb, gphi *vphi, gphi *phi,
       if (!other_vuse)
 	continue;
 
+      tree load_type = TREE_TYPE (gimple_assign_lhs (use_stmt));
       bool no_speculate
 	= (canpossible_trap
 	   || aggregate
-	   || !phiprop_can_speculate_load_p (TREE_TYPE (gimple_assign_lhs
-							  (use_stmt)),
-					     phi_addrs));
+	   || !phiprop_can_speculate_load_p (load_type, phi_addrs));
+      bool truncate = (!no_speculate
+		       && !phi_addrs.is_empty ()
+		       && phiprop_truncated_load_p (load_type));
 
-      if (no_speculate
+      if ((no_speculate || truncate)
 	  && !dom_info_available_p (cfun, CDI_POST_DOMINATORS))
 	calculate_dominance_info (CDI_POST_DOMINATORS);
 
       /* Only replace loads in blocks that post-dominate the PHI node.  That
-	 makes sure we don't end up speculating trapping loads or
-	 aggregate stores won't happen speculating.  */
-      if (no_speculate
-	  && !dominated_by_p (CDI_POST_DOMINATORS,
-			      bb, gimple_bb (use_stmt)))
+	 makes sure we don't end up speculating trapping loads or loads of
+	 invalid values, or aggregate stores won't happen speculating.  A
+	 boolean load in such a block runs on every path out of the PHI
+	 anyway, so it doesn't need truncating either.  */
+      if ((no_speculate || truncate)
+	  && dominated_by_p (CDI_POST_DOMINATORS, bb, gimple_bb (use_stmt)))
+	truncate = false;
+      else if (no_speculate)
 	delay = true;
 
       /* Amend the post-dominance check for SSA cycles, we need to
@@ -621,7 +666,7 @@ propagate_with_phi (basic_block bb, gphi *vphi, gphi *phi,
 	    }
 
 	  phiprop_insert_phi (bb, phi, use_stmt, phivn, n,
-			      dce_ssa_names, other_vuse);
+			      dce_ssa_names, other_vuse, false);
 
 	  /* Remove old stmt. The phi and all of maybe its dependencies
 	     will be removed later via simple_dce_from_worklist. */
@@ -655,7 +700,7 @@ propagate_with_phi (basic_block bb, gphi *vphi, gphi *phi,
 	{
 	  tree vuse = gimple_vuse (use_stmt);
 	  res = phiprop_insert_phi (bb, phi, use_stmt, phivn, n,
-				    dce_ssa_names, other_vuse);
+				    dce_ssa_names, other_vuse, truncate);
 	  type = TREE_TYPE (res);
 
 	  /* Remember the value we created for *ptr.  */
