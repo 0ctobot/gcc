@@ -689,7 +689,7 @@ static const struct default_options default_options_table[] =
     { OPT_LEVELS_2_PLUS_SPEED_ONLY, OPT_foptimize_strlen, NULL, 1 },
     { OPT_LEVELS_2_PLUS_SPEED_ONLY, OPT_freorder_blocks_algorithm_, NULL,
       REORDER_BLOCKS_ALGORITHM_STC },
-    { OPT_LEVELS_2_PLUS_SPEED_ONLY, OPT_ftree_loop_vectorize, NULL, 1 },
+    /* -ftree-loop-vectorize is off by default (PR126575, PR126590).  */
     { OPT_LEVELS_2_PLUS_SPEED_ONLY, OPT_ftree_slp_vectorize, NULL, 1 },
     { OPT_LEVELS_2_PLUS_SPEED_ONLY, OPT_fopenmp_target_simd_clone_, NULL,
       OMP_TARGET_SIMD_CLONE_NOHOST },
@@ -2169,7 +2169,7 @@ enable_fdo_optimizations (struct gcc_options *opts,
       SET_OPTION_IF_UNSET (opts, opts_set, flag_predictive_commoning, value);
       SET_OPTION_IF_UNSET (opts, opts_set, flag_split_loops, value);
       SET_OPTION_IF_UNSET (opts, opts_set, flag_unswitch_loops, value);
-      SET_OPTION_IF_UNSET (opts, opts_set, flag_tree_loop_vectorize, value);
+      /* -ftree-loop-vectorize stays off (PR126575, PR126590).  */
       SET_OPTION_IF_UNSET (opts, opts_set, flag_tree_slp_vectorize, value);
       SET_OPTION_IF_UNSET (opts, opts_set, flag_version_loops_for_strides, value);
       SET_OPTION_IF_UNSET (opts, opts_set, flag_vect_cost_model,
