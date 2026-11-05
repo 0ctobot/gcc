@@ -266,6 +266,17 @@ public:
 	that the flag does not say anything about whether the DR_STEPs
 	of the two references in the pair are the same.)
 
+   DR_ALIAS_SEG_MAY_WRAP:
+	One of the data references in the pair might not access every byte
+	that its segment covers, since it might not run in every iteration
+	that the segment length counts.  The segment can therefore reach
+	past the top of the address space in a valid program, and the
+	run-time test has to be correct for a segment that wraps around.
+	Whoever sets this flag must also make sure that the iteration count
+	is at most dr_seg_max_iters for both steps whenever the test passes,
+	since the test relies on the segment being smaller than the address
+	space.
+
    The ordering assumption mentioned above is that for every pair
    (DR_A, DR_B) in P:
 
@@ -304,6 +315,7 @@ const unsigned int DR_ALIAS_ARBITRARY = 1U << 3;
 const unsigned int DR_ALIAS_SWAPPED = 1U << 4;
 const unsigned int DR_ALIAS_UNSWAPPED = 1U << 5;
 const unsigned int DR_ALIAS_MIXED_STEPS = 1U << 6;
+const unsigned int DR_ALIAS_SEG_MAY_WRAP = 1U << 7;
 
 /* This struct contains two dr_with_seg_len objects with aliasing data
    refs.  Two comparisons are generated from them.  */
@@ -593,6 +605,8 @@ extern void prune_runtime_alias_test_list (vec<dr_with_seg_len_pair_t> *,
 extern void create_runtime_alias_checks (class loop *,
 					 const vec<dr_with_seg_len_pair_t> *,
 					 tree*);
+extern unsigned HOST_WIDE_INT dr_seg_access_limit ();
+extern widest_int dr_seg_max_iters (tree);
 extern tree dr_direction_indicator (struct data_reference *);
 extern tree dr_zero_step_indicator (struct data_reference *);
 extern bool dr_known_forward_stride_p (struct data_reference *);

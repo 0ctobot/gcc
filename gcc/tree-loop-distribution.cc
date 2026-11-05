@@ -102,6 +102,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "fold-const.h"
 #include "cfganal.h"
 #include "gimple-iterator.h"
+#include "gimplify.h"
 #include "gimplify-me.h"
 #include "stor-layout.h"
 #include "tree-cfg.h"
@@ -2698,6 +2699,25 @@ data_ref_segment_size (struct data_reference *dr, tree niters)
 		     fold_convert (sizetype, niters));
 }
 
+/* Compute and return the segment length of DR if it might not run in every
+   iteration of a loop whose latch runs LATCH_COUNT times.  It can run in the
+   iteration that leaves the loop if it comes before the exit test, so the
+   length has to cover LATCH_COUNT + 1 runs.  Since DR doesn't have to run in
+   all of them, the length can wrap in a valid program.  Lower *MAX_ITERS to the
+   largest latch count for which it doesn't.  The step is always constant here
+   because pg_add_dependence_edges doesn't record a pair without one.  */
+
+static tree
+data_ref_conditional_segment_size (struct data_reference *dr, tree latch_count,
+				   widest_int *max_iters)
+{
+  *max_iters = wi::smin (*max_iters, dr_seg_max_iters (DR_STEP (dr)));
+
+  return size_binop (MULT_EXPR,
+		     fold_convert (sizetype, DR_STEP (dr)),
+		     fold_convert (sizetype, latch_count));
+}
+
 /* Return true if LOOP's latch is dominated by statement for data reference
    DR.  */
 
@@ -2708,18 +2728,51 @@ latch_dominated_by_data_ref (class loop *loop, data_reference *dr)
 			 gimple_bb (DR_STMT (dr)));
 }
 
+/* Return true if versioning LOOP for DATAREFS might need an alias check that
+   create_intersect_range_checks can't build.  compute_alias_check_pairs sets
+   DR_ALIAS_SEG_MAY_WRAP for a pair with a reference that doesn't run on every
+   iteration, and the builder gives up on such a pair when either access is at
+   least dr_seg_access_limit () bytes, which leaves a check that always fails
+   and a distributed copy of the loop that never runs.  */
+
+static bool
+alias_check_may_fail_p (class loop *loop,
+			const vec<data_reference_p> &datarefs)
+{
+  bool may_wrap = false, too_big = false;
+  for (data_reference_p dr : datarefs)
+    {
+      if (!latch_dominated_by_data_ref (loop, dr))
+	may_wrap = true;
+      tree size = TYPE_SIZE_UNIT (TREE_TYPE (DR_REF (dr)));
+      if (!size
+	  || !tree_fits_uhwi_p (size)
+	  || tree_to_uhwi (size) >= dr_seg_access_limit ())
+	too_big = true;
+    }
+  return may_wrap && too_big;
+}
+
 /* Compute alias check pairs and store them in COMP_ALIAS_PAIRS for LOOP's
-   data dependence relations ALIAS_DDRS.  */
+   data dependence relations ALIAS_DDRS.  If they are only valid for a limited
+   latch count, store the condition for that in *GUARD, otherwise store
+   NULL_TREE.  */
 
 static void
 compute_alias_check_pairs (class loop *loop, vec<ddr_p> *alias_ddrs,
-			   vec<dr_with_seg_len_pair_t> *comp_alias_pairs)
+			   vec<dr_with_seg_len_pair_t> *comp_alias_pairs,
+			   tree *guard)
 {
   unsigned int i;
   unsigned HOST_WIDE_INT factor = 1;
   tree niters_plus_one, niters = number_of_latch_executions (loop);
 
   gcc_assert (niters != NULL_TREE && niters != chrec_dont_know);
+  tree latch_count = niters;
+  tree latch_count_type = TREE_TYPE (latch_count);
+  widest_int latch_count_max
+    = wi::to_widest (TYPE_MAX_VALUE (latch_count_type));
+  widest_int max_iters = latch_count_max;
   niters = fold_convert (sizetype, niters);
   niters_plus_one = size_binop (PLUS_EXPR, niters, size_one_node);
 
@@ -2733,16 +2786,25 @@ compute_alias_check_pairs (class loop *loop, vec<ddr_p> *alias_ddrs,
       struct data_reference *dr_a = DDR_A (ddr);
       struct data_reference *dr_b = DDR_B (ddr);
       tree seg_length_a, seg_length_b;
+      bool seg_may_wrap_p = false;
 
       if (latch_dominated_by_data_ref (loop, dr_a))
 	seg_length_a = data_ref_segment_size (dr_a, niters_plus_one);
       else
-	seg_length_a = data_ref_segment_size (dr_a, niters);
+	{
+	  seg_length_a = data_ref_conditional_segment_size (dr_a, latch_count,
+							    &max_iters);
+	  seg_may_wrap_p = true;
+	}
 
       if (latch_dominated_by_data_ref (loop, dr_b))
 	seg_length_b = data_ref_segment_size (dr_b, niters_plus_one);
       else
-	seg_length_b = data_ref_segment_size (dr_b, niters);
+	{
+	  seg_length_b = data_ref_conditional_segment_size (dr_b, latch_count,
+							    &max_iters);
+	  seg_may_wrap_p = true;
+	}
 
       unsigned HOST_WIDE_INT access_size_a
 	= tree_to_uhwi (TYPE_SIZE_UNIT (TREE_TYPE (DR_REF (dr_a))));
@@ -2756,9 +2818,18 @@ compute_alias_check_pairs (class loop *loop, vec<ddr_p> *alias_ddrs,
 	 dr_with_seg_len (dr_b, seg_length_b, access_size_b, align_b),
 	 /* ??? Would WELL_ORDERED be safe?  */
 	 dr_with_seg_len_pair_t::REORDERED);
+      if (seg_may_wrap_p)
+	dr_with_seg_len_pair.flags |= DR_ALIAS_SEG_MAY_WRAP;
 
       comp_alias_pairs->safe_push (dr_with_seg_len_pair);
     }
+
+  *guard = NULL_TREE;
+  if (max_iters < latch_count_max)
+    *guard = fold_build2 (LE_EXPR, boolean_type_node,
+			  rewrite_to_non_trapping_overflow
+			    (unshare_expr (latch_count)),
+			  wide_int_to_tree (latch_count_type, max_iters));
 
   if (tree_fits_uhwi_p (niters))
     factor = tree_to_uhwi (niters);
@@ -2781,7 +2852,7 @@ version_loop_by_alias_check (vec<struct partition *> *partitions,
   profile_probability prob;
   basic_block cond_bb;
   class loop *nloop;
-  tree lhs, arg0, cond_expr = NULL_TREE;
+  tree lhs, arg0, guard, cond_expr = NULL_TREE;
   gimple_seq cond_stmts = NULL;
   gimple *call_stmt = NULL;
   auto_vec<dr_with_seg_len_pair_t> comp_alias_pairs;
@@ -2793,8 +2864,11 @@ version_loop_by_alias_check (vec<struct partition *> *partitions,
     fprintf (dump_file,
 	     "Version loop <%d> with runtime alias check\n", loop->num);
 
-  compute_alias_check_pairs (loop, alias_ddrs, &comp_alias_pairs);
+  compute_alias_check_pairs (loop, alias_ddrs, &comp_alias_pairs, &guard);
   create_runtime_alias_checks (loop, &comp_alias_pairs, &cond_expr);
+  if (guard)
+    cond_expr = fold_build2 (TRUTH_AND_EXPR, boolean_type_node,
+			     guard, cond_expr);
   cond_expr = force_gimple_operand_1 (cond_expr, &cond_stmts,
 				      is_gimple_val, NULL_TREE);
 
@@ -3216,8 +3290,12 @@ loop_distribution::distribute_loop (class loop *loop,
       /* Don't support loop nest distribution under runtime alias check
 	 since it's not likely to enable many vectorization opportunities.
 	 Also if loop has any data reference which may be not addressable
-	 since alias check needs to take, compare address of the object.  */
-      if (loop->inner || has_nonaddressable_dataref_p)
+	 since alias check needs to take, compare address of the object.
+	 Likewise if an alias check might be impossible to build, since
+	 versioning on a check that always fails only adds code.  */
+      if (loop->inner
+	  || has_nonaddressable_dataref_p
+	  || alias_check_may_fail_p (loop, datarefs_vec))
 	merge_dep_scc_partitions (rdg, &partitions, false);
       else
 	{

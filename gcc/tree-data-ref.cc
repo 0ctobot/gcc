@@ -1846,6 +1846,8 @@ dump_alias_pair (dr_with_seg_len_pair_t *alias_pair, const char *indent)
     dump_printf (MSG_NOTE, " UNSWAPPED");
   if (alias_pair->flags & DR_ALIAS_MIXED_STEPS)
     dump_printf (MSG_NOTE, " MIXED_STEPS");
+  if (alias_pair->flags & DR_ALIAS_SEG_MAY_WRAP)
+    dump_printf (MSG_NOTE, " SEG_MAY_WRAP");
   if (alias_pair->flags == 0)
     dump_printf (MSG_NOTE, " <none>");
   dump_printf (MSG_NOTE, "\n");
@@ -2670,6 +2672,69 @@ get_segment_min_max (const dr_with_seg_len &d, tree *seg_min_out,
   *seg_max_out = fold_build_pointer_plus (addr_base, max_reach);
 }
 
+/* Return the smallest access size that a pair with DR_ALIAS_SEG_MAY_WRAP cannot
+   handle.  It's far above the access size of anything we can vectorize, which
+   leaves room for prune_runtime_alias_test_list to grow an access size when it
+   merges neighboring references.  */
+
+unsigned HOST_WIDE_INT
+dr_seg_access_limit ()
+{
+  return HOST_WIDE_INT_1U << MIN (20, TYPE_PRECISION (sizetype) - 8);
+}
+
+/* Return the largest number of steps of constant size STEP that a segment can
+   advance by while it stays smaller than the address space, given an access
+   size below dr_seg_access_limit.  Such a segment never reaches its own start
+   again, so it holds exactly the addresses that it advances over, even if it
+   reaches past the top of the address space.  */
+
+widest_int
+dr_seg_max_iters (tree step)
+{
+  widest_int size_max = wi::to_widest (TYPE_MAX_VALUE (sizetype));
+  widest_int abs_step = wi::abs (wi::to_widest (step));
+  if (abs_step == 0)
+    return size_max;
+
+  return (size_max + 1 - dr_seg_access_limit ()) / abs_step;
+}
+
+/* Compute the address of the lowest byte covered by D's segment and the number
+   of bytes that the segment covers, both as sizetype values, and store them in
+   *START_OUT and *SIZE_OUT.  The start is exact modulo the size of the address
+   space even if the segment reaches past the top of it.  The size is exact
+   since dr_seg_max_iters and dr_seg_access_limit keep it from wrapping.  */
+
+static void
+get_segment_start_and_size (const dr_with_seg_len &d, tree *start_out,
+			    tree *size_out)
+{
+  tree indicator = dr_direction_indicator (d.dr);
+  tree neg_step = fold_build2 (LT_EXPR, boolean_type_node,
+			       fold_convert (ssizetype, indicator),
+			       ssize_int (0));
+  tree addr_base = fold_build_pointer_plus (DR_BASE_ADDRESS (d.dr),
+					    DR_OFFSET (d.dr));
+  addr_base = fold_build_pointer_plus (addr_base, DR_INIT (d.dr));
+  addr_base = fold_convert (sizetype, addr_base);
+  tree seg_len
+    = fold_convert (sizetype, rewrite_to_non_trapping_overflow (d.seg_len));
+  tree access_size = size_int (d.access_size);
+
+  /* A negative step makes SEG_LEN the negated distance to the lowest access,
+     modulo the size of the address space.  */
+  *start_out = fold_build3 (COND_EXPR, sizetype, neg_step,
+			    fold_build2 (PLUS_EXPR, sizetype, addr_base,
+					 seg_len),
+			    addr_base);
+  *size_out = fold_build3 (COND_EXPR, sizetype, neg_step,
+			   fold_build2 (MINUS_EXPR, sizetype, access_size,
+					seg_len),
+			   fold_build2 (PLUS_EXPR, sizetype, seg_len,
+					access_size));
+}
+
 /* Generate a runtime condition that is true if ALIAS_PAIR is free of aliases,
    storing the condition in *COND_EXPR.  The fallback is to generate a
    a test that the two accesses do not overlap:
@@ -2691,6 +2756,38 @@ create_intersect_range_checks (class loop *loop, tree *cond_expr,
 
   if (create_waw_or_war_checks (cond_expr, alias_pair))
     return;
+
+  if (alias_pair.flags & DR_ALIAS_SEG_MAY_WRAP)
+    {
+      /* Merging references can leave an access too large for the test below to
+	 be exact.  Just pick the scalar loop in that case.  */
+      if (maybe_ge (dr_a.access_size, dr_seg_access_limit ())
+	  || maybe_ge (dr_b.access_size, dr_seg_access_limit ()))
+	{
+	  *cond_expr = boolean_false_node;
+	  return;
+	}
+
+      /* A segment that wraps around has its end below its start, which breaks
+	 the test below.  View the address space as a circle instead: two arcs
+	 overlap iff the start of one lies within the other, so the distance
+	 from each start to the other one must be at least the size of the arc
+	 it leaves.  All of this is modulo the size of the address space, so it
+	 doesn't matter where the arcs are.  It gives the same answer as the
+	 test below if neither segment wraps.  */
+      tree start_a, size_a, start_b, size_b;
+      get_segment_start_and_size (dr_a, &start_a, &size_a);
+      get_segment_start_and_size (dr_b, &start_b, &size_b);
+      tree a_to_b = fold_build2 (MINUS_EXPR, sizetype, start_b, start_a);
+      tree b_to_a = fold_build2 (MINUS_EXPR, sizetype, start_a, start_b);
+      tree a_clear = fold_build2 (GE_EXPR, boolean_type_node, a_to_b, size_a);
+      tree b_clear = fold_build2 (GE_EXPR, boolean_type_node, b_to_a, size_b);
+      *cond_expr = fold_build2 (TRUTH_AND_EXPR, boolean_type_node,
+				a_clear, b_clear);
+      if (dump_enabled_p ())
+	dump_printf (MSG_NOTE, "using an address-based overlap test\n");
+      return;
+    }
 
   unsigned HOST_WIDE_INT min_align;
   tree_code cmp_code;
