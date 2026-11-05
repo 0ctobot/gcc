@@ -3468,6 +3468,11 @@ simplify_count_zeroes (gimple_stmt_iterator *gsi)
   if (!low || !integer_zerop (low))
     return false;
 
+  /* The rewrite computes the value from the index, which would delete a
+     volatile read of the table.  */
+  if (gimple_has_volatile_ops (stmt))
+    return false;
+
   /* Check the shift extracts the top 5..7 bits.  */
   unsigned shiftval = tree_to_shwi (res_ops[2]);
   if (shiftval < input_bits - 7 || shiftval > input_bits - 5)

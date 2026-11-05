@@ -4615,6 +4615,10 @@ strlen_pass::count_nonzero_bytes (tree exp, tree vuse, gimple *stmt,
 	}
 
       gimple *g = SSA_NAME_DEF_STMT (exp);
+      /* A volatile load must be assumed to read something other than
+	 the initializer of the object it loads from.  */
+      if (gimple_has_volatile_ops (g))
+	return false;
       if (gimple_assign_single_p (g))
 	{
 	  exp = gimple_assign_rhs1 (g);
