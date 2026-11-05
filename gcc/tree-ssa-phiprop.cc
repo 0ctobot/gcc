@@ -29,6 +29,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "gimple-pretty-print.h"
 #include "fold-const.h"
 #include "tree-eh.h"
+#include "tree-dfa.h"
 #include "gimple-iterator.h"
 #include "stor-layout.h"
 #include "tree-ssa-loop.h"
@@ -360,6 +361,60 @@ can_handle_load (gimple *load_stmt,
   return NULL_TREE;
 }
 
+/* Return true if loading a value of type TYPE from ADDR, an ADDR_EXPR, might
+   read past the end of the object that ADDR points into.  A string constant
+   needs its own length since the type of the operand of ADDR says nothing about
+   what's left of the string, as with &MEM <char[5]> [(void *)"abcd" + 3B].  For
+   any other base that isn't a declaration, the only storage known to exist is
+   the operand of ADDR.  */
+
+static bool
+phiprop_load_exceeds_object_p (tree addr, tree type)
+{
+  tree obj = TREE_OPERAND (addr, 0);
+  poly_int64 offset = 0;
+  tree base = get_addr_base_and_unit_offset (obj, &offset);
+  tree size;
+
+  if (base && DECL_P (base))
+    size = DECL_SIZE_UNIT (base);
+  else if (base && TREE_CODE (base) == STRING_CST)
+    size = size_int (TREE_STRING_LENGTH (base));
+  else
+    {
+      offset = 0;
+      size = TYPE_SIZE_UNIT (TREE_TYPE (obj));
+    }
+
+  tree load_size = TYPE_SIZE_UNIT (type);
+  if (!size
+      || !load_size
+      || !poly_int_tree_p (size)
+      || !poly_int_tree_p (load_size)
+      || maybe_lt (offset, 0))
+    return true;
+
+  return maybe_gt (poly_offset_int::from (offset, SIGNED)
+		   + wi::to_poly_offset (load_size),
+		   wi::to_poly_offset (size));
+}
+
+/* Return true if a load of type TYPE can run on paths where the program doesn't
+   perform it.  ADDRS holds the ADDR_EXPR arguments of the PHI, which are the
+   places a new load gets inserted for.  tree_could_trap_p only looks at the
+   object named by each address and has no idea how much gets loaded from it,
+   and the size of the load isn't known until we reach a use of the PHI.  */
+
+static bool
+phiprop_can_speculate_load_p (tree type, const vec<tree> &addrs)
+{
+  for (tree addr : addrs)
+    if (phiprop_load_exceeds_object_p (addr, type))
+      return false;
+
+  return true;
+}
+
 /* Propagate between the phi node arguments of PHI in BB and phi result
    users.  For now this matches
         # p_2 = PHI <&x, &y>
@@ -397,6 +452,7 @@ propagate_with_phi (basic_block bb, gphi *vphi, gphi *phi,
 
   tree up_vuse = NULL_TREE;
   bool canpossible_trap = false;
+  auto_vec<tree, 4> phi_addrs;
   /* Check if we can "cheaply" dereference all phi arguments.  */
   FOR_EACH_PHI_ARG (arg_p, phi, i, SSA_OP_USE)
     {
@@ -419,6 +475,7 @@ propagate_with_phi (basic_block bb, gphi *vphi, gphi *phi,
 	  tree decl = TREE_OPERAND (arg, 0);
 	  if (!canpossible_trap)
 	    canpossible_trap = tree_could_trap_p (decl);
+	  phi_addrs.safe_push (arg);
 	}
       /* When we have an SSA name see if we previously encountered a
 	 dereference of it.  */
@@ -489,14 +546,21 @@ propagate_with_phi (basic_block bb, gphi *vphi, gphi *phi,
       if (!other_vuse)
 	continue;
 
-      if ((canpossible_trap || aggregate)
+      bool no_speculate
+	= (canpossible_trap
+	   || aggregate
+	   || !phiprop_can_speculate_load_p (TREE_TYPE (gimple_assign_lhs
+							  (use_stmt)),
+					     phi_addrs));
+
+      if (no_speculate
 	  && !dom_info_available_p (cfun, CDI_POST_DOMINATORS))
 	calculate_dominance_info (CDI_POST_DOMINATORS);
 
       /* Only replace loads in blocks that post-dominate the PHI node.  That
 	 makes sure we don't end up speculating trapping loads or
 	 aggregate stores won't happen speculating.  */
-      if ((canpossible_trap || aggregate)
+      if (no_speculate
 	  && !dominated_by_p (CDI_POST_DOMINATORS,
 			      bb, gimple_bb (use_stmt)))
 	delay = true;
