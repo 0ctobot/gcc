@@ -444,8 +444,18 @@ mark_stmt_if_obviously_necessary (gimple *stmt, bool aggressive)
 	    case BUILT_IN_ATOMIC_LOAD_16:
 	      {
 	      tree model_arg = gimple_call_arg (call, 1);
+	      tree ptr = gimple_call_arg (call, 0);
+	      /* A load from a volatile object is observable even when its
+		 value is unused, and the checks below for calls that could
+		 throw still apply.  */
 	      if (TREE_CODE (model_arg) == INTEGER_CST
-		  && is_mm_relaxed (memmodel_from_int (tree_to_uhwi (model_arg))))
+		  && is_mm_relaxed (memmodel_from_int (tree_to_uhwi (model_arg)))
+		  && !(POINTER_TYPE_P (TREE_TYPE (ptr))
+		       && TYPE_VOLATILE (TREE_TYPE (TREE_TYPE (ptr))))
+		  && !(TREE_CODE (ptr) == ADDR_EXPR
+		       && TREE_THIS_VOLATILE (TREE_OPERAND (ptr, 0)))
+		  && (cfun->can_delete_dead_exceptions
+		      || !stmt_could_throw_p (cfun, call)))
 		return;
 	      break;
 	      }
