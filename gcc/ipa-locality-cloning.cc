@@ -876,7 +876,10 @@ adjust_recursive_callees (cgraph_node *clone, cgraph_node *new_callee,
 		     e->caller->dump_asm_name (), e->callee->dump_asm_name (),
 		     callee->dump_asm_name ());
 	}
+      /* A call through an ifunc symbol doesn't call the resolver at the end of
+	 its alias chain, even when that resolver is what got cloned.  */
       else if (callee->alias
+	       && !callee->ifunc_on_alias_chain_p ()
 	       && e->callee->ultimate_alias_target () == orig_callee)
 	{
 	  if (!alias)

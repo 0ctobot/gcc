@@ -1667,6 +1667,26 @@ symtab_node::noipa_on_alias_chain_p ()
   return true;
 }
 
+/* Return true if this symbol or any alias between it and the body it resolves
+   to is an ifunc symbol.  A call through such a symbol runs the function the
+   resolver picked at load time, not the resolver, so the body at the end of the
+   alias chain says nothing about what the call does.  Only the links towards
+   the body count: the resolver itself and its plain aliases are just ordinary
+   functions, even with an ifunc symbol pointing at them.  */
+
+bool
+symtab_node::ifunc_on_alias_chain_p ()
+{
+  symtab_node *node = this;
+  while (!node->ifunc_resolver)
+    {
+      if (!node->alias || !node->analyzed)
+	return false;
+      node = node->get_alias_target ();
+    }
+  return true;
+}
+
 /* Walk the alias chain to return the symbol NODE is alias of.
    If NODE is not an alias, return NODE.
    Assumes NODE is known to be alias.  */
@@ -1717,7 +1737,7 @@ symtab_node::ultimate_alias_target_1 (enum availability *availability,
 	  if (availability
 	      && transparent_alias
 	      && *availability > AVAIL_INTERPOSABLE
-	      && noipa_on_alias_chain_p ())
+	      && (noipa_on_alias_chain_p () || ifunc_on_alias_chain_p ()))
 	    *availability = AVAIL_INTERPOSABLE;
 	  return node;
 	}
@@ -2024,7 +2044,8 @@ symtab_node::resolve_alias (symtab_node *target, bool transparent)
 
   /* All non-transparent aliases of THIS are now in fact aliases of TARGET.
      If alias is transparent, also all transparent aliases of THIS are now
-     aliases of TARGET.
+     aliases of TARGET.  An ifunc symbol is the exception since its target is
+     the resolver, which isn't what an alias of the ifunc symbol names.
      Also merge same comdat group lists.  */
   ipa_ref *ref;
   for (unsigned i = 0; iterate_direct_aliases (i, ref);)
@@ -2037,9 +2058,10 @@ symtab_node::resolve_alias (symtab_node *target, bool transparent)
 	  if (target->get_comdat_group ())
 	    alias_alias->add_to_same_comdat_group (target);
 	}
-      if ((!alias_alias->transparent_alias
-	   && !alias_alias->symver)
-	  || transparent)
+      if (!ifunc_resolver
+	  && ((!alias_alias->transparent_alias
+	       && !alias_alias->symver)
+	      || transparent))
 	{
 	  alias_alias->remove_all_references ();
 	  alias_alias->create_reference (target, IPA_REF_ALIAS, NULL);
@@ -2083,6 +2105,12 @@ symtab_node::noninterposable_alias (void)
 {
   tree new_decl;
   symtab_node *new_node = NULL;
+
+  /* The body at the end of an ifunc symbol's alias chain is the resolver, which
+     isn't what the symbol calls.  Nothing that aliases that body can replace
+     the symbol.  */
+  if (ifunc_on_alias_chain_p ())
+    return NULL;
 
   /* First try to look up existing alias or base object
      (if that is already non-overwritable).  */
@@ -2357,6 +2385,15 @@ symtab_node::equal_address_to (symtab_node *s2, bool memory_accessed)
      Also check if the symbol needs to bind to given definition.  */
   symtab_node *rs1 = ultimate_alias_target (&avail1);
   symtab_node *rs2 = s2->ultimate_alias_target (&avail2);
+
+  /* The address of an ifunc symbol isn't settled until load time and can be the
+     address of the function the resolver picks, which means it cannot be
+     compared here against any other function.  That includes the resolver and
+     other aliases of the same ifunc.  */
+  if (TREE_CODE (decl) == TREE_CODE (s2->decl)
+      && (ifunc_on_alias_chain_p () || s2->ifunc_on_alias_chain_p ()))
+    return -1;
+
   bool binds_local1 = rs1->analyzed && decl_binds_to_current_def_p (this->decl);
   bool binds_local2 = rs2->analyzed && decl_binds_to_current_def_p (s2->decl);
   bool really_binds_local1 = binds_local1;
@@ -2622,7 +2659,7 @@ symtab_node::binds_to_current_def_p (symtab_node *ref)
     return definition
 	   && get_alias_target()->binds_to_current_def_p (ref);
   cgraph_node *cnode = dyn_cast <cgraph_node *> (this);
-  if (cnode && cnode->ifunc_resolver)
+  if (cnode && cnode->ifunc_on_alias_chain_p ())
     return false;
   if (decl_binds_to_current_def_p (decl))
     return true;

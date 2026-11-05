@@ -277,6 +277,10 @@ public:
      resolves to has the noipa attribute.  */
   bool noipa_on_alias_chain_p ();
 
+  /* Return true if this symbol or any alias between it and the body it
+     resolves to is an ifunc symbol.  */
+  bool ifunc_on_alias_chain_p ();
+
   /* Classify symbol symtab node for partitioning.  */
   enum symbol_partitioning_class get_partitioning_class (void);
 

@@ -1685,13 +1685,20 @@ propagate_pure_const (void)
 		      edge_looping = y_l->looping;
 		    }
 		}
-	      else if (builtin_safe_for_const_function_p (&edge_looping,
-							   y->decl))
-		edge_state = IPA_CONST;
 	      else
-		state_from_flags (&edge_state, &edge_looping,
-				  flags_from_decl_or_type (y->decl),
-				  e->cannot_lead_to_return_p ());
+		{
+		  /* The resolver's flags don't describe a call through an
+		     ifunc symbol since the call runs something else.  */
+		  tree y_decl = (e->callee->ifunc_on_alias_chain_p ()
+				 ? e->callee->decl : y->decl);
+
+		  if (builtin_safe_for_const_function_p (&edge_looping, y_decl))
+		    edge_state = IPA_CONST;
+		  else
+		    state_from_flags (&edge_state, &edge_looping,
+				      flags_from_decl_or_type (y_decl),
+				      e->cannot_lead_to_return_p ());
+		}
 
 	      /* Merge the results with what we already know.  */
 	      better_state (&edge_state, &edge_looping,
