@@ -2327,7 +2327,11 @@ strlen_pass::handle_builtin_strlen ()
       strinfo *si = get_strinfo (idx);
       if (si != NULL)
 	{
-	  if (!si->full_string_p && !si->stmt)
+	  /* For strnlen LHS is min (strlen (src), bound) rather than the
+	     length of the string, so it must not be installed as the full
+	     length; see the !bound guard on the new_strinfo path below
+	     (PR86204) and, for the same reason, keep the lower bound.  */
+	  if (!si->full_string_p && !si->stmt && !bound)
 	    {
 	      /* Until now we only had a lower bound on the string length.
 		 Install LHS as the actual length.  */
