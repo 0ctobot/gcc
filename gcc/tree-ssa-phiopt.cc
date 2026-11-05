@@ -2713,7 +2713,7 @@ spaceship_replacement (basic_block cond_bb, basic_block middle_bb,
 	    {
 	      tree temp3 = build_debug_expr_decl (type);
 	      tree t = build2 (one_cmp == LT_EXPR ? GT_EXPR : LT_EXPR,
-			       boolean_type_node, lhs1, rhs2);
+			       boolean_type_node, lhs1, rhs1);
 	      t = build3 (COND_EXPR, type, t, minus_one,
 			  build_int_cst (type, -128));
 	      gimple *g = gimple_build_debug_bind (temp3, t, phi);
@@ -2721,13 +2721,13 @@ spaceship_replacement (basic_block cond_bb, basic_block middle_bb,
 	      minus_one = temp3;
 	    }
 	  tree temp1 = build_debug_expr_decl (type);
-	  tree t = build2 (one_cmp, boolean_type_node, lhs1, rhs2);
+	  tree t = build2 (one_cmp, boolean_type_node, lhs1, rhs1);
 	  t = build3 (COND_EXPR, type, t, build_one_cst (type),
 		      minus_one);
 	  gimple *g = gimple_build_debug_bind (temp1, t, phi);
 	  gsi_insert_before (&gsi, g, GSI_SAME_STMT);
 	  tree temp2 = build_debug_expr_decl (type);
-	  t = build2 (EQ_EXPR, boolean_type_node, lhs1, rhs2);
+	  t = build2 (EQ_EXPR, boolean_type_node, lhs1, rhs1);
 	  t = build3 (COND_EXPR, type, t, build_zero_cst (type), temp1);
 	  g = gimple_build_debug_bind (temp2, t, phi);
 	  gsi_insert_before (&gsi, g, GSI_SAME_STMT);
