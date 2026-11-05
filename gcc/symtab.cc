@@ -1648,6 +1648,25 @@ symtab_node::copy_visibility_from (symtab_node *n)
   SYMBOL_REF_WEAK (symbol) = DECL_WEAK (decl);
 }
 
+/* Return true if this symbol or any alias between it and the body it resolves
+   to has the noipa attribute.  All of those symbols name the same code, so a
+   noipa on any of them has to hide that code from the users of this symbol
+   too.  Only the links towards the body count: an alias of this symbol doesn't
+   affect it.  */
+
+bool
+symtab_node::noipa_on_alias_chain_p ()
+{
+  symtab_node *node = this;
+  while (!lookup_attribute ("noipa", DECL_ATTRIBUTES (node->decl)))
+    {
+      if (!node->alias || !node->analyzed)
+	return false;
+      node = node->get_alias_target ();
+    }
+  return true;
+}
+
 /* Walk the alias chain to return the symbol NODE is alias of.
    If NODE is not an alias, return NODE.
    Assumes NODE is known to be alias.  */
@@ -1693,6 +1712,13 @@ symtab_node::ultimate_alias_target_1 (enum availability *availability,
 	    *availability = node->get_availability (ref);
 	  else
 	    *availability = AVAIL_NOT_AVAILABLE;
+	  /* A transparent alias takes its availability from the end of the
+	     chain alone, which skips over the links on the way there.  */
+	  if (availability
+	      && transparent_alias
+	      && *availability > AVAIL_INTERPOSABLE
+	      && noipa_on_alias_chain_p ())
+	    *availability = AVAIL_INTERPOSABLE;
 	  return node;
 	}
       if (node && availability && transparent_p
