@@ -10408,8 +10408,9 @@ finish_enum (tree enumtype, tree values, tree attributes)
 	     parsed), so no conversions are needed here if all
 	     enumerators fit in int.  If the enum has a fixed
 	     underlying type, the correct type was also given in
-	     build_enumerator.  */
-	  if (!ENUM_FIXED_UNDERLYING_TYPE_P (enumtype) && wider_than_int)
+	     build_enumerator, except in a redefinition where the
+	     enumerators have the previous type until now.  */
+	  if (ENUM_FIXED_UNDERLYING_TYPE_P (enumtype) || wider_than_int)
 	    ini = convert (enumtype, ini);
 
 	  DECL_INITIAL (enu) = ini;
@@ -10554,8 +10555,19 @@ build_enumerator (location_t decl_loc, location_t loc,
 		  "enumerator value outside the range of underlying type");
       /* Enumeration constants for an enum with fixed underlying type
 	 have the enum type, both inside and outside the
-	 definition.  */
-      value = convert (the_enum->enum_type, value);
+	 definition.  In a redefinition, the tag refers to the previous
+	 definition until this one is complete, and the two aren't
+	 compatible until then.  Give the constant the previous type so
+	 that it matches the tag; finish_enum converts it to the new
+	 type.  The parser already gave a mismatched underlying type an
+	 error and replaced it with the previous one, so the two match.  */
+      tree enum_type = the_enum->enum_type;
+      tree vistype = flag_isoc23 ? previous_tag (enum_type) : NULL_TREE;
+      if (vistype
+	  && TREE_CODE (vistype) == ENUMERAL_TYPE
+	  && ENUM_FIXED_UNDERLYING_TYPE_P (vistype))
+	enum_type = vistype;
+      value = convert (enum_type, value);
     }
   else if (flag_isoc23
 	   && (old_decl = lookup_name_in_scope (name, current_scope))
