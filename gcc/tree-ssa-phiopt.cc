@@ -4322,6 +4322,18 @@ induction_based (tree p, basic_block merge)
    are needed for profitability.
    Returns true if a load was factored out.  */
 
+/* Return true if a statement after STMT in its basic block defines memory.  */
+
+static bool
+vdef_after_stmt_p (gimple *stmt)
+{
+  gimple_stmt_iterator gsi = gsi_for_stmt (stmt);
+  for (gsi_next (&gsi); !gsi_end_p (gsi); gsi_next (&gsi))
+    if (gimple_vdef (gsi_stmt (gsi)))
+      return true;
+  return false;
+}
+
 static bool
 factor_out_conditional_load (edge e0, edge e1, basic_block merge, gphi *phi,
 			     bool early_p, bool before_vect)
@@ -4362,8 +4374,12 @@ factor_out_conditional_load (edge e0, edge e1, basic_block merge, gphi *phi,
     }
   /* Sometimes due to not removing dead statements,
      a virtual phi does not show up going into an infinite loop
-     so just reject that case.  */
-  else if (gimple_vuse (load0) != gimple_vuse (load1))
+     so just reject that case.  Without the virtual PHI, nothing shows that
+     the memory the loads read is still there at MERGE, where the factored
+     load goes, so also reject a store after either load.  */
+  else if (gimple_vuse (load0) != gimple_vuse (load1)
+	   || vdef_after_stmt_p (load0)
+	   || vdef_after_stmt_p (load1))
     return false;
 
   tree ref0 = gimple_assign_rhs1 (load0);
