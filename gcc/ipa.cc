@@ -746,13 +746,16 @@ set_readonly_bit (varpool_node *vnode, void *data ATTRIBUTE_UNUSED)
   return false;
 }
 
-/* Set writeonly bit and clear the initializer, since it will not be needed.  */
+/* Set writeonly bit and clear the initializer, since it will not be needed.
+   An object with a volatile member keeps its initializer: its volatile stores
+   stay, and clearing the initializer would move them to the .bss section.  */
 
 bool
 set_writeonly_bit (varpool_node *vnode, void *data)
 {
   vnode->writeonly = true;
-  if (optimize || in_lto_p)
+  if ((optimize || in_lto_p)
+      && !type_has_volatile_member_p (TREE_TYPE (vnode->decl)))
     {
       DECL_INITIAL (vnode->decl) = NULL;
       if (!vnode->alias)

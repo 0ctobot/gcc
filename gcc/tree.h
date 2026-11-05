@@ -7055,6 +7055,7 @@ extern void gt_pch_nx (tree_raw_data *, gt_pointer_operator, void *);
 
 extern bool nonnull_arg_p (const_tree);
 extern bool is_empty_type (const_tree);
+extern bool type_has_volatile_member_p (tree);
 extern bool default_is_empty_record (const_tree);
 extern bool flexible_array_member_type_p (const_tree);
 extern bool flexible_array_type_p (const_tree);
