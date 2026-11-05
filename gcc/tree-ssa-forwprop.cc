@@ -5314,6 +5314,7 @@ simplify_vector_constructor (gimple_stmt_iterator *gsi)
   orig[0] = NULL;
   orig[1] = NULL;
   tree orig_elem_type[2] = {};
+  bool mixed_sign_p = false;
   conv_code = ERROR_MARK;
   bool maybe_ident = true;
   bool maybe_blend[2] = { true, true };
@@ -5376,6 +5377,8 @@ simplify_vector_constructor (gimple_stmt_iterator *gsi)
 		 tree_nop_conversion_p).  */
 	      if (!orig_elem_type[j])
 		orig_elem_type[j] = TREE_TYPE (op1);
+	      if (TYPE_SIGN (TREE_TYPE (op1)) != TYPE_SIGN (orig_elem_type[0]))
+		mixed_sign_p = true;
 	      if (elem != i || j != 0)
 		maybe_ident = false;
 	      if (elem != i)
@@ -5449,6 +5452,18 @@ simplify_vector_constructor (gimple_stmt_iterator *gsi)
   refnelts = TYPE_VECTOR_SUBPARTS (TREE_TYPE (orig[0])).to_constant ();
   /* We currently do not handle larger destination vectors.  */
   if (refnelts < nelts)
+    return false;
+
+  /* All lanes share one conversion, whose source takes its sign from the first
+     extracted lane.  A widening or an integer to float conversion depends on
+     that sign, so it cannot produce the right values for lanes extracted with
+     different signs.  A truncation or a same-size conversion just keeps the low
+     bits, so mixed signs are harmless there.  */
+  if (conv_code != ERROR_MARK
+      && mixed_sign_p
+      && (!CONVERT_EXPR_CODE_P (conv_code)
+	  || (TYPE_PRECISION (TREE_TYPE (type))
+	      > TYPE_PRECISION (TREE_TYPE (TREE_TYPE (orig[0]))))))
     return false;
 
   /* Determine the element type for the conversion source.
