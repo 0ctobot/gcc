@@ -164,9 +164,16 @@ along with GCC; see the file COPYING3.  If not see
   (if (types_match (type, @0, @1))))
  (match (unsigned_integer_sat_sub @0 @1)
   /* SAT_U_SUB = X >= Y ? X - Y : 0, and the commuted comparison.  */
-  (cond^ (ge:c @0 @1) (convert? (minus (convert1? @0) (convert1? @1)))
+  (cond^ (ge:c @0 @1) (convert? (minus@2 (convert1? @0) (convert1? @1)))
 		    integer_zerop)
-  (if (TYPE_UNSIGNED (TREE_TYPE (@0)) && types_match (@0, @1))))
+  /* .SAT_SUB computes in the type of X and its result can only be narrowed
+     safely.  A wider result gets extended from the mode of X as if it were
+     signed, a narrower subtraction wouldn't have its upper bits discarded,
+     and a result without mode precision isn't reduced to that precision.  */
+  (if (TYPE_UNSIGNED (TREE_TYPE (@0)) && types_match (@0, @1)
+       && TYPE_PRECISION (type) <= TYPE_PRECISION (TREE_TYPE (@0))
+       && TYPE_PRECISION (type) <= TYPE_PRECISION (TREE_TYPE (@2))
+       && type_has_mode_precision_p (type))))
  (match (unsigned_integer_sat_sub @0 @1)
   /* SAT_U_SUB = (X - Y) * (X > Y), and the commuted comparison.  */
   (mult:c (minus @0 @1) (convert (gt:c @0 @1)))
