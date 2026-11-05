@@ -2231,12 +2231,19 @@ spaceship_replacement (basic_block cond_bb, basic_block middle_bb,
     {
       orig_use_lhs = gimple_assign_lhs (use_stmt);
       temps[0] = orig_use_lhs;
-      tree ty1 = TREE_TYPE (gimple_assign_rhs1 (use_stmt));
+      /* Don't take this from the cast's operand, since the operand of a
+	 VIEW_CONVERT_EXPR already has type ty2 and would let an unsigned
+	 final cast through below.  */
+      tree ty1 = TREE_TYPE (phires);
       tree ty2 = TREE_TYPE (orig_use_lhs);
 
       if (!TYPE_UNSIGNED (ty2) || !INTEGRAL_TYPE_P (ty2))
 	return false;
-      if (TYPE_PRECISION (ty2) != 8 || TYPE_PRECISION (ty1) < 8)
+      /* Negating in the unsigned type only reverses the order when phires is
+	 exactly as wide, so that the final cast reinterprets the sign bit.
+	 A wider phires gets the negated value zero-extended instead: -1 and 1
+	 end up as 1 and 255, which are both positive.  */
+      if (TYPE_PRECISION (ty2) != 8 || TYPE_PRECISION (ty1) != 8)
 	return false;
       if (SSA_NAME_OCCURS_IN_ABNORMAL_PHI (orig_use_lhs))
 	return false;
