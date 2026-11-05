@@ -969,6 +969,20 @@ equal_different_set_p (rtx p1, rtx s1, rtx p2, rtx s2)
 }
 
 
+/* Return true if NOTE, the REG_EQUAL or REG_EQUIV note of an insn whose source
+   is SRC, names a different constant integer than SRC.  An insn can carry both
+   only in code that never runs, e.g., when CSE replaced the source with a
+   constant it learned from a conditional jump, while the note still describes
+   the original definition.  */
+static bool
+note_contradicts_src_p (rtx note, rtx src)
+{
+  return (note
+	  && CONST_INT_P (src)
+	  && CONST_INT_P (XEXP (note, 0))
+	  && !rtx_equal_p (XEXP (note, 0), src));
+}
+
 /* NOTE1 is the REG_EQUAL note, if any, attached to an insn
    that is a single_set with a SET_SRC of SRC1.  Similarly
    for NOTE2/SRC2.
@@ -981,6 +995,14 @@ equal_different_set_p (rtx p1, rtx s1, rtx p2, rtx s2)
 static int
 values_equal_p (rtx note1, rtx note2, rtx src1, rtx src2)
 {
+  /* can_replace_by keeps an insn with a constant source and deletes the other
+     one, and what the surviving insn computes is its source, not its note.  A
+     match through a note that disagrees with its own source would therefore
+     put the wrong constant in the code that runs.  */
+  if (note_contradicts_src_p (note1, src1)
+      || note_contradicts_src_p (note2, src2))
+    return 0;
+
   if (note1
       && note2
       && CONST_INT_P (XEXP (note1, 0))
