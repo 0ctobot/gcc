@@ -4229,8 +4229,12 @@ vectorizable_with_step_bound_p (loop_vec_info loop_vinfo,
     return false;
 
   /* There is no alias if abs (DR_STEP) is greater than or equal to
-     the bytes spanned by the combination of the two accesses.  */
-  *lower_bound_out = init_b + vect_get_scalar_dr_size (dr_info_b) - init_a;
+     the bytes spanned by the combination of the two accesses.  Note that
+     DR_A can end after DR_B even though it starts first or at the same
+     address, when it's the larger access.  */
+  poly_int64 end_a = init_a + vect_get_scalar_dr_size (dr_info_a);
+  poly_int64 end_b = init_b + vect_get_scalar_dr_size (dr_info_b);
+  *lower_bound_out = upper_bound (end_a, end_b) - init_a;
   return true;
 }
 
