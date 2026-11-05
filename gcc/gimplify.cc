@@ -6561,11 +6561,14 @@ gimplify_compound_literal_expr (tree *expr_p, gimple_seq *pre_p,
   /* Otherwise, if we don't need an lvalue and have a literal directly
      substitute it.  Check if it matches the gimple predicate, as
      otherwise we'd generate a new temporary, and we can as well just
-     use the decl we already have.  */
+     use the decl we already have.  A literal with static or thread storage
+     duration is one object that keeps its value between evaluations, so its
+     initializer can only stand in for it when the object is const.  */
   else if (!TREE_ADDRESSABLE (decl)
 	   && !TREE_THIS_VOLATILE (decl)
 	   && init
 	   && (fallback & fb_lvalue) == 0
+	   && (!TREE_STATIC (decl) || TREE_READONLY (decl))
 	   && gimple_test_f (init))
     {
       *expr_p = init;
@@ -6574,8 +6577,13 @@ gimplify_compound_literal_expr (tree *expr_p, gimple_seq *pre_p,
 
   /* If the decl is not addressable, then it is being used in some
      expression or on the right hand side of a statement, and it can
-     be put into a readonly data section.  */
-  if (!TREE_ADDRESSABLE (decl) && (fallback & fb_lvalue) == 0)
+     be put into a readonly data section.  That doesn't apply to a static
+     object, since a read here doesn't mean nothing writes to it: the front
+     end reuses the same literal for both the read and the write when it
+     lowers a compound assignment or a bool increment or decrement.  */
+  if (!TREE_ADDRESSABLE (decl)
+      && !TREE_STATIC (decl)
+      && (fallback & fb_lvalue) == 0)
     TREE_READONLY (decl) = 1;
 
   /* This decl isn't mentioned in the enclosing block, so add it to the
