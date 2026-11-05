@@ -6584,12 +6584,16 @@ gimplify_compound_literal_expr (tree *expr_p, gimple_seq *pre_p,
      otherwise we'd generate a new temporary, and we can as well just
      use the decl we already have.  A literal with static or thread storage
      duration is one object that keeps its value between evaluations, so its
-     initializer can only stand in for it when the object is const.  */
+     initializer can only stand in for it when the object is const.  An
+     initializer with side effects can't stand in for the literal either, since
+     substituting it leaves it in place for the write of a compound assignment,
+     which would then evaluate it a second time.  */
   if (!TREE_ADDRESSABLE (decl)
       && !TREE_THIS_VOLATILE (decl)
       && init
       && (fallback & fb_lvalue) == 0
       && (!TREE_STATIC (decl) || TREE_READONLY (decl))
+      && !TREE_SIDE_EFFECTS (init)
       && gimple_test_f (init))
     {
       *expr_p = init;
@@ -7455,10 +7459,15 @@ gimplify_modify_expr_rhs (tree *expr_p, tree *from_p, tree *to_p,
 
 	    /* struct T x = (struct T) { 0, 1, 2 } can be optimized
 	       into struct T x = { 0, 1, 2 } if the address of the
-	       compound literal has never been taken.  */
+	       compound literal has never been taken.  That doesn't apply
+	       when a literal is assigned to itself, which is what
+	       (int) { f () } += 0 folds to, since the destination still
+	       needs the initializer and f would get called twice.  */
 	    if (!TREE_ADDRESSABLE (complit)
 		&& !TREE_ADDRESSABLE (decl)
-		&& init)
+		&& init
+		&& !(TREE_CODE (*to_p) == COMPOUND_LITERAL_EXPR
+		     && COMPOUND_LITERAL_EXPR_DECL (*to_p) == decl))
 	      {
 		*expr_p = copy_node (*expr_p);
 		TREE_OPERAND (*expr_p, 1) = init;
