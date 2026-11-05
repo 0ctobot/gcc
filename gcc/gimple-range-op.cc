@@ -155,7 +155,16 @@ gimple_range_op_handler::gimple_range_op_handler (gimple *s)
 	  // VIEW_CONVERT_EXPR needs to descend one level deeper to pick
 	  // up the symbolic operand.
 	  if (TREE_CODE (m_op1) == VIEW_CONVERT_EXPR)
-	    m_op1 = TREE_OPERAND (m_op1, 0);
+	    {
+	      m_op1 = TREE_OPERAND (m_op1, 0);
+	      // A VIEW_CONVERT_EXPR of memory reads whatever bits are stored
+	      // there, and they don't have to be valid for the type of the
+	      // memory reference.  This is how a speculated _Bool load avoids
+	      // assuming the byte holds 0 or 1, so don't treat it as a cast
+	      // from that type.
+	      if (!is_gimple_val (m_op1))
+		return;
+	    }
 	  if (gimple_num_ops (m_stmt) >= 3)
 	    m_op2 = gimple_assign_rhs2 (m_stmt);
 	  // Check that operands are supported types.  One check is enough.
