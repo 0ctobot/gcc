@@ -473,11 +473,7 @@
 (define_constants
   [; 0xf0ff...
    ; Tag mask for the 4-bit tag stored in the top 8 bits of a pointer.
-   (MEMTAG_TAG_MASK -1080863910568919041)
-
-   ;  0x00ff...
-   ; Tag mask 56-bit address used by subp instruction.
-   (MEMTAG_ADDR_MASK 72057594037927935)])
+   (MEMTAG_TAG_MASK -1080863910568919041)])
 
 (include "constraints.md")
 (include "predicates.md")
@@ -8852,13 +8848,18 @@
   }
 )
 
+;; SUBP sign-extends bits [55:0] of each source register to 64 bits and then
+;; subtracts them as 64-bit values.  Mask-then-subtract would zero-extend
+;; instead, so model the operands as sign_extracts.
 (define_insn "subp"
   [(set (match_operand:DI 0 "register_operand" "=r")
 	(minus:DI
-	  (and:DI (match_operand:DI 1 "register_operand" "rk")
-		  (const_int MEMTAG_ADDR_MASK))
-	  (and:DI (match_operand:DI 2 "register_operand" "rk")
-		  (const_int MEMTAG_ADDR_MASK))))]
+	  (sign_extract:DI (match_operand:DI 1 "register_operand" "rk")
+			   (const_int 56)
+			   (const_int 0))
+	  (sign_extract:DI (match_operand:DI 2 "register_operand" "rk")
+			   (const_int 56)
+			   (const_int 0))))]
   "TARGET_MEMTAG"
   "subp\\t%0, %1, %2"
   [(set_attr "type" "memtag")]
