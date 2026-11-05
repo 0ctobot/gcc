@@ -3098,10 +3098,11 @@ vect_gen_vector_loop_niters (loop_vec_info loop_vinfo, tree niters,
 	    {
 	      int_range<1> vr (type,
 			       wi::one (TYPE_PRECISION (type)),
-			       wi::rshift (wi::max_value (TYPE_PRECISION (type),
-							  TYPE_SIGN (type))
-					   - (const_vf - 1),
-					   exact_log2 (const_vf), TYPE_SIGN (type))
+			       wi::div_trunc (wi::max_value
+					      (TYPE_PRECISION (type),
+					       TYPE_SIGN (type))
+					      - (const_vf - 1),
+					      const_vf, TYPE_SIGN (type))
 			       + 1);
 	      set_range_info (niters_vector, vr);
 	    }
