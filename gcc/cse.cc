@@ -5615,6 +5615,21 @@ cse_insn (rtx_insn *insn)
 	  df_notes_rescan (insn);
 	}
 
+      /* An equivalence recorded from a conditional jump on this path can turn
+	 the source into a constant other than the one named by a REG_EQUAL
+	 note that came from the register's definition.  Both facts can only
+	 hold in code that never runs.  Drop the note, because cross jumping
+	 compares notes across blocks and could otherwise replace a reachable
+	 insn with this one.  */
+      if (n_sets == 1 && REG_P (dest) && CONST_SCALAR_INT_P (src))
+	{
+	  rtx eq_note = find_reg_note (insn, REG_EQUAL, NULL_RTX);
+	  if (eq_note
+	      && CONST_SCALAR_INT_P (XEXP (eq_note, 0))
+	      && !rtx_equal_p (XEXP (eq_note, 0), src))
+	    remove_note (insn, eq_note);
+	}
+
       /* Now deal with the destination.  */
       do_not_record = 0;
 
