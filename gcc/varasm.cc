@@ -8057,7 +8057,7 @@ default_binds_local_p_3 (const_tree exp, bool shlib, bool weak_dominate,
       || (!targetm.ifunc_ref_local_ok ()
 	  && TREE_CODE (exp) == FUNCTION_DECL
 	  && cgraph_node::get (exp)
-	  && cgraph_node::get (exp)->ifunc_resolver))
+	  && cgraph_node::get (exp)->ifunc_on_alias_chain_p ()))
     return false;
 
   /* Static variables are always local.  */
