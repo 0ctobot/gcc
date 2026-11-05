@@ -575,8 +575,10 @@ find_unswitching_predicates_for_bb (basic_block bb, class loop *loop,
       /* Build compound expression for all outgoing edges of the switch.  */
       auto_vec<tree, 16> preds;
       auto_vec<int_range_max> edge_range;
+      auto_vec<unsigned, 16> label_cnt;
       preds.safe_grow_cleared (EDGE_COUNT (gimple_bb (stmt)->succs), true);
       edge_range.safe_grow_cleared (EDGE_COUNT (gimple_bb (stmt)->succs), true);
+      label_cnt.safe_grow_cleared (EDGE_COUNT (gimple_bb (stmt)->succs), true);
       edge e;
       edge_iterator ei;
       unsigned edge_index = 0;
@@ -607,6 +609,22 @@ find_unswitching_predicates_for_bb (basic_block bb, class loop *loop,
 	  basic_block dest = label_to_block (cfun, CASE_LABEL (lab));
 	  e = find_edge (gimple_bb (stmt), dest);
 	  tree &expr = preds[(uintptr_t)e->aux];
+
+	  /* Don't unswitch on an edge with too many labels to keep its range
+	     exact.  An irange holds at most HARD_MAX_RANGES sub-ranges, and a
+	     union past that swallows the gaps between the last ones.  The
+	     result still covers the values that take the edge, but the range
+	     for not taking the edge is its inverse, which then wrongly excludes
+	     the swallowed values.  Inverting N sub-ranges can also need N + 1
+	     of them, so stay below the limit in order for the inverse to fit
+	     too.  Each label adds at most one sub-range, so the label count is
+	     a safe bound no matter how the labels merge.  */
+	  if (++label_cnt[(uintptr_t)e->aux] >= irange::HARD_MAX_RANGES)
+	    {
+	      expr = NULL_TREE;
+	      continue;
+	    }
+
 	  if (expr == NULL_TREE)
 	    expr = cmp;
 	  else
