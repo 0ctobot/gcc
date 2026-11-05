@@ -3460,6 +3460,10 @@ struct GTY((for_user)) constant_descriptor_tree {
      hashfn is called can't work properly, as that means recursive
      use of the hash table during hash table expansion.  */
   hashval_t hash;
+
+  /* The alignment in bits that a match for this constant must have been
+     emitted with.  Only set in a lookup key, not in the table's entries.  */
+  unsigned int min_align;
 };
 
 /* Return true when function is only called directly or it has alias.
