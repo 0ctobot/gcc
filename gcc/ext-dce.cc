@@ -44,6 +44,7 @@ static vec<bitmap_head> livein;
 static bitmap all_blocks;
 static bitmap livenow;
 static bitmap changed_pseudos;
+static vec<rtx_insn *> stale_note_candidates;
 static bool modify;
 
 /* Chain detection for promotion: we defer promotions and only apply them
@@ -1489,6 +1490,73 @@ ext_dce_process_uses (rtx_insn *insn, rtx obj,
     }
 }
 
+/* Return true if every bit group of REG is live in BMAP.  */
+
+static bool
+reg_fully_live_p (bitmap bmap, const_rtx reg)
+{
+  /* Only the groups of the first hard register are checked below, so just
+     assume that a multi-register reference has dead groups.  */
+  if (REG_NREGS (reg) > 1)
+    return false;
+
+  int limit = group_limit (reg);
+  for (int i = 0; i < limit; i++)
+    if (!bitmap_bit_p (bmap, REGNO (reg) * 4 + i))
+      return false;
+
+  return true;
+}
+
+/* Return true if X mentions a register with a bit group missing from
+   LIVENOW.  */
+
+static bool
+mentions_partly_dead_reg_p (const_rtx x)
+{
+  subrtx_iterator::array_type array;
+  FOR_EACH_SUBRTX (iter, array, x, NONCONST)
+    if (REG_P (*iter) && !reg_fully_live_p (livenow, *iter))
+      return true;
+
+  return false;
+}
+
+/* Return true if a REG_EQUAL or REG_EQUIV note on INSN could become false when
+   this pass removes an extension anywhere in the function.  LIVE_TMP has the
+   groups of the destination that are live after INSN, while LIVENOW has the
+   groups that are live before INSN.
+
+   These notes describe all bits of the destination, including dead ones.
+   Removing an extension changes the dead bits of its result, and those changed
+   bits flow through any later insn that reads them, e.g., a copy of the result
+   whose note still claims that the value was extended.  Passes trust that
+   claim; combine uses it to compute nonzero bits for the copy's destination,
+   which lets it delete another extension that is still needed.
+
+   The pass never changes live bits, so a note's expression keeps its value when
+   every register it mentions is fully live.  The destination keeps its value
+   when it's fully live, or when the source doesn't read any bits that could
+   have changed.  */
+
+static bool
+note_may_go_stale_p (rtx_insn *insn, bitmap live_tmp)
+{
+  rtx note = find_reg_equal_equiv_note (insn);
+  if (!note)
+    return false;
+
+  rtx set = single_set (insn);
+  if (!set || mentions_partly_dead_reg_p (XEXP (note, 0)))
+    return true;
+
+  rtx dest = SET_DEST (set);
+  if (REG_P (dest) && reg_fully_live_p (live_tmp, dest))
+    return false;
+
+  return mentions_partly_dead_reg_p (SET_SRC (set));
+}
+
 /* Process a single basic block BB with current liveness information
    in LIVENOW, returning updated liveness information.
 
@@ -1546,6 +1614,12 @@ ext_dce_process_bb (basic_block bb)
 
 	  ext_dce_process_uses (insn, CALL_INSN_FUNCTION_USAGE (insn), live_tmp, false);
 	}
+
+      /* Removing the notes has to wait until the end of the pass since an
+	 extension feeding this insn is visited later in this backward walk.
+	 INSN is already gone if it was a right shift that got replaced.  */
+      if (modify && !insn->deleted () && note_may_go_stale_p (insn, live_tmp))
+	stale_note_candidates.safe_push (insn);
 
       BITMAP_FREE (live_tmp);
     }
@@ -1769,6 +1843,7 @@ ext_dce_finish (void)
   BITMAP_FREE (consumed_by_candidate);
   promotion_candidates.release ();
   promotion_copies.release ();
+  stale_note_candidates.release ();
 }
 
 /* Process block number BB_INDEX as part of the backward
@@ -1839,6 +1914,11 @@ ext_dce_execute (void)
       modify = !modify;
     }
   while (modify);
+
+  /* The candidate notes are all still true if nothing was removed.  */
+  if (!bitmap_empty_p (changed_pseudos))
+    for (rtx_insn *insn : stale_note_candidates)
+      remove_reg_equal_equiv_notes (insn, false);
 
   reset_subreg_promoted_p ();
 
