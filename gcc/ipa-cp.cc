@@ -1050,9 +1050,12 @@ ipcp_bits_lattice::meet_with (ipcp_bits_lattice& other, unsigned precision,
     return false;
 
   widest_int adjusted_value, adjusted_mask;
-  /* The lattice may mark bits above PRECISION as unknown.  */
-  widest_int value = wi::ext (other.get_value (), precision, sgn);
-  widest_int mask = wi::ext (other.get_mask (), precision, sgn);
+  /* The lattice may mark bits above PRECISION as unknown, whereas the folders
+     expect the value and mask to be extended by the operand's own sign.  That
+     sign matches the operation's, except for ABSU_EXPR's signed operand.  */
+  signop op_sgn = code == ABSU_EXPR ? SIGNED : sgn;
+  widest_int value = wi::ext (other.get_value (), precision, op_sgn);
+  widest_int mask = wi::ext (other.get_mask (), precision, op_sgn);
 
   if (TREE_CODE_CLASS (code) == tcc_binary)
     {
@@ -1071,7 +1074,7 @@ ipcp_bits_lattice::meet_with (ipcp_bits_lattice& other, unsigned precision,
   else if (TREE_CODE_CLASS (code) == tcc_unary)
     {
       bit_value_unop (code, sgn, precision, &adjusted_value,
-		      &adjusted_mask, sgn, precision, value, mask);
+		      &adjusted_mask, op_sgn, precision, value, mask);
 
       if (wi::sext (adjusted_mask, precision) == -1)
 	return set_to_bottom ();
