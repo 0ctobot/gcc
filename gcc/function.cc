@@ -2931,12 +2931,12 @@ assign_parm_adjust_stack_rtl (tree parm, struct assign_parm_data_one *data)
 	      && TYPE_ALIGN (data->nominal_type) > MEM_ALIGN (stack_parm)
 	      && ((MEM_ALIGN (stack_parm)
 		   < MIN (BIGGEST_ALIGNMENT, MAX_SUPPORTED_STACK_ALIGNMENT))
-		  /* If its address is taken, make a local copy whose
-		     maximum alignment is MAX_SUPPORTED_STACK_ALIGNMENT.
-		   */
-		  || (TREE_ADDRESSABLE (parm)
-		      && (MEM_ALIGN (stack_parm)
-			  < MAX_SUPPORTED_STACK_ALIGNMENT))))))
+		  /* If its address is taken, make a local copy, since the
+		     address must honor the type's alignment.  This holds even
+		     for a slot at MAX_SUPPORTED_STACK_ALIGNMENT, because
+		     assign_stack_local aligns the copy at run time when the
+		     type needs more than that.  */
+		  || TREE_ADDRESSABLE (parm)))))
     stack_parm = NULL;
 
   /* If parm was passed in memory, and we need to convert it on entry,
@@ -3037,8 +3037,15 @@ assign_parm_setup_block (struct assign_parm_data_all *all,
 	   ? MAX (DECL_ALIGN (parm), BITS_PER_WORD) : DECL_ALIGN (parm));
 
       SET_DECL_ALIGN (parm, parm_align);
-      stack_parm = assign_stack_local (BLKmode, size_stored,
-				       DECL_ALIGN (parm));
+
+      /* assign_stack_local doesn't align a zero-size slot at run time, but
+	 the address of a zero-size parameter must still honor its alignment.
+	 Request a word in that case so the slot gets aligned.  */
+      HOST_WIDE_INT slot_size = size_stored;
+      if (slot_size == 0 && DECL_ALIGN (parm) > MAX_SUPPORTED_STACK_ALIGNMENT)
+	slot_size = UNITS_PER_WORD;
+
+      stack_parm = assign_stack_local (BLKmode, slot_size, DECL_ALIGN (parm));
       if (known_eq (GET_MODE_SIZE (GET_MODE (entry_parm)), size))
 	PUT_MODE (stack_parm, GET_MODE (entry_parm));
       set_mem_attributes (stack_parm, parm, 1);
