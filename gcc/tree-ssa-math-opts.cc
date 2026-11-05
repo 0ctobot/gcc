@@ -3728,6 +3728,9 @@ maybe_optimize_guarding_check (vec<gimple *> &mul_stmts, gimple *cond_stmt,
     {
       if (EDGE_COUNT (bb->succs) != 2)
 	return;
+      /* Find the no-overflow edge, since .MUL_OVERFLOW (0, y) always takes it
+	 once the zero check is gone.  The successor order says nothing about
+	 which edge is which, so check the flags for either condition code.  */
       other_succ_edge = EDGE_SUCC (bb, 0);
       if (gimple_cond_code (cond_stmt) == NE_EXPR)
 	{
@@ -3735,7 +3738,7 @@ maybe_optimize_guarding_check (vec<gimple *> &mul_stmts, gimple *cond_stmt,
 	    other_succ_edge = EDGE_SUCC (bb, 1);
 	}
       else if (other_succ_edge->flags & EDGE_FALSE_VALUE)
-	other_succ_edge = EDGE_SUCC (bb, 0);
+	other_succ_edge = EDGE_SUCC (bb, 1);
       if (other_edge->dest != other_succ_edge->dest)
 	return;
     }
