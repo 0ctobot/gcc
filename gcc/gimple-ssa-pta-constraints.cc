@@ -2468,6 +2468,30 @@ process_ipa_clobber (varinfo_t fi, tree ptr)
   ptrc.release ();
 }
 
+/* Return true if the store to REF may become a read-modify-write after IPA-PTA
+   has run.  Store merging lowers bit-field stores to a load and store of the
+   containing bytes in order to preserve the bits that aren't written, and
+   if-conversion can do the same.  Store merging tests DECL_BIT_FIELD_TYPE
+   rather than DECL_BIT_FIELD, which is clear for a byte-sized and byte-aligned
+   bit-field, so such fields also get merged into wider accesses.
+
+   This only anticipates bit-field lowering.  If-conversion can also turn a
+   conditional store in a loop into a load and an unconditional store, which
+   isn't caught here.  A missing use only matters when modref records a kill
+   for the store, and modref only does that for stores that always run from
+   function entry, which a store in a loop body doesn't.  */
+
+static bool
+store_may_become_rmw_p (tree ref)
+{
+  for (; handled_component_p (ref); ref = TREE_OPERAND (ref, 0))
+    if (TREE_CODE (ref) == BIT_FIELD_REF
+	|| (TREE_CODE (ref) == COMPONENT_REF
+	    && DECL_BIT_FIELD_TYPE (TREE_OPERAND (ref, 1))))
+      return true;
+  return false;
+}
+
 /* Walk statement T setting up clobber and use constraints according to the
    references found in T.  This function is a main part of the
    IPA constraint builder.  */
@@ -2516,6 +2540,17 @@ find_func_clobbers (struct function *fn, gimple *origt)
 	  get_constraint_for_address_of (lhs, &rhsc);
 	  FOR_EACH_VEC_ELT (rhsc, i, rhsp)
 	    process_constraint (new_constraint (lhsc, *rhsp));
+	  /* What callers know about this function's uses is fixed once IPA-PTA
+	     has run, while its late modref summary is still free to grow.  If
+	     this store later reads the bits around it, the summary says the
+	     call kills them, and only a use recorded now stops DSE in a caller
+	     from deleting its stores to the bits being preserved.  */
+	  if (store_may_become_rmw_p (lhs))
+	    {
+	      lhsc = get_function_part_constraint (fi, fi_uses);
+	      FOR_EACH_VEC_ELT (rhsc, i, rhsp)
+		process_constraint (new_constraint (lhsc, *rhsp));
+	    }
 	  rhsc.truncate (0);
 	}
     }
