@@ -3494,6 +3494,19 @@ tree_descriptor_hasher::equal (constant_descriptor_tree *c1,
 {
   if (c1->hash != c2->hash)
     return false;
+
+  /* The same bytes can have different type alignments (e.g., "\0\0\0" and
+     L""), and the shared constant only gets the alignment of whichever one
+     came first.  Require equal alignments instead of just a sufficient one to
+     make a lookup independent of the table's probe order, since
+     compare_constant compares the addresses of constants through lookups.  */
+  if (TYPE_ALIGN (TREE_TYPE (c1->value)) != TYPE_ALIGN (TREE_TYPE (c2->value)))
+    return false;
+
+  /* C1 is the table's entry, so its rtl is valid even though C2's isn't.  */
+  if (MEM_ALIGN (c1->rtl) < c2->min_align)
+    return false;
+
   return compare_constant (c1->value, c2->value);
 }
 
@@ -3730,6 +3743,7 @@ build_constant_desc (tree exp)
 
   desc = ggc_alloc<constant_descriptor_tree> ();
   desc->value = exp;
+  desc->min_align = 0;
 
   /* Create a string containing the label name, in LABEL.  */
   labelno = const_labelno++;
@@ -3824,18 +3838,46 @@ add_constant_to_table (tree exp, int defer)
   struct constant_descriptor_tree key;
   key.value = exp;
   key.hash = const_hash_1 (exp);
+  /* constant_alignment depends on the current function's optimization level
+     and get_object_alignment_2 assumes its result, so a string emitted for an
+     -Os function can be too misaligned to use in an -O2 function.  Other
+     constants only need the alignment of their type, since their uses take
+     the alignment from the rtl of the copy they get.  */
+  key.min_align = TYPE_ALIGN (TREE_TYPE (exp));
+  if (TREE_CODE (exp) == STRING_CST)
+    key.min_align = targetm.constant_alignment (exp, key.min_align);
+  struct constant_descriptor_tree *desc
+    = const_desc_htab->find_with_hash (&key, key.hash);
+  if (desc)
+    {
+      inserting = false;
+      return desc;
+    }
+
+  /* Any copy of EXP already in the table was placed with less alignment, and
+     its value can be EXP itself, since inlining puts one string tree into both
+     -Os and -O2 functions.  Whether a copy has been emitted is tracked through
+     TREE_ASM_WRITTEN on its value, so sharing EXP would keep the new copy from
+     being emitted once the old one goes out, leaving its label undefined.  Give
+     the new copy its own value.  The search for an old copy has to happen
+     before a slot is taken for the new one, since the table can't be searched
+     while an insertion into it is pending.  */
+  unsigned int min_align = key.min_align;
+  key.min_align = 0;
+  if (const_desc_htab->find_with_hash (&key, key.hash))
+    {
+      exp = copy_node (exp);
+      TREE_ASM_WRITTEN (exp) = 0;
+    }
+  key.min_align = min_align;
   constant_descriptor_tree **loc
     = const_desc_htab->find_slot_with_hash (&key, key.hash, INSERT);
 
   inserting = false;
 
-  struct constant_descriptor_tree *desc = *loc;
-  if (!desc)
-    {
-      desc = build_constant_desc (exp);
-      desc->hash = key.hash;
-      *loc = desc;
-    }
+  desc = build_constant_desc (exp);
+  desc->hash = key.hash;
+  *loc = desc;
 
   return desc;
 }
@@ -3976,6 +4018,9 @@ lookup_constant_def (tree exp)
 
   key.value = exp;
   key.hash = const_hash_1 (exp);
+  /* Any existing copy will do since this is finding a constant rather than
+     placing one, and decode_addr_const relies on this finding one.  */
+  key.min_align = 0;
   constant_descriptor_tree *desc
     = const_desc_htab->find_with_hash (&key, key.hash);
 
