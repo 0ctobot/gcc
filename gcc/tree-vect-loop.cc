@@ -10688,7 +10688,24 @@ loop_niters_no_overflow (loop_vec_info loop_vinfo)
       signop sgn = TYPE_SIGN (type);
       widest_int type_max = widest_int::from (wi::max_value (type), sgn);
       if (max < type_max)
-	return true;
+	{
+	  if (!LOOP_VINFO_EARLY_BREAKS (loop_vinfo))
+	    return true;
+
+	  /* The bound recorded for a loop with early breaks says nothing about
+	     NITERS: it also accounts for the other exits, while NITERSM1 only
+	     describes the main exit and can exceed that bound when another exit
+	     ends the loop first.  Use the main exit's own bound instead, since
+	     niter analysis doesn't assume that exit gets taken when there are
+	     others.  It may not reflect a guard ruling out the overflow though,
+	     such as p != e around a loop stepping a byte pointer.  */
+	  class tree_niter_desc desc;
+	  if (number_of_iterations_exit_assumptions
+		(loop, LOOP_VINFO_MAIN_EXIT (loop_vinfo), &desc, NULL)
+	      && desc.max < type_max)
+	    return true;
+	  return vect_niters_nonzero_p (loop_vinfo);
+	}
     }
   return false;
 }
@@ -11673,9 +11690,11 @@ vect_transform_loop (loop_vec_info loop_vinfo, gimple *loop_vectorized_call)
 
   if (!uncounted_p)
     {
-      /* The vectorization factor is always > 1, so if we use an IV increment of
-	 1.  A zero NITERS becomes a nonzero NITERS_VECTOR.  */
-      if (integer_onep (step_vector))
+      /* With a vectorization factor above 1, using an IV increment of 1 means
+	 that a zero NITERS becomes a nonzero NITERS_VECTOR.  That doesn't hold
+	 for a factor of 1, which an SLP group as wide as the vector gives:
+	 NITERS_VECTOR is just NITERS then, so it overflows along with it.  */
+      if (integer_onep (step_vector) && maybe_ne (vf, 1U))
 	niters_no_overflow = true;
 
       vect_set_loop_condition (loop, LOOP_VINFO_MAIN_EXIT (loop_vinfo),
