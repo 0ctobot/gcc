@@ -3565,6 +3565,18 @@ create_variable_info_for (tree decl, const char *name, bool add_id)
       return fi->id;
     }
 
+  /* A call through an alias of an ifunc symbol is the same as a call through
+     the ifunc symbol itself.  */
+  if (in_ipa_mode
+      && TREE_CODE (decl) == FUNCTION_DECL
+      && (node = cgraph_node::get (decl))
+      && node->ifunc_on_alias_chain_p ())
+    {
+      varinfo_t fi = get_vi_for_tree (node->get_alias_target ()->decl);
+      insert_vi_for_tree (decl, fi);
+      return fi->id;
+    }
+
   varinfo_t vi = create_variable_info_for_1 (decl, name, add_id, false, NULL);
   unsigned int id = vi->id;
 
@@ -3908,7 +3920,7 @@ associate_varinfo_to_alias (struct cgraph_node *node, void *data)
        || (node->thunk
 	   && ! node->inlined_to))
       && node->analyzed
-      && !node->ifunc_resolver)
+      && !node->ifunc_on_alias_chain_p ())
     insert_vi_for_tree (node->decl, (varinfo_t)data);
   return false;
 }
