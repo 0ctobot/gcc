@@ -159,20 +159,31 @@ vect_check_nonzero_value (loop_vec_info loop_vinfo, tree value)
    DR_INFO_B.  At least one of the accesses is a write.  */
 
 static bool
-vect_preserves_scalar_order_p (dr_vec_info *dr_info_a, dr_vec_info *dr_info_b)
+vect_preserves_scalar_order_p (loop_vec_info loop_vinfo,
+			       dr_vec_info *dr_info_a, dr_vec_info *dr_info_b)
 {
   stmt_vec_info stmtinfo_a = dr_info_a->stmt;
   stmt_vec_info stmtinfo_b = dr_info_b->stmt;
+  class loop *loop = LOOP_VINFO_LOOP (loop_vinfo);
+  bool zero_step_read_a = (DR_IS_READ (dr_info_a->dr)
+			   && integer_zerop (DR_STEP (dr_info_a->dr)));
+  bool zero_step_read_b = (DR_IS_READ (dr_info_b->dr)
+			   && integer_zerop (DR_STEP (dr_info_b->dr)));
 
-  /* Single statements are always kept in their original order.  */
+  /* Single statements are always kept in their original order, except for a
+     loop invariant read that vectorizable_load hoists to the preheader, since
+     it then runs before every in-loop store.  A read nested in an inner loop
+     never gets hoisted, and its DR_STEP is relative to the inner loop rather
+     than the vectorized loop.  Treating it as reordered would only make
+     dependence analysis reject omp simd outer loops.  */
   if (!STMT_VINFO_GROUPED_ACCESS (stmtinfo_a)
       && !STMT_VINFO_GROUPED_ACCESS (stmtinfo_b))
-    return true;
+    return ((!zero_step_read_a || nested_in_vect_loop_p (loop, stmtinfo_a))
+	    && (!zero_step_read_b || nested_in_vect_loop_p (loop, stmtinfo_b)));
 
   /* If there is a loop invariant read involved we might vectorize it in
      the prologue, breaking scalar order with respect to the in-loop store.  */
-  if ((DR_IS_READ (dr_info_a->dr) && integer_zerop (DR_STEP (dr_info_a->dr)))
-      || (DR_IS_READ (dr_info_b->dr) && integer_zerop (DR_STEP (dr_info_b->dr))))
+  if (zero_step_read_a || zero_step_read_b)
     return false;
 
   /* STMT_A and STMT_B belong to overlapping groups.  All loads are
@@ -426,7 +437,7 @@ vect_analyze_data_ref_dependence (struct data_dependence_relation *ddr,
 		... = a[i];
 		a[i+1] = ...;
 	     where loads from the group interleave with the store.  */
-	  if (!vect_preserves_scalar_order_p (dr_info_a, dr_info_b))
+	  if (!vect_preserves_scalar_order_p (loop_vinfo, dr_info_a, dr_info_b))
 	    return opt_result::failure_at (stmtinfo_a->stmt,
 					   "READ_WRITE dependence"
 					   " in interleaving.\n");
@@ -465,7 +476,7 @@ vect_analyze_data_ref_dependence (struct data_dependence_relation *ddr,
 					       "between data-refs %T and %T\n",
 					       DR_REF (dra), DR_REF (drb));
 	    }
-	  if (!vect_preserves_scalar_order_p (dr_info_a, dr_info_b))
+	  if (!vect_preserves_scalar_order_p (loop_vinfo, dr_info_a, dr_info_b))
 	    return opt_result::failure_at (stmtinfo_a->stmt,
 					   "dependence in interleaving.\n");
 	  /* Record a negative dependence distance to later limit the
@@ -4040,7 +4051,8 @@ vect_small_gap_p (loop_vec_info loop_vinfo, dr_vec_info *dr_info,
    When returning true, set *LOWER_BOUND_OUT to this N.  */
 
 static bool
-vectorizable_with_step_bound_p (dr_vec_info *dr_info_a, dr_vec_info *dr_info_b,
+vectorizable_with_step_bound_p (loop_vec_info loop_vinfo,
+				dr_vec_info *dr_info_a, dr_vec_info *dr_info_b,
 				poly_uint64 *lower_bound_out)
 {
   /* Check that there is a constant gap of known sign between DR_A
@@ -4067,7 +4079,7 @@ vectorizable_with_step_bound_p (dr_vec_info *dr_info_a, dr_vec_info *dr_info_b,
   /* If the two accesses could be dependent within a scalar iteration,
      make sure that we'd retain their order.  */
   if (maybe_gt (init_a + vect_get_scalar_dr_size (dr_info_a), init_b)
-      && !vect_preserves_scalar_order_p (dr_info_a, dr_info_b))
+      && !vect_preserves_scalar_order_p (loop_vinfo, dr_info_a, dr_info_b))
     return false;
 
   /* There is no alias if abs (DR_STEP) is greater than or equal to
@@ -4160,7 +4172,7 @@ vect_prune_runtime_alias_test_list (loop_vec_info loop_vinfo)
       stmt_vec_info stmt_info_b = dr_info_b->stmt;
 
       bool preserves_scalar_order_p
-	= vect_preserves_scalar_order_p (dr_info_a, dr_info_b);
+	= vect_preserves_scalar_order_p (loop_vinfo, dr_info_a, dr_info_b);
       bool ignore_step_p
 	  = (vf_one_p
 	     && (preserves_scalar_order_p
@@ -4171,8 +4183,8 @@ vect_prune_runtime_alias_test_list (loop_vec_info loop_vinfo)
 	 and intra-iteration dependencies are guaranteed to be honored.  */
       if (ignore_step_p
 	  && (preserves_scalar_order_p
-	      || vectorizable_with_step_bound_p (dr_info_a, dr_info_b,
-						 &lower_bound)))
+	      || vectorizable_with_step_bound_p (loop_vinfo, dr_info_a,
+						 dr_info_b, &lower_bound)))
 	{
 	  if (dump_enabled_p ())
 	    dump_printf_loc (MSG_NOTE, vect_location,
@@ -4188,7 +4200,7 @@ vect_prune_runtime_alias_test_list (loop_vec_info loop_vinfo)
 	 than the number of bytes handled by one vector iteration.)  */
       if (!ignore_step_p
 	  && TREE_CODE (DR_STEP (dr_info_a->dr)) != INTEGER_CST
-	  && vectorizable_with_step_bound_p (dr_info_a, dr_info_b,
+	  && vectorizable_with_step_bound_p (loop_vinfo, dr_info_a, dr_info_b,
 					     &lower_bound)
 	  && (vect_small_gap_p (loop_vinfo, dr_info_a, lower_bound)
 	      || vect_small_gap_p (loop_vinfo, dr_info_b, lower_bound)))
