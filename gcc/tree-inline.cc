@@ -1890,6 +1890,13 @@ remap_gimple_stmt (gimple *stmt, copy_body_data *id)
 	    gimple_call_set_tail (call_stmt, false);
 	  if (gimple_call_from_thunk_p (call_stmt))
 	    gimple_call_set_from_thunk (call_stmt, false);
+	  /* The call's LHS gets the remapped type when the return type is
+	     variably modified in the source function, so the function type
+	     has to follow it or else the two no longer match.  */
+	  if (!gimple_call_internal_p (call_stmt))
+	    gimple_call_set_fntype (call_stmt,
+				    remap_type (gimple_call_fntype (call_stmt),
+						id));
 	  /* Silently clear musttail flag when inlining a function
 	     with must tail call from a non-musttail call.  The inlining
 	     removes one frame so acts like musttail's intent, and we

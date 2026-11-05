@@ -435,12 +435,43 @@ c_types_compatible_p (tree x, tree y)
   return comptypes (TYPE_MAIN_VARIANT (x), TYPE_MAIN_VARIANT (y));
 }
 
-/* Determine if the type is a variably modified type for the backend.  */
+/* Determine if the type is a variably modified type for the backend.  If FN
+   is given, X only counts when it depends on a variable in FN.  */
 
 bool
-c_var_mod_p (tree x, tree fn ATTRIBUTE_UNUSED)
+c_var_mod_p (tree x, tree fn)
 {
-  return c_type_variably_modified_p (x);
+  if (!c_type_variably_modified_p (x))
+    return false;
+
+  if (!fn)
+    return true;
+
+  /* variably_modified_type_p already checked the size of X, a pointer's target
+     and a function's return type.  Check what it can't see, since a nested
+     function can use a variably modified type whose size is a variable in the
+     enclosing function, and copying such a type for FN would be wrong: the copy
+     wouldn't match the same type in the signatures of sibling functions.  The
+     recursion ends since a type can only contain itself through a pointer, and
+     variably_modified_type_p doesn't enter a pointer it's already visiting.  */
+  switch (TREE_CODE (x))
+    {
+    case RECORD_TYPE:
+    case UNION_TYPE:
+      for (tree f = TYPE_FIELDS (x); f; f = DECL_CHAIN (f))
+	if (TREE_CODE (f) == FIELD_DECL
+	    && variably_modified_type_p (TREE_TYPE (f), fn))
+	  return true;
+      return false;
+
+    case ARRAY_TYPE:
+      return (variably_modified_type_p (TREE_TYPE (x), fn)
+	      || (TYPE_DOMAIN (x)
+		  && variably_modified_type_p (TYPE_DOMAIN (x), fn)));
+
+    default:
+      return false;
+    }
 }
 
 /* Special routine to get the alias set of T for C.  */
