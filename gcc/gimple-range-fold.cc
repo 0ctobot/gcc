@@ -1370,6 +1370,12 @@ fold_using_range::range_from_readonly_var (vrange &r, gimple *stmt,
 					   fur_source &src)
 {
   gcc_checking_assert (gimple_code (stmt) == GIMPLE_ASSIGN);
+
+  // A volatile load can observe a value other than the initializer, even when
+  // the variable or the volatile member's siblings are read-only.
+  if (gimple_has_volatile_ops (stmt))
+    return false;
+
   tree type = TREE_TYPE (gimple_assign_lhs (stmt));
   if (!irange::supports_p (type)
       && !prange::supports_p (type)

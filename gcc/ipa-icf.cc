@@ -2455,10 +2455,14 @@ sem_item_optimizer::filter_removed_items (void)
 	    remove_item (item);
 	  else
 	    {
-	      /* Filter out non-readonly variables.  */
+	      /* Filter out non-readonly variables.  A volatile access to a
+		 member has to reach the object it names, so objects with
+		 volatile members can't be merged either.  */
 	      tree decl = item->decl;
 	      varpool_node *vnode = static_cast <sem_variable *>(item)->get_node ();
-	      if (!TREE_READONLY (decl) || vnode->body_removed)
+	      if (!TREE_READONLY (decl)
+		  || vnode->body_removed
+		  || type_has_volatile_member_p (TREE_TYPE (decl)))
 		remove_item (item);
 	      else
 		filtered.safe_push (item);
