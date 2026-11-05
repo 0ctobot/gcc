@@ -3423,10 +3423,14 @@ strlen_pass::handle_builtin_memcpy (built_in_function bcode)
       full_string_p = clen > nonzero_chars;
     }
 
+  /* If NEWLEN is less than LEN then the bytes of SRC past NEWLEN are unknown.
+     They may replace OLDDSI's nul or contain a nul of their own, so OLDDSI
+     says nothing about the result and only the lower bound from SRC holds.  */
   if (!full_string_p
       && olddsi
       && olddsi->nonzero_chars
       && TREE_CODE (olddsi->nonzero_chars) == INTEGER_CST
+      && tree_int_cst_equal (newlen, len)
       && tree_int_cst_le (newlen, olddsi->nonzero_chars))
     {
       /* The SRC substring being written strictly overlaps
