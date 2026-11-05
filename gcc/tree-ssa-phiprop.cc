@@ -22,6 +22,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "system.h"
 #include "coretypes.h"
 #include "backend.h"
+#include "target.h"
 #include "tree.h"
 #include "gimple.h"
 #include "tree-pass.h"
@@ -408,6 +409,20 @@ phiprop_load_exceeds_object_p (tree addr, tree type)
 static bool
 phiprop_can_speculate_load_p (tree type, const vec<tree> &addrs)
 {
+  /* Every PHI argument already has its value loaded, so nothing new runs.  */
+  if (addrs.is_empty ())
+    return true;
+
+  /* Do not speculate a load when that's not a noop, either because the mode
+     cannot be transferred or because there's UB involved for out-of-bound
+     values.  Memory that's readable can still hold bytes that aren't a valid
+     value of TYPE when the program doesn't load it, and later passes assume
+     that whatever gets loaded is within the range of TYPE.  */
+  if (!mode_can_transfer_bits (TYPE_MODE (type))
+      || TREE_CODE (type) == BOOLEAN_TYPE
+      || (INTEGRAL_TYPE_P (type) && !type_has_mode_precision_p (type)))
+    return false;
+
   for (tree addr : addrs)
     if (phiprop_load_exceeds_object_p (addr, type))
       return false;
@@ -558,8 +573,8 @@ propagate_with_phi (basic_block bb, gphi *vphi, gphi *phi,
 	calculate_dominance_info (CDI_POST_DOMINATORS);
 
       /* Only replace loads in blocks that post-dominate the PHI node.  That
-	 makes sure we don't end up speculating trapping loads or
-	 aggregate stores won't happen speculating.  */
+	 makes sure we don't end up speculating trapping loads or loads of
+	 invalid values, or aggregate stores won't happen speculating.  */
       if (no_speculate
 	  && !dominated_by_p (CDI_POST_DOMINATORS,
 			      bb, gimple_bb (use_stmt)))
