@@ -1,6 +1,7 @@
 /* { dg-do compile } */
 /* { dg-additional-options "-fopenmp-simd" } */
 /* { dg-additional-options "-mavx512vl -mavx512bw -mprefer-vector-width=512" { target { avx512bw && avx512vl } } } */
+/* { dg-additional-options "-w" { target aarch64*-*-* } } */
 
 #pragma omp declare simd simdlen(32)
 signed char f(signed char) __attribute__((const));
