@@ -968,6 +968,44 @@ vect_min_prec_for_max_niters (loop_vec_info loop_vinfo, unsigned int factor)
   return wi::min_precision (max_ni * factor, UNSIGNED);
 }
 
+/* Calculate the minimum precision necessary to represent:
+
+      NITERS * FACTOR
+
+   as an unsigned integer, where NITERS is LOOP_VINFO_NITERS, the limit
+   that the controls for partial vectors are computed from.  */
+
+static unsigned
+vect_min_prec_for_partial_vectors_limit (loop_vec_info loop_vinfo,
+					 unsigned int factor)
+{
+  if (!LOOP_VINFO_EARLY_BREAKS (loop_vinfo)
+      || LOOP_VINFO_NITERS_UNCOUNTED_P (loop_vinfo))
+    return vect_min_prec_for_max_niters (loop_vinfo, factor);
+
+  /* The bound recorded for a loop with early breaks says nothing about
+     NITERS: it also accounts for the other exits, while NITERS only
+     describes the main exit and can exceed that bound when another exit
+     ends the loop first.  Use the main exit's own bound instead.  NITERS
+     is computed as NITERSM1 + 1, so it wraps to 0 when the main exit's
+     count is one past the maximum of its type.  Keep room for that count
+     unless the guards around the loop rule it out, so that the limit is
+     either converted to a wider type with the wrap undone or the loop
+     isn't vectorized with partial vectors at all.  */
+  class loop *loop = LOOP_VINFO_LOOP (loop_vinfo);
+  tree ni_type = TREE_TYPE (LOOP_VINFO_NITERSM1 (loop_vinfo));
+  widest_int type_max = wi::to_widest (TYPE_MAX_VALUE (ni_type));
+  widest_int max_ni = type_max + 1;
+  class tree_niter_desc desc;
+  if (number_of_iterations_exit_assumptions
+	(loop, LOOP_VINFO_MAIN_EXIT (loop_vinfo), &desc, NULL))
+    max_ni = wi::smin (max_ni, desc.max + 1);
+  if (vect_niters_nonzero_p (loop_vinfo))
+    max_ni = wi::smin (max_ni, type_max);
+
+  return wi::min_precision (max_ni * factor, UNSIGNED);
+}
+
 /* True if the loop needs peeling or partial vectors when vectorized.  */
 
 static bool
@@ -1050,7 +1088,8 @@ vect_verify_full_masking (loop_vec_info loop_vinfo)
 
   /* Work out how many bits we need to represent the limit.  */
   min_ni_width
-    = vect_min_prec_for_max_niters (loop_vinfo, max_nscalars_per_iter);
+    = vect_min_prec_for_partial_vectors_limit (loop_vinfo,
+					       max_nscalars_per_iter);
 
   /* Find a scalar mode for which WHILE_ULT is supported.  */
   opt_scalar_int_mode cmp_mode_iter;
@@ -1142,6 +1181,26 @@ vect_verify_full_masking_avx512 (loop_vec_info loop_vinfo)
   unsigned int iv_precision = UINT_MAX;
   if (iv_limit != -1)
     iv_precision = wi::min_precision (iv_limit, UNSIGNED);
+
+  /* With early breaks, IV_LIMIT comes from the bound for the whole loop,
+     but the IV starts from NITERS for the main exit plus the skipped
+     iterations, and NITERS can exceed that bound when another exit ends
+     the loop first.  Make the IV wide enough for the largest such start
+     value, including a NITERS that wrapped to 0 and gets converted with
+     the wrap undone.  */
+  if (LOOP_VINFO_EARLY_BREAKS (loop_vinfo))
+    {
+      unsigned int ni_precision
+	= vect_min_prec_for_partial_vectors_limit (loop_vinfo, 1);
+      widest_int max_start = wi::mask <widest_int> (ni_precision, false);
+      tree niters_skip = LOOP_VINFO_MASK_SKIP_NITERS (loop_vinfo);
+      if (niters_skip && TREE_CODE (niters_skip) == INTEGER_CST)
+	max_start += wi::to_widest (niters_skip);
+      else if (niters_skip || LOOP_VINFO_PEELING_FOR_ALIGNMENT (loop_vinfo))
+	max_start += vect_max_vf (loop_vinfo) - 1;
+      iv_precision = MAX (iv_precision,
+			  wi::min_precision (max_start, UNSIGNED));
+    }
 
   /* First compute the type for the IV we use to track the remaining
      scalar iterations.  */
@@ -1320,7 +1379,8 @@ vect_verify_loop_lens (loop_vec_info loop_vinfo)
 
   /* Work out how many bits we need to represent the length limit.  */
   unsigned int min_ni_prec
-    = vect_min_prec_for_max_niters (loop_vinfo, max_nitems_per_iter);
+    = vect_min_prec_for_partial_vectors_limit (loop_vinfo,
+					       max_nitems_per_iter);
 
   /* Now use the maximum of below precisions for one suitable IV type:
      - the IV's natural precision
@@ -10688,7 +10748,24 @@ loop_niters_no_overflow (loop_vec_info loop_vinfo)
       signop sgn = TYPE_SIGN (type);
       widest_int type_max = widest_int::from (wi::max_value (type), sgn);
       if (max < type_max)
-	return true;
+	{
+	  if (!LOOP_VINFO_EARLY_BREAKS (loop_vinfo))
+	    return true;
+
+	  /* The bound recorded for a loop with early breaks says nothing about
+	     NITERS: it also accounts for the other exits, while NITERSM1 only
+	     describes the main exit and can exceed that bound when another exit
+	     ends the loop first.  Use the main exit's own bound instead, since
+	     niter analysis doesn't assume that exit gets taken when there are
+	     others.  It may not reflect a guard ruling out the overflow though,
+	     such as p != e around a loop stepping a byte pointer.  */
+	  class tree_niter_desc desc;
+	  if (number_of_iterations_exit_assumptions
+		(loop, LOOP_VINFO_MAIN_EXIT (loop_vinfo), &desc, NULL)
+	      && desc.max < type_max)
+	    return true;
+	  return vect_niters_nonzero_p (loop_vinfo);
+	}
     }
   return false;
 }
@@ -11673,9 +11750,11 @@ vect_transform_loop (loop_vec_info loop_vinfo, gimple *loop_vectorized_call)
 
   if (!uncounted_p)
     {
-      /* The vectorization factor is always > 1, so if we use an IV increment of
-	 1.  A zero NITERS becomes a nonzero NITERS_VECTOR.  */
-      if (integer_onep (step_vector))
+      /* With a vectorization factor above 1, using an IV increment of 1 means
+	 that a zero NITERS becomes a nonzero NITERS_VECTOR.  That doesn't hold
+	 for a factor of 1, which an SLP group as wide as the vector gives:
+	 NITERS_VECTOR is just NITERS then, so it overflows along with it.  */
+      if (integer_onep (step_vector) && maybe_ne (vf, 1U))
 	niters_no_overflow = true;
 
       vect_set_loop_condition (loop, LOOP_VINFO_MAIN_EXIT (loop_vinfo),
@@ -12095,6 +12174,32 @@ vect_rgroup_iv_might_wrap_p (loop_vec_info loop_vinfo, rgroup_controls *rgc)
 
   if (wi::min_precision (iv_limit * nitems, UNSIGNED) > compare_precision)
     return true;
+
+  /* The IV is compared against NITERS + NITERS_SKIP, which is computed in
+     the compare type.  IV_LIMIT covers that sum only when NITERS is within
+     the loop's bound.  With early breaks, NITERS describes the main exit
+     alone and can exceed the bound behind IV_LIMIT, which also accounts for
+     the other exits.  The IV never gets that far, but the sum can still wrap
+     and cut the loop short.  The bound on NITERS that sized the compare
+     type isn't recorded, so allow for any value of NITERS's type.  */
+  tree niters_skip = LOOP_VINFO_MASK_SKIP_NITERS (loop_vinfo);
+  if (niters_skip && LOOP_VINFO_EARLY_BREAKS (loop_vinfo))
+    {
+      widest_int max_ni;
+      if (LOOP_VINFO_NITERS_KNOWN_P (loop_vinfo))
+	max_ni = wi::to_widest (LOOP_VINFO_NITERS (loop_vinfo));
+      else
+	{
+	  tree ni_type = TREE_TYPE (LOOP_VINFO_NITERSM1 (loop_vinfo));
+	  max_ni = wi::to_widest (TYPE_MAX_VALUE (ni_type)) + 1;
+	}
+      if (TREE_CODE (niters_skip) == INTEGER_CST)
+	max_ni += wi::to_widest (niters_skip);
+      else
+	max_ni += vect_max_vf (loop_vinfo) - 1;
+      if (wi::min_precision (max_ni * nitems, UNSIGNED) > compare_precision)
+	return true;
+    }
 
   return false;
 }
