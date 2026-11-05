@@ -746,6 +746,7 @@ _loop_vec_info::_loop_vec_info (class loop *loop_in, vec_info_shared *shared,
     num_iters (NULL_TREE),
     num_iters_unchanged (NULL_TREE),
     num_iters_assumptions (NULL_TREE),
+    alias_nitersm1_limit (NULL_TREE),
     vector_costs (nullptr),
     scalar_costs (nullptr),
     th (0),
@@ -4110,6 +4111,8 @@ vect_estimate_min_profitable_iters (loop_vec_info loop_vinfo,
     {
       /*  FIXME: Make cost depend on complexity of individual check.  */
       unsigned len = LOOP_VINFO_COMP_ALIAS_DDRS (loop_vinfo).length ();
+      if (LOOP_VINFO_ALIAS_NITERSM1_LIMIT (loop_vinfo))
+	len++;
       (void) add_stmt_cost (target_cost_data, len, scalar_stmt, vect_prologue);
       len = LOOP_VINFO_CHECK_UNEQUAL_ADDRS (loop_vinfo).length ();
       if (len)
