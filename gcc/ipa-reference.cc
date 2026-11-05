@@ -708,7 +708,10 @@ get_read_write_all_from_node (struct cgraph_node *node,
       if (avail <= AVAIL_INTERPOSABLE
 	  || (callee->analyzed && !opt_for_fn (callee->decl,
 					       flag_ipa_reference)))
-	read_write_all_from_decl (callee, read_all, write_all);
+	/* The resolver's flags don't describe a call through an ifunc symbol
+	   since the call runs something else.  */
+	read_write_all_from_decl (e->callee->ifunc_on_alias_chain_p ()
+				  ? e->callee : callee, read_all, write_all);
     }
 
   for (ie = node->indirect_calls;
