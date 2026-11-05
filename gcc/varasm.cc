@@ -3494,6 +3494,19 @@ tree_descriptor_hasher::equal (constant_descriptor_tree *c1,
 {
   if (c1->hash != c2->hash)
     return false;
+
+  /* The same bytes can have different type alignments (e.g., "\0\0\0" and
+     L""), and the shared constant only gets the alignment of whichever one
+     came first.  Require equal alignments instead of just a sufficient one to
+     make a lookup independent of the table's probe order, since
+     compare_constant compares the addresses of constants through lookups.  */
+  if (TYPE_ALIGN (TREE_TYPE (c1->value)) != TYPE_ALIGN (TREE_TYPE (c2->value)))
+    return false;
+
+  /* C1 is the table's entry, so its rtl is valid even though C2's isn't.  */
+  if (MEM_ALIGN (c1->rtl) < c2->min_align)
+    return false;
+
   return compare_constant (c1->value, c2->value);
 }
 
@@ -3824,6 +3837,13 @@ add_constant_to_table (tree exp, int defer)
   struct constant_descriptor_tree key;
   key.value = exp;
   key.hash = const_hash_1 (exp);
+  /* constant_alignment depends on the current function's optimization level
+     and get_object_alignment_2 assumes its result, so a string emitted for an
+     -Os function can be too misaligned to use in an -O2 function.  */
+  key.min_align = 0;
+  if (TREE_CODE (exp) == STRING_CST)
+    key.min_align = targetm.constant_alignment (exp,
+						TYPE_ALIGN (TREE_TYPE (exp)));
   constant_descriptor_tree **loc
     = const_desc_htab->find_slot_with_hash (&key, key.hash, INSERT);
 
@@ -3976,6 +3996,9 @@ lookup_constant_def (tree exp)
 
   key.value = exp;
   key.hash = const_hash_1 (exp);
+  /* Any existing copy will do since this is finding a constant rather than
+     placing one, and decode_addr_const relies on this finding one.  */
+  key.min_align = 0;
   constant_descriptor_tree *desc
     = const_desc_htab->find_with_hash (&key, key.hash);
 
