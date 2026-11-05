@@ -2688,6 +2688,7 @@ extern bool needs_fold_left_reduction_p (tree, code_helper);
 extern opt_loop_vec_info vect_analyze_loop (class loop *, gimple *,
 					    vec_info_shared *);
 extern tree vect_build_loop_niters (loop_vec_info, bool * = NULL);
+extern bool vect_niters_nonzero_p (loop_vec_info);
 extern void vect_gen_vector_loop_niters (loop_vec_info, tree, tree *,
 					 tree *, bool);
 extern tree vect_get_loop_iv_increment (loop_vec_info);
