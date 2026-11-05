@@ -16,6 +16,8 @@ uint32_t _crc32 (uint32_t data, uint32_t crc) {
   return crc;
 }
 
-/* { dg-final { scan-tree-dump "_crc32 function maybe contains CRC calculation." "crc" } } */
+/* 24-iteration loops are no longer treated as CRC loops (PR127984), so the
+   loop is seen but must not be recognized.  */
 /* { dg-final { scan-tree-dump "Loop iteration number is 23" "crc" } } */
-/* { dg-final { scan-tree-dump "Bit forward" "crc" } } */
+/* { dg-final { scan-tree-dump-not "maybe contains CRC calculation" "crc" } } */
+/* { dg-final { scan-tree-dump-not "Bit forward" "crc" } } */
