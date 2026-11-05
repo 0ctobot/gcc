@@ -341,6 +341,9 @@ public:
   virtual irange_bitmask get_bitmask () const override;
 
   virtual void verify_range () const override;
+
+  // Hard limit on max ranges allowed.
+  static const int HARD_MAX_RANGES = 255;
 protected:
   void maybe_resize (int needed);
   virtual void set (tree, tree, value_range_kind = VR_RANGE) override;
@@ -353,9 +356,6 @@ protected:
 
   void normalize_kind ();
 
-
-  // Hard limit on max ranges allowed.
-  static const int HARD_MAX_RANGES = 255;
 private:
   bool varying_compatible_p () const;
   bool intersect_bitmask (const irange &r);
