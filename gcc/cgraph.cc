@@ -2865,8 +2865,7 @@ cgraph_node::get_availability (symtab_node *ref)
     avail = AVAIL_AVAILABLE;
   else if (transparent_alias)
     ultimate_alias_target (&avail, ref);
-  else if (ifunc_resolver
-	   || lookup_attribute ("noipa", DECL_ATTRIBUTES (decl)))
+  else if (ifunc_resolver || noipa_on_alias_chain_p ())
     avail = AVAIL_INTERPOSABLE;
   else if (!externally_visible)
     avail = AVAIL_AVAILABLE;

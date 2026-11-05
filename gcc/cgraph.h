@@ -273,6 +273,10 @@ public:
      semantically equivalent symbols.  */
   bool semantically_equivalent_p (symtab_node *target);
 
+  /* Return true if this symbol or any alias between it and the body it
+     resolves to has the noipa attribute.  */
+  bool noipa_on_alias_chain_p ();
+
   /* Classify symbol symtab node for partitioning.  */
   enum symbol_partitioning_class get_partitioning_class (void);
 
