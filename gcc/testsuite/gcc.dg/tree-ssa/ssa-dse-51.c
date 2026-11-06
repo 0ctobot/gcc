@@ -2,20 +2,20 @@
 /* { dg-options "-O -fstrict-aliasing -fdump-tree-dse1-details" } */
 
 int a;
-short *p;
+short s;
 void
 test (int b)
 {
   a=1;
   if (b)
     {
-      (*p)++;
+      s++;
       a=2;
       __builtin_printf ("1\n");
     }
   else
     {
-      (*p)++;
+      s++;
       a=3;
       __builtin_printf ("2\n");
     }

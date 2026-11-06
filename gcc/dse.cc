@@ -44,6 +44,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "cfgrtl.h"
 #include "cselib.h"
 #include "tree-pass.h"
+#include "tree-eh.h"
 #include "explow.h"
 #include "expr.h"
 #include "dbgcnt.h"
@@ -970,6 +971,54 @@ can_escape (tree expr)
   return true;
 }
 
+/* Return true if an access to MEM may fault.  Indexing into a named object can
+   only fault when the index is out of bounds, which isn't counted on here.  */
+
+static bool
+mem_may_fault_p (rtx mem)
+{
+  if (!may_trap_p (mem))
+    return false;
+
+  tree expr = MEM_EXPR (mem);
+  if (!expr)
+    return true;
+
+  tree base = get_base_address (expr);
+  return !DECL_P (base) || tree_could_trap_p (base);
+}
+
+/* Return true if the store in S_INFO has to stay because an access to MEM may
+   fault with S_INFO's memory visible to a signal handler.  MEM goes through
+   BASE and GROUP_ID, and going through the same pointer as the store doesn't
+   count since the store has already been through that pointer.  */
+
+static bool
+fault_keeps_store_p (class store_info *s_info, rtx mem, int group_id,
+		     cselib_val *base)
+{
+  if (!mem_may_fault_p (mem)
+      || (s_info->group_id == group_id && s_info->cse_base == base))
+    return false;
+
+  if (s_info->group_id >= 0
+      && rtx_group_vec[s_info->group_id]->frame_related
+      && !MEM_EXPR (s_info->mem))
+    return false;
+
+  /* A global is visible even if can_escape () says that nothing can point to
+     it, like when it's static and doesn't have its address taken.  */
+  tree expr = MEM_EXPR (s_info->mem);
+  if (expr)
+    {
+      tree base = get_base_address (expr);
+      if (DECL_P (base) && is_global_var (base))
+	return true;
+    }
+
+  return can_escape (expr);
+}
+
 /* Set the store* bitmaps offset_map_size* fields in GROUP based on
    OFFSET and WIDTH.  */
 
@@ -1450,6 +1499,10 @@ record_store (rtx body, bb_info_t bb_info)
   if (known_eq (width, 0))
     return 0;
 
+  /* The stores tracked across blocks have to stay if this access may fault.  */
+  if (mem_may_fault_p (mem))
+    insn_info->non_frame_wild_read = true;
+
   if (group_id >= 0)
     {
       /* In the restrictive case where the base is a constant or the
@@ -1554,6 +1607,17 @@ record_store (rtx body, bb_info_t bb_info)
 	 has exactly on set. */
       while (!s_info->is_set)
 	s_info = s_info->next;
+
+      if (fault_keeps_store_p (s_info, mem, group_id, base))
+	{
+	  active_local_stores_len--;
+	  if (last)
+	    last->next_local_store = next;
+	  else
+	    active_local_stores = next;
+	  ptr = next;
+	  continue;
+	}
 
       if (s_info->group_id == group_id
 	  && s_info->cse_base == base
@@ -2237,6 +2301,10 @@ check_mem_read_rtx (rtx *loc, bb_info_t bb_info, bool used_in_call = false)
       return;
     }
 
+  /* The stores tracked across blocks have to stay if this access may fault.  */
+  if (mem_may_fault_p (mem))
+    insn_info->non_frame_wild_read = true;
+
   read_info = read_info_type_pool.allocate ();
   read_info->group_id = group_id;
   read_info->mem = mem;
@@ -2329,10 +2397,11 @@ check_mem_read_rtx (rtx *loc, bb_info_t bb_info, bool used_in_call = false)
 	       by a read from a const base.  Different bases can still overlap
 	       if they alias or if cselib values conflict.  */
 	    remove
-	      = canon_true_dependence (store_info->mem,
-				       GET_MODE (store_info->mem),
-				       store_info->mem_addr,
-				       mem, mem_addr);
+	      = (canon_true_dependence (store_info->mem,
+					GET_MODE (store_info->mem),
+					store_info->mem_addr,
+					mem, mem_addr)
+		 || fault_keeps_store_p (store_info, mem, group_id, base));
 
 	  if (remove)
 	    {
@@ -2387,10 +2456,11 @@ check_mem_read_rtx (rtx *loc, bb_info_t bb_info, bool used_in_call = false)
 	      && replace_read (store_info, i_ptr,  read_info, insn_info, loc))
 	    return;
 
-	  remove = canon_true_dependence (store_info->mem,
-					  GET_MODE (store_info->mem),
-					  store_info->mem_addr,
-					  mem, mem_addr);
+	  remove = (canon_true_dependence (store_info->mem,
+					   GET_MODE (store_info->mem),
+					   store_info->mem_addr,
+					   mem, mem_addr)
+		    || fault_keeps_store_p (store_info, mem, group_id, base));
 
 	  if (remove)
 	    {

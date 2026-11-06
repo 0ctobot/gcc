@@ -11,13 +11,21 @@ void *foo (int *p)
   return q;
 }
 
-int j;
-void bar (int *i)
+int j, k;
+void bar (void)
 {
   /* This store is dead as well.  */
   j = 1;
-  *i = 0;
+  k = 0;
   j = 2;
+}
+
+void baz (int *i)
+{
+  /* This store isn't since *i may fault, and it stays visible when it does.  */
+  j = 3;
+  *i = 0;
+  j = 4;
 }
 
 /* { dg-final { scan-tree-dump-times "Deleted dead store" 2 "dse1" } } */

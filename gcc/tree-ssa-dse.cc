@@ -1250,6 +1250,51 @@ exit_vop_keeps_ref_live_p (tree vop, ao_ref *ref)
 	  && ref_may_alias_global_p (ref, true));
 }
 
+/* Return true if ACCESS may fault and it isn't through POINTER, the pointer or
+   object that a store to be deleted goes through.  Indexing into a named object
+   can only fault on an out-of-bounds index, which isn't counted on here.  */
+
+static bool
+access_may_fault_apart_from_p (tree access, tree pointer)
+{
+  if (!tree_could_trap_p (access))
+    return false;
+
+  tree base = get_base_address (access);
+  if (DECL_P (base) && !tree_could_trap_p (base))
+    return false;
+
+  if (TREE_CODE (base) == MEM_REF || TREE_CODE (base) == TARGET_MEM_REF)
+    base = TREE_OPERAND (base, 0);
+  return !operand_equal_p (base, pointer, 0);
+}
+
+/* Return true if STMT may fault on memory unrelated to REF, in which case a
+   signal handler gets to see what's in REF at that point even though the
+   virtual use-def chain doesn't show it.  An access through the same pointer as
+   REF is fine to ignore since the store it comes after has already gone through
+   that pointer, and without that exception no pair of stores could ever be
+   merged.  */
+
+static bool
+fault_at_stmt_keeps_ref_live_p (gimple *stmt, ao_ref *ref)
+{
+  if (!is_gimple_assign (stmt) || gimple_clobber_p (stmt))
+    return false;
+
+  tree pointer = get_base_address (ao_ref_base (ref));
+  if (TREE_CODE (pointer) == MEM_REF || TREE_CODE (pointer) == TARGET_MEM_REF)
+    pointer = TREE_OPERAND (pointer, 0);
+
+  bool may_fault
+    = ((gimple_store_p (stmt)
+	&& access_may_fault_apart_from_p (gimple_assign_lhs (stmt), pointer))
+       || (gimple_assign_load_p (stmt)
+	   && access_may_fault_apart_from_p (gimple_assign_rhs1 (stmt),
+					     pointer)));
+  return may_fault && ref_may_alias_global_p (ref, true);
+}
+
 /* STMT is about to be removed, so whatever it left in memory is now up to the
    store before it.  Move its dse_exit_vops mark there.  */
 
@@ -1393,6 +1438,13 @@ dse_classify_store (ao_ref *ref, gimple *stmt,
 			  last_phi_def = phi;
 			}
 		    }
+		}
+	      /* A fault at this statement lets the store be seen.  */
+	      else if (use_stmt != stmt
+		       && fault_at_stmt_keeps_ref_live_p (use_stmt, ref))
+		{
+		  fail = true;
+		  break;
 		}
 	      /* If the statement is a use the store is not dead.  */
 	      else if (ref_maybe_used_by_stmt_p (use_stmt, ref))
