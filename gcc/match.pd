@@ -12755,11 +12755,20 @@ and,
 
 /* Fold REDUC (@0 op VECTOR_CST) as REDUC (@0) op REDUC (VECTOR_CST)
    when the constant reduction simplifies to a scalar operand.  */
-(for reduc (IFN_REDUC_PLUS IFN_REDUC_MAX IFN_REDUC_MIN IFN_REDUC_FMAX
+(for reduc (IFN_REDUC_MAX IFN_REDUC_MIN IFN_REDUC_FMAX
 	    IFN_REDUC_FMIN IFN_REDUC_AND IFN_REDUC_IOR IFN_REDUC_XOR)
-     op (plus max min IFN_FMAX IFN_FMIN bit_and bit_ior bit_xor)
+     op (max min IFN_FMAX IFN_FMIN bit_and bit_ior bit_xor)
   (simplify (reduc (op @0 VECTOR_CST@1))
     (op (reduc:type @0) (reduc!:type @1))))
+
+/* The same for REDUC_PLUS.  The reduction wraps on overflow even for a signed
+   element type, so the addition that replaces part of it has to wrap too.  */
+(simplify (IFN_REDUC_PLUS (plus @0 VECTOR_CST@1))
+ (if (ANY_INTEGRAL_TYPE_P (type) && TYPE_OVERFLOW_UNDEFINED (type))
+  (with { tree utype = unsigned_type_for (type); }
+   (convert (plus (convert:utype (IFN_REDUC_PLUS:type @0))
+		  (convert:utype (IFN_REDUC_PLUS!:type @1)))))
+  (plus (IFN_REDUC_PLUS:type @0) (IFN_REDUC_PLUS!:type @1))))
 
 /* Fold REDUC_PLUS (@0) +- REDUC_PLUS (@1) as REDUC_PLUS (@0 +- @1).  This
    trades one lane-crossing reduction for one elementwise operation.  The
