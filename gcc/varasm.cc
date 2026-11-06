@@ -186,8 +186,28 @@ struct section_hasher : ggc_ptr_hash<section>
   static bool equal (section *, const char *);
 };
 
-/* Hash table of named sections.  */
+/* Hash table of named sections, holding the first section for each name.  */
 static GTY(()) hash_table<section_hasher> *section_htab;
+
+/* The name and COMDAT group of a section, as a key into section_group_htab.  */
+
+struct section_group_key
+{
+  const char *name;
+  tree group;
+};
+
+struct section_group_hasher : ggc_ptr_hash<section>
+{
+  typedef const section_group_key &compare_type;
+
+  static hashval_t hash (section *);
+  static bool equal (section *, const section_group_key &);
+};
+
+/* Hash table of the named sections that section_htab has no room for, since a
+   section with the same name but a different COMDAT group got there first.  */
+static GTY(()) hash_table<section_group_hasher> *section_group_htab;
 
 struct object_block_hasher : ggc_ptr_hash<object_block>
 {
@@ -220,13 +240,41 @@ section_hasher::hash (section *old)
   return htab_hash_string (old->named.name);
 }
 
+/* Return a hash value for a section named NAME in COMDAT group GROUP.  Any
+   number of sections can share a name across groups, so the group has to count
+   towards the hash for them to not all collide.  */
+
+static hashval_t
+hash_section_name (const char *name, tree group)
+{
+  hashval_t hash = htab_hash_string (name);
+  if (group)
+    hash = iterative_hash_hashval_t (IDENTIFIER_HASH_VALUE (group), hash);
+  return hash;
+}
+
+/* Helper routines for maintaining section_group_htab.  */
+
+bool
+section_group_hasher::equal (section *old, const section_group_key &key)
+{
+  return (old->named.group == key.group
+	  && strcmp (old->named.name, key.name) == 0);
+}
+
+hashval_t
+section_group_hasher::hash (section *old)
+{
+  return hash_section_name (old->named.name, old->named.group);
+}
+
 /* Return a hash value for section SECT.  */
 
 static hashval_t
 hash_section (section *sect)
 {
   if (sect->common.flags & SECTION_NAMED)
-    return htab_hash_string (sect->named.name);
+    return hash_section_name (sect->named.name, sect->named.group);
   return sect->common.flags & ~SECTION_DECLARED;
 }
 
@@ -276,7 +324,60 @@ get_noswitch_section (unsigned int flags, noswitch_section_callback callback)
   return sect;
 }
 
-/* Return the named section structure associated with NAME.  Create
+/* Return the COMDAT group that a section with flags FLAGS for DECL goes in, or
+   null if it doesn't go in one.  This is the group that
+   default_elf_asm_named_section writes in the section's directive.  */
+
+static tree
+section_comdat_group (tree decl, unsigned int flags)
+{
+  if (!HAVE_COMDAT_GROUP || !(flags & SECTION_LINKONCE) || !decl)
+    return NULL_TREE;
+  if (TREE_CODE (decl) == IDENTIFIER_NODE)
+    return decl;
+  if (!VAR_OR_FUNCTION_DECL_P (decl))
+    return NULL_TREE;
+  return decl_comdat_group_id (decl);
+}
+
+/* Return true if a section with flags FLAGS1 and one with flags FLAGS2 can have
+   the same name when they aren't in the same COMDAT group, which rules out what
+   get_section would report as a section type conflict for one group.  */
+
+static bool
+section_flags_allow_other_group_p (unsigned int flags1, unsigned int flags2)
+{
+  unsigned int diff = flags1 ^ flags2;
+
+  /* get_section doesn't report a conflict when SECTION_RETAIN differs, whatever
+     else does.  */
+  if (diff & SECTION_RETAIN)
+    return true;
+  /* SECTION_LINKONCE and SECTION_NOTYPE follow from being in a group or not
+     (see default_section_type_flags), and SECTION_DECLARED isn't a property of
+     the section's contents.  */
+  diff &= ~(SECTION_DECLARED | SECTION_LINKONCE | SECTION_NOTYPE);
+  /* Read-only data next to data that's writable only because of relocations
+     isn't a conflict either.  */
+  return diff == 0 || diff == (SECTION_WRITE | SECTION_RELRO);
+}
+
+/* Allocate a named section structure with the given fields.  */
+
+static section *
+alloc_named_section (const char *name, unsigned int flags, tree decl,
+		     tree group)
+{
+  section *sect = ggc_alloc<section> ();
+  sect->named.common.flags = flags;
+  sect->named.name = ggc_strdup (name);
+  sect->named.decl = decl;
+  sect->named.group = group;
+  return sect;
+}
+
+/* Return the named section structure associated with NAME and with the COMDAT
+   group of DECL, if FLAGS puts the section in one.  Create
    a new section with the given fields if no such structure exists.
    When NOT_EXISTING, then fail if the section already exists.  Return
    the existing section if the SECTION_RETAIN bit doesn't match.  Set
@@ -298,12 +399,10 @@ get_section (const char *name, unsigned int flags, tree decl,
       && DECL_P (decl)
       && lookup_attribute ("retain", DECL_ATTRIBUTES (decl)))
     flags |= SECTION_RETAIN;
+  tree group = section_comdat_group (decl, flags);
   if (*slot == NULL)
     {
-      sect = ggc_alloc<section> ();
-      sect->named.common.flags = flags;
-      sect->named.name = ggc_strdup (name);
-      sect->named.decl = decl;
+      sect = alloc_named_section (name, flags, decl, group);
       *slot = sect;
     }
   else
@@ -312,6 +411,23 @@ get_section (const char *name, unsigned int flags, tree decl,
 	internal_error ("section already exists: %qs", name);
 
       sect = *slot;
+      /* A section in a COMDAT group is a separate ELF section from any other
+	 section with the same name, and the linker keeps or discards it along
+	 with its group, so it can't share a section object with them.  The
+	 checks below then only have to compare sections within one group.  */
+      if (sect->named.group != group
+	  && section_flags_allow_other_group_p (sect->common.flags, flags))
+	{
+	  section_group_key key = { name, group };
+	  slot = section_group_htab->find_slot_with_hash
+	    (key, hash_section_name (name, group), INSERT);
+	  if (*slot == NULL)
+	    {
+	      *slot = alloc_named_section (name, flags, decl, group);
+	      return *slot;
+	    }
+	  sect = *slot;
+	}
       /* It is fine if one of the sections has SECTION_NOTYPE as long as
          the other has none of the contrary flags (see the logic at the end
          of default_section_type_flags, below).  */
@@ -6986,6 +7102,7 @@ void
 init_varasm_once (void)
 {
   section_htab = hash_table<section_hasher>::create_ggc (31);
+  section_group_htab = hash_table<section_group_hasher>::create_ggc (31);
   object_block_htab = hash_table<object_block_hasher>::create_ggc (31);
   const_desc_htab = hash_table<tree_descriptor_hasher>::create_ggc (1009);
 
@@ -9126,6 +9243,7 @@ varasm_cc_finalize ()
   cold_function_name = NULL_TREE;
   unnamed_sections = nullptr;
   section_htab = nullptr;
+  section_group_htab = nullptr;
   object_block_htab = nullptr;
   anchor_labelno = 0;
   shared_constant_pool = nullptr;
