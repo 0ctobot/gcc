@@ -162,6 +162,8 @@ cgraph_edge::clone (cgraph_node *n, gcall *call_stmt, unsigned stmt_uid,
   new_edge->callback = callback;
   new_edge->has_callback = has_callback;
   new_edge->in_polymorphic_cdtor = in_polymorphic_cdtor;
+  new_edge->inlined_return_callee_uncaptured
+    = inlined_return_callee_uncaptured;
 
   /* Update IPA profile.  Local profiles need no updating in original.  */
   if (update_original)
