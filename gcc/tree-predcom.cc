@@ -235,6 +235,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "builtins.h"
 #include "opts.h"
 #include "tree-ssa-address.h"
+#include "tree-ssa-dse.h"
 
 /* The maximum number of iterations between the considered memory
    references.  */
@@ -887,6 +888,22 @@ last_always_executed_block (class loop *loop)
   return last;
 }
 
+/* Return true if LOOP contains a statement that the function may not get past,
+   which keeps a store in front of that statement from being dropped.  */
+
+static bool
+loop_may_end_function_p (class loop *loop)
+{
+  basic_block *body = get_loop_body (loop);
+  bool ret = false;
+  for (unsigned i = 0; i < loop->num_nodes && !ret; ++i)
+    for (gimple_stmt_iterator gsi = gsi_start_bb (body[i]);
+	 !gsi_end_p (gsi) && !ret; gsi_next (&gsi))
+      ret = stmt_may_end_function_p (cfun, gsi_stmt (gsi));
+  free (body);
+  return ret;
+}
+
 /* Splits dependence graph on DATAREFS described by DEPENDENCES to
    components.  */
 
@@ -899,8 +916,11 @@ pcom_worker::split_data_refs_to_components ()
   struct data_dependence_relation *ddr;
   struct component *comp_list = NULL, *comp;
   dref dataref;
-  /* Don't do store elimination if loop has multiple exit edges.  */
-  bool eliminate_store_p = single_exit (m_loop) != NULL;
+  /* Don't do store elimination if loop has multiple exit edges or if the
+     function may not get past something in the loop, since memory visible
+     outside of the function must hold the earlier store for that.  */
+  bool eliminate_store_p = (single_exit (m_loop) != NULL
+			    && !loop_may_end_function_p (m_loop));
   basic_block last_always_executed = last_always_executed_block (m_loop);
   auto_bitmap no_store_store_comps;
   auto_vec<unsigned> comp_father (n + 1);
