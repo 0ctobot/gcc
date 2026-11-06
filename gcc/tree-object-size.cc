@@ -2907,9 +2907,85 @@ object_size_may_step_back_p (tree ptr)
   return negative && object_size_chain_repeats_p (ptr);
 }
 
-/* Return true if the non-constant offset OFF is computed by subtracting, which
-   makes it a step backward rather than an index that merely might be
-   negative.  */
+/* Return true if the integer OFF, part of the offset of a pointer, may be
+   negative.  An unsigned value only counts if it's the result of subtracting,
+   since it's otherwise an index that goes forward, or an index so large that
+   using it is undefined.  */
+
+static bool
+object_size_offset_may_be_negative_p (tree off)
+{
+  auto_bitmap visited;
+  auto_vec<tree, 8> worklist;
+  int limit = param_ssa_name_def_chain_limit;
+
+  worklist.safe_push (off);
+  while (!worklist.is_empty ())
+    {
+      off = worklist.pop ();
+      if (TREE_CODE (off) == INTEGER_CST)
+	{
+	  if (tree_int_cst_sgn (off) < 0 || object_size_negative_offset_p (off))
+	    return true;
+	  continue;
+	}
+
+      if (TREE_CODE (off) != SSA_NAME || !INTEGRAL_TYPE_P (TREE_TYPE (off)))
+	return true;
+      if (!bitmap_set_bit (visited, SSA_NAME_VERSION (off)))
+	continue;
+      if (limit-- == 0)
+	return true;
+
+      gimple *stmt = SSA_NAME_DEF_STMT (off);
+      if (gimple_code (stmt) == GIMPLE_PHI)
+	{
+	  for (unsigned i = 0; i < gimple_phi_num_args (stmt); i++)
+	    worklist.safe_push (gimple_phi_arg_def (stmt, i));
+	  continue;
+	}
+
+      if (is_gimple_assign (stmt))
+	switch (gimple_assign_rhs_code (stmt))
+	  {
+	  case NEGATE_EXPR:
+	  case MINUS_EXPR:
+	    return true;
+	  case PLUS_EXPR:
+	  case MULT_EXPR:
+	    worklist.safe_push (gimple_assign_rhs1 (stmt));
+	    worklist.safe_push (gimple_assign_rhs2 (stmt));
+	    continue;
+	  CASE_CONVERT:
+	    {
+	      /* A non-negative value of an unsigned type can come out of a
+		 conversion to a signed type as a negative one.  */
+	      tree type = TREE_TYPE (off);
+	      tree rhs = gimple_assign_rhs1 (stmt);
+	      if (!TYPE_UNSIGNED (type)
+		  && TYPE_UNSIGNED (TREE_TYPE (rhs))
+		  && TYPE_PRECISION (type) <= TYPE_PRECISION (TREE_TYPE (rhs)))
+		return true;
+	      worklist.safe_push (rhs);
+	      continue;
+	    }
+	  default:
+	    break;
+	  }
+
+      if (!tree_expr_nonnegative_p (off))
+	return true;
+    }
+
+  return false;
+}
+
+/* Return true if the non-constant offset OFF is computed in a way that can step
+   back, which is different from an index that merely might be negative.  That's
+   the case for subtracting, and for adding to an index with something that may
+   be negative, or to one that may be negative itself.  The latter is what two
+   steps LABEL + N + C look like once they're folded into one, with N going
+   below LABEL and C coming back.  */
 
 static bool
 object_size_negated_offset_p (tree off)
@@ -2925,8 +3001,13 @@ object_size_negated_offset_p (tree off)
 	case NEGATE_EXPR:
 	case MINUS_EXPR:
 	  return true;
+	case PLUS_EXPR:
+	  return object_size_offset_may_be_negative_p (off);
 	case MULT_EXPR:
-	  return object_size_negative_offset_p (gimple_assign_rhs2 (stmt));
+	  if (object_size_negative_offset_p (gimple_assign_rhs2 (stmt)))
+	    return true;
+	  off = gimple_assign_rhs1 (stmt);
+	  break;
 	CASE_CONVERT:
 	  off = gimple_assign_rhs1 (stmt);
 	  break;
@@ -2939,13 +3020,17 @@ object_size_negated_offset_p (tree off)
 }
 
 /* Return true if the step LHS = BASE + OFF gives a pointer that may have come
-   back from below its subobject, or that may be there still.  */
+   back from below its subobject, or that may be there still.  A non-constant
+   offset applied in a cycle doesn't count unless it's a step backward in
+   itself: that's an ordinary walk through the subobject.  */
 
 static bool
 object_size_step_returns_p (tree lhs, tree base, tree off)
 {
   if (TREE_CODE (off) != INTEGER_CST)
-    return object_size_negated_offset_p (off);
+    return (object_size_negated_offset_p (off)
+	    || (!object_size_step_repeats_p (lhs, base)
+		&& object_size_may_step_back_p (base)));
 
   if (object_size_negative_offset_p (off))
     return object_size_chain_repeats_p (base);
