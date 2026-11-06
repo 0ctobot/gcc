@@ -385,6 +385,13 @@ factor_out_conditional_operation (edge e0, edge e1, basic_block merge,
   if (!gimple_extract_op (arg0_def_stmt, &arg0_op))
     return false;
 
+  /* The operation gets removed and rebuilt after the merge, which loses its
+     EH region, so a trapping operation under -fnon-call-exceptions cannot be
+     factored out.  This includes a must-not-throw region, in which the
+     statement doesn't end its basic block.  */
+  if (stmt_could_throw_p (cfun, arg0_def_stmt))
+    return false;
+
   /* Check to make sure none of the operands are in abnormal phis.  */
   if (arg0_op.operands_occurs_in_abnormal_phi ())
    return false;
@@ -405,6 +412,8 @@ factor_out_conditional_operation (edge e0, edge e1, basic_block merge,
       /* Check if arg1 is an SSA_NAME.  */
       arg1_def_stmt = SSA_NAME_DEF_STMT (arg1);
       if (!gimple_extract_op (arg1_def_stmt, &arg1_op))
+	return false;
+      if (stmt_could_throw_p (cfun, arg1_def_stmt))
 	return false;
       if (arg1_op.code != arg0_op.code)
 	return false;
