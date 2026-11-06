@@ -14569,6 +14569,15 @@ tree_expr_maybe_nan_p (const_tree x)
     {
     case REAL_CST:
       return real_isnan (TREE_REAL_CST_PTR (x));
+    case SSA_NAME:
+      if (frange::supports_p (TREE_TYPE (x)))
+	{
+	  frange r;
+	  if (get_range_query (cfun)->range_of_expr (r, const_cast <tree> (x))
+	      && !r.undefined_p ())
+	    return r.maybe_isnan ();
+	}
+      return true;
     case FLOAT_EXPR:
       return false;
     case PLUS_EXPR:
@@ -14766,9 +14775,9 @@ tree_binary_nonnegative_p (enum tree_code code, tree type, tree op0,
     case MULT_EXPR:
       if (FLOAT_TYPE_P (type) || TYPE_OVERFLOW_UNDEFINED (type))
 	{
-	  /* x * x is always non-negative for floating point x
-	     or without overflow.  */
-	  if (operand_equal_p (op0, op1, 0)
+	  /* x * x is non-negative without overflow and for floating point x
+	     that isn't a NaN, since squaring a NaN can keep its sign.  */
+	  if ((operand_equal_p (op0, op1, 0) && !tree_expr_maybe_nan_p (op0))
 	      || (RECURSE (op0) && RECURSE (op1)))
 	    return true;
 	}
@@ -15048,17 +15057,18 @@ tree_call_nonnegative_p (tree type, combined_fn fn, tree arg0, tree arg1,
 
     CASE_CFN_POWI:
       /* True if the 1st argument is nonnegative or the second
-	 argument is an even integer.  */
+	 argument is an even integer and the 1st isn't a NaN.  */
       if (TREE_CODE (arg1) == INTEGER_CST
-	  && (TREE_INT_CST_LOW (arg1) & 1) == 0)
+	  && (TREE_INT_CST_LOW (arg1) & 1) == 0
+	  && !tree_expr_maybe_nan_p (arg0))
 	return true;
       return RECURSE (arg0);
 
     CASE_CFN_POW:
     CASE_CFN_POW_FN:
       /* True if the 1st argument is nonnegative or the second
-	 argument is an even integer valued real.  */
-      if (TREE_CODE (arg1) == REAL_CST)
+	 argument is an even integer valued real and the 1st isn't a NaN.  */
+      if (TREE_CODE (arg1) == REAL_CST && !tree_expr_maybe_nan_p (arg0))
 	{
 	  REAL_VALUE_TYPE c;
 	  HOST_WIDE_INT n;
