@@ -3159,17 +3159,19 @@ count_num_arguments (tree decl, bool *is_varargs)
 
 /* Creation function node for DECL, using NAME, and return the index
    of the variable we've created for the function.  If NONLOCAL_p, create
-   initial constraints.  */
+   initial constraints.  If ANY_ARGS_P, callers may pass arguments the
+   definition doesn't name, so add the part for further args that a varargs
+   function gets.  */
 
 static varinfo_t
 create_function_info_for (tree decl, const char *name, bool add_id,
-			  bool nonlocal_p)
+			  bool nonlocal_p, bool any_args_p)
 {
   struct function *fn = DECL_STRUCT_FUNCTION (decl);
   varinfo_t vi, prev_vi;
   tree arg;
   unsigned int i;
-  bool is_varargs = false;
+  bool is_varargs = any_args_p;
   unsigned int num_args = count_num_arguments (decl, &is_varargs);
 
   /* Create the variable info.  */
@@ -4012,6 +4014,37 @@ refered_from_nonlocal_fn (struct cgraph_node *node, void *data)
   return false;
 }
 
+/* Return true if a call through NODE cannot rely on the body it would see,
+   since NODE is noipa or its definition can be replaced.  Ifunc symbols don't
+   count because associate_varinfo_to_alias keeps them off the function info of
+   the body.  Worker for cgraph_for_symbol_thunks_and_aliases.  */
+static bool
+opaque_symbol_p (struct cgraph_node *node, void *data ATTRIBUTE_UNUSED)
+{
+  return (node->get_availability () <= AVAIL_INTERPOSABLE
+	  && !node->ifunc_on_alias_chain_p ());
+}
+
+/* Make callers of the function info FI see what they'd see when calling an
+   external function, on top of what the body does.  Whatever is passed to the
+   function escapes, and the call uses and clobbers nonlocal and escaped memory
+   and returns a pointer to it.  All names of a body share one function info,
+   so this covers calls through the names that aren't opaque too.  */
+static void
+make_function_info_opaque (varinfo_t fi)
+{
+  varinfo_t escaped = get_varinfo (escaped_id);
+  for (varinfo_t part = vi_next (fi); part; part = vi_next (part))
+    if (part->offset == fi_clobbers || part->offset == fi_uses)
+      make_copy_constraint (part, nonlocal_id);
+    else
+      {
+	make_copy_constraint (escaped, part->id);
+	if (part->offset == fi_result)
+	  make_copy_constraint (part, nonlocal_id);
+      }
+}
+
 /* Same for varpool nodes.  */
 static bool
 refered_from_nonlocal_var (struct varpool_node *node, void *data)
@@ -4060,9 +4093,13 @@ ipa_create_function_infos (void)
       node->call_for_symbol_thunks_and_aliases (refered_from_nonlocal_fn,
 						&nonlocal_p, true);
 
+      bool opaque_p
+	= node->call_for_symbol_thunks_and_aliases (opaque_symbol_p, NULL, true);
       vi = create_function_info_for (node->decl,
 				     alias_get_name (node->decl), false,
-				     nonlocal_p);
+				     nonlocal_p, opaque_p);
+      if (opaque_p)
+	make_function_info_opaque (vi);
       if (dump_file && (dump_flags & TDF_DETAILS)
 	  && constr_count != constraints.length ())
 	{
