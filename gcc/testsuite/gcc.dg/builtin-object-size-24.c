@@ -1,8 +1,9 @@
 /* Folding can turn container_of, a member access and a pointer step into a
    single positive offset from the member that container_of started at.  A
    maximum subobject size must not take that for a pointer leaving the member,
-   since it may have landed in another subobject with room left.  An offset
-   straight from the source that leaves its subobject must still give 0.  */
+   since it may have landed in another subobject with room left.  A constant
+   offset straight from the source that leaves its subobject must still give
+   0.  */
 /* { dg-do run } */
 /* { dg-options "-O2" } */
 
@@ -159,7 +160,9 @@ test_exit (struct w *x, long i)
   CHECK (DOS (p + 16, 1), 0);
   CHECK (BOS (p + 20, 1), 0);
   CHECK (DOS (p + 20, 1), 0);
-  CHECK (DOS (p + i, 1), 0);
+  /* A non-constant offset cannot be told from a folded one, and the object
+     around the member is unknown here.  */
+  CHECK (DOS (p + i, 1), (__SIZE_TYPE__) -1);
 }
 
 int

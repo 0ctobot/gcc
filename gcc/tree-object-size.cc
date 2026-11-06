@@ -1816,30 +1816,24 @@ merge_object_sizes (struct object_size_info *osi, tree dest, tree orig)
 }
 
 
-/* Return true if the offset OP1 from OP0 in STMT may come from several pointer
-   steps folded together, e.g., container_of, a member access and a step turned
-   into a single positive offset.  Such an offset can look like it leaves a
-   subobject when none of the steps in the source do.  The early pass runs
-   before a function's own statements are optimized, so only a statement from an
-   inlined function can be folded by then, since the inlined body already went
-   through the optimizations of its own function.  Any statement can be folded
-   after that, but a function's own statement only counts when the early pass
-   capped its size with the estimate from before the folding.
-   __builtin_dynamic_object_size gets no such cap with a non-constant offset,
-   and a cap from before the folding is of no use to it when OP0 may be one of
-   several pointers, since the size depends on the pointer in use at run time.
-   Offsets in these cases have to be taken at face value in order to catch one
-   that really leaves the subobject.  */
+/* Return true if the offset in STMT may come from several pointer steps folded
+   together, e.g., container_of, a member access and a step turned into a single
+   positive offset.  Such an offset can look like it leaves a subobject when none
+   of the steps in the source do.  The early pass runs before a function's own
+   statements are optimized, so only a statement from an inlined function can be
+   folded by then, since the inlined body already went through the optimizations
+   of its own function.  Any statement can be folded after that, whether or not
+   its offset is constant, and nothing in the statement tells a folded offset
+   from one straight from the source.  An offset from the source that really
+   leaves the subobject is left to the cap the early pass computed from before
+   the folding.  There's no such cap for a non-constant offset with
+   __builtin_dynamic_object_size, which falls back to the bound of the enclosing
+   object since a size of 0 would abort valid code.  */
 
 static bool
-object_size_offset_folded_p (int object_size_type, gimple *stmt, tree op0,
-			     tree op1)
+object_size_offset_folded_p (gimple *stmt)
 {
-  if (!object_sizes_early
-      && (!(object_size_type & OST_DYNAMIC)
-	  || (TREE_CODE (op1) == INTEGER_CST
-	      && !object_size_merged_p (op0)
-	      && !object_size_variable_offset_p (op0))))
+  if (!object_sizes_early)
     return true;
 
   for (tree block = gimple_block (stmt);
@@ -2019,9 +2013,7 @@ plus_stmt_object_size (struct object_size_info *osi, tree var, gimple *stmt)
 
       bool maxsub = ((object_size_type & (OST_SUBOBJECT | OST_MINIMUM))
 		     == OST_SUBOBJECT);
-      bool folded = (maxsub
-		     && object_size_offset_folded_p (object_size_type, stmt,
-						     op0, op1));
+      bool folded = maxsub && object_size_offset_folded_p (stmt);
 
       tree offwhole = wholesize;
       if (!pos_offset && !size_unknown_p (bytes, 0))
