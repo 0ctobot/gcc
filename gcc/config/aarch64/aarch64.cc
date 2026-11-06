@@ -11553,7 +11553,7 @@ aarch64_classify_index (struct aarch64_address_info *info, rtx x,
 {
   enum aarch64_address_type type;
   rtx index;
-  int shift;
+  HOST_WIDE_INT shift;
 
   /* (reg:P) */
   if ((REG_P (x) || SUBREG_P (x))
@@ -11629,7 +11629,10 @@ aarch64_classify_index (struct aarch64_address_info *info, rtx x,
       type = ADDRESS_REG_UXTW;
       index = XEXP (XEXP (x, 0), 0);
       shift = INTVAL (XEXP (XEXP (x, 0), 1));
-      if (INTVAL (XEXP (x, 1)) != (HOST_WIDE_INT)0xffffffff << shift)
+      /* Only the amounts checked below can be valid, and anything else could
+	 be too large to shift the mask by.  */
+      if (!IN_RANGE (shift, 0, 3)
+	  || INTVAL (XEXP (x, 1)) != (HOST_WIDE_INT)0xffffffff << shift)
 	shift = -1;
     }
   /* (mult:P (reg:P) (const_int scale)) */
@@ -11663,8 +11666,10 @@ aarch64_classify_index (struct aarch64_address_info *info, rtx x,
   auto vec_flags = aarch64_classify_vector_memory_mode (mode);
   if (vec_flags & VEC_SVE_DATA)
     {
+      /* Compare logarithms since SHIFT is unvalidated here and could be out of
+	 range for a shift on the host.  */
       if (type != ADDRESS_REG_REG
-	  || (1 << shift) != GET_MODE_UNIT_SIZE (mode))
+	  || shift != exact_log2 (GET_MODE_UNIT_SIZE (mode)))
 	return false;
     }
   else
