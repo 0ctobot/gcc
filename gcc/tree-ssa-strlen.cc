@@ -133,7 +133,10 @@ struct strinfo
      function.  */
   bool writable;
   /* A flag for the next maybe_invalidate that this strinfo shouldn't
-     be invalidated.  Always cleared by maybe_invalidate.  */
+     be invalidated.  Always cleared by maybe_invalidate.  Only set this while
+     handling a statement with a VDEF: maybe_invalidate runs right after such
+     a statement, whereas a flag set for a statement without one would exempt
+     this strinfo from a later store that has nothing to do with it.  */
   bool dont_invalidate;
   /* True if the string is known to be nul-terminated after NONZERO_CHARS
      characters.  False is useful when detecting strings that are built
@@ -1630,10 +1633,16 @@ zero_length_string (tree ptr, strinfo *chainsi)
    related strinfos so that they match the new ORIGSI.  This involves:
 
    - adding ADJ to the nonzero_chars fields
-   - copying full_string_p from the new ORIGSI.  */
+   - copying full_string_p from the new ORIGSI.
+
+   STMT_WRITES says whether the current statement writes to memory.  If it
+   does, the related strinfos are exempted from the maybe_invalidate call for
+   that write.  A statement that only reads, such as a call to strlen, gets no
+   such call and must not leave the exemption behind for the next store.  */
 
 static void
-adjust_related_strinfos (location_t loc, strinfo *origsi, tree adj)
+adjust_related_strinfos (location_t loc, strinfo *origsi, tree adj,
+			 bool stmt_writes = true)
 {
   strinfo *si = verify_related_strinfos (origsi);
 
@@ -1660,7 +1669,8 @@ adjust_related_strinfos (location_t loc, strinfo *origsi, tree adj)
 	  si->full_string_p = origsi->full_string_p;
 
 	  si->endptr = NULL_TREE;
-	  si->dont_invalidate = true;
+	  if (stmt_writes)
+	    si->dont_invalidate = true;
 	}
       nsi = get_next_strinfo (si);
       if (nsi == NULL)
@@ -2344,7 +2354,7 @@ strlen_pass::handle_builtin_strlen ()
 		  old = fold_convert_loc (loc, TREE_TYPE (lhs), old);
 		  tree adj = fold_build2_loc (loc, MINUS_EXPR,
 					      TREE_TYPE (lhs), lhs, old);
-		  adjust_related_strinfos (loc, si, adj);
+		  adjust_related_strinfos (loc, si, adj, false);
 		  /* Use the constant minimum length as the lower bound
 		     of the non-constant length.  */
 		  wide_int min = wi::to_wide (old);
@@ -3797,7 +3807,9 @@ strlen_pass::handle_alloc_call (built_in_function bcode)
   si->alloc = stmt;
   set_strinfo (idx, si);
   si->writable = true;
-  si->dont_invalidate = true;
+  /* A call to a const or pure function with attribute alloc_size has no VDEF
+     and thus gets no maybe_invalidate call of its own to clear this flag.  */
+  si->dont_invalidate = gimple_vdef (stmt) != NULL_TREE;
 }
 
 /* Returns true of the last statement of the bb is a conditional
