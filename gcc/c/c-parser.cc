@@ -2996,6 +2996,23 @@ c_parser_declaration_or_fndef (c_parser *parser, bool fndef_ok,
 					      specs->expr, type_expr);
 		      else
 			specs->expr = type_expr;
+		      /* Evaluating the initializer can allocate a variable-sized
+			 temporary that the declaration goes on to read.  If a
+			 jump can bypass the top of this binding level, then
+			 create a new BIND_EXPR here so that it can't skip the
+			 stack save for the temporary, like finish_decl does for
+			 the variable itself.  */
+		      if (TYPE_SIZE (init_type)
+			  && !TREE_CONSTANT (TYPE_SIZE (init_type))
+			  && building_stmt_list_p ()
+			  && STATEMENT_LIST_HAS_LABEL (cur_stmt_list))
+			{
+			  tree bind = build3 (BIND_EXPR, void_type_node, NULL,
+					      NULL, NULL);
+			  TREE_SIDE_EFFECTS (bind) = 1;
+			  add_stmt (bind);
+			  BIND_EXPR_BODY (bind) = push_stmt_list ();
+			}
 		    }
 		  d = start_decl (declarator, specs, true,
 				  chainon (postfix_attrs, all_prefix_attrs));
