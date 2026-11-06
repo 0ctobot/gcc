@@ -55,6 +55,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "attribs.h"
 #include "asan.h"
 #include "target.h"
+#include "tree-ssa-dse.h"
 
 /* The file implements the tail recursion elimination.  It is also used to
    analyze the tail calls in general, passing the results to the rtl level
@@ -1184,7 +1185,11 @@ find_tail_calls (basic_block bb, edge esucc, struct tailcall **ret,
 
   /* Make sure the tail invocation of this function does not indirectly
      refer to local variables.  (Passing variables directly by value
-     is OK.)  */
+     is OK.)  This also keeps the frame around for a callee that doesn't touch
+     a local variable when the function may never get past the callee, since
+     whoever got the address of the variable can still read it.  */
+  bool may_end_function = (!gimple_call_must_tail_p (call)
+			   && stmt_may_end_function_p (cfun, call));
   FOR_EACH_LOCAL_DECL (cfun, idx, var)
     {
       if (TREE_CODE (var) != PARM_DECL
@@ -1192,7 +1197,8 @@ find_tail_calls (basic_block bb, edge esucc, struct tailcall **ret,
 	  && may_be_aliased (var)
 	  && (ref_maybe_used_by_stmt_p (call, var, false)
 	      || call_may_clobber_ref_p (call, var, false)
-	      || call_may_see_address_p (call, var)))
+	      || call_may_see_address_p (call, var)
+	      || (may_end_function && ref_may_alias_global_p (var, true))))
 	{
 	  if (!VAR_P (var))
 	    {
