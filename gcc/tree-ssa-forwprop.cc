@@ -59,6 +59,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "gimple-range.h"
 #include "tree-ssa-dce.h"
 #include "tree-ssa-math-opts.h"
+#include "tree-ssa-dse.h"
 
 /* This pass propagates the RHS of assignment statements into use
    sites of the LHS of the assignment.  It's basically a specialized
@@ -1814,6 +1815,12 @@ optimize_agr_copyprop (gimple *stmt)
     }
 }
 
+/* Whether the function being walked may stop running without any virtual use
+   showing that, from function_may_stop_unseen_p, or -1 if nobody has asked yet.
+   This is only computed once per walk since a function can have many
+   clobbers.  */
+static int simple_dse_may_stop;
+
 /* Simple DSE of the lhs from a clobber STMT.
    This is used mostly to clean up from optimize_agr_copyprop and
    to remove (exactly one) extra copy that might later on confuse SRA.
@@ -1838,6 +1845,19 @@ do_simple_agr_dse (gassign *stmt, bool full_walk)
   /* Only handle clobbers of a full decl.  */
   if (!DECL_P (lhs))
     return;
+  /* The clobber only ends LHS when the function gets as far as the clobber.
+     Whoever got the address of LHS can still read it if the function stops
+     running in front of the clobber instead, and the walk below doesn't see
+     that since the statement doing it needn't have a virtual use or may not
+     read LHS.  */
+  bool visible_lhs = may_be_aliased (lhs);
+  if (visible_lhs)
+    {
+      if (simple_dse_may_stop < 0)
+	simple_dse_may_stop = function_may_stop_unseen_p (cfun);
+      if (simple_dse_may_stop)
+	return;
+    }
   ao_ref_init (&read, lhs);
   tree vuse = gimple_vuse (stmt);
   unsigned limit = full_walk ? param_sccvn_max_alias_queries_per_access : 4;
@@ -1880,7 +1900,8 @@ do_simple_agr_dse (gassign *stmt, bool full_walk)
 	    }
 	  /* The use needs to be dominating the clobber. */
 	  if ((ubb != bb && !dominated_by_p (CDI_DOMINATORS, bb, ubb))
-	      || ref_maybe_used_by_stmt_p (use_stmt, &read, false))
+	      || ref_maybe_used_by_stmt_p (use_stmt, &read, false)
+	      || (visible_lhs && stmt_may_end_function_p (cfun, use_stmt)))
 	    return;
 	  /* Count the above alias lookup towards the limit. */
 	  limit--;
@@ -1976,7 +1997,8 @@ do_simple_agr_dse (gassign *stmt, bool full_walk)
 	   dse of this statement.
 	 b = {CLOBBER}; */
       if (stmt_may_clobber_ref_p_1 (ostmt, &read, false)
-	  || ref_maybe_used_by_stmt_p (ostmt, &read, false))
+	  || ref_maybe_used_by_stmt_p (ostmt, &read, false)
+	  || (visible_lhs && stmt_may_end_function_p (cfun, ostmt)))
 	return;
       limit--;
     }
@@ -6720,6 +6742,7 @@ pass_forwprop::execute (function *fun)
   bool full_walk = m_full_walk && flag_expensive_optimizations;
 
   cfg_changed = false;
+  simple_dse_may_stop = -1;
   if (last_p)
     fun->curr_properties |= PROP_last_full_fold;
 
