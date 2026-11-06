@@ -1570,7 +1570,12 @@ ipacp_value_safe_for_type (tree param_type, tree value)
       || useless_type_conversion_p (param_type, val_type))
     return value;
   if (fold_convertible_p (param_type, value))
-    return fold_convert (param_type, value);
+    {
+      /* A narrowing conversion to a signed type can set TREE_OVERFLOW, which
+	 has no place in the IL of a clone.  */
+      tree res = fold_convert (param_type, value);
+      return TREE_OVERFLOW_P (res) ? drop_tree_overflow (res) : res;
+    }
   else
     return NULL_TREE;
 }
@@ -1608,6 +1613,11 @@ ipa_get_jf_arith_result (enum tree_code opcode, tree input, tree operand,
 
   if (res && !is_gimple_ip_invariant (res))
     return NULL_TREE;
+
+  /* Signed wrapping while folding can set TREE_OVERFLOW, which has no place in
+     the IL of a clone.  */
+  if (res && TREE_OVERFLOW_P (res))
+    res = drop_tree_overflow (res);
 
   return res;
 }
