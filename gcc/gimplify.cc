@@ -261,6 +261,11 @@ struct gimplify_ctx
   int conditions;
   unsigned into_ssa : 1;
   unsigned allow_rhs_cond_expr : 1;
+  /* A statement expression's variable-sized temporary that's yet to be
+     allocated, and the BIND_EXPR that has to keep it alive.  */
+  tree late_alloca_tmp;
+  tree late_alloca_bind;
+
   unsigned in_cleanup_point_expr : 1;
   unsigned keep_stack : 1;
   unsigned save_stack : 1;
@@ -1953,7 +1958,9 @@ gimplify_bind_expr (tree *expr_p, gimple_seq *pre_p)
 
   /* If the code both contains VLAs and calls alloca, then we cannot reclaim
      the stack space allocated to the VLAs.  */
-  if (gimplify_ctxp->save_stack && !gimplify_ctxp->keep_stack)
+  if (gimplify_ctxp->save_stack
+      && !gimplify_ctxp->keep_stack
+      && bind_expr != gimplify_ctxp->late_alloca_bind)
     {
       gcall *stack_restore;
 
@@ -7579,6 +7586,28 @@ gimplify_modify_expr (tree *expr_p, gimple_seq *pre_p, gimple_seq *post_p,
   gcc_assert (TREE_CODE (*expr_p) == MODIFY_EXPR
 	      || TREE_CODE (*expr_p) == INIT_EXPR);
 
+  /* This assignment ends the body of a statement expression whose temporary
+     couldn't be allocated earlier; see gimplify_target_expr.  A nested
+     statement expression can be what declares the type, and it can be anywhere
+     in the value, such as under a comma, a member access or an indirection, so
+     everything in the value with side effects runs first.  */
+  if (gimplify_ctxp->late_alloca_tmp
+      && *to_p == gimplify_ctxp->late_alloca_tmp)
+    {
+      gimplify_ctxp->late_alloca_tmp = NULL_TREE;
+      if (TREE_SIDE_EFFECTS (*from_p))
+	{
+	  ret = gimplify_expr (from_p, pre_p, post_p, is_gimple_lvalue,
+			       fb_lvalue);
+	  if (ret == GS_ERROR)
+	    return ret;
+	  ret = GS_UNHANDLED;
+	}
+      if (!TYPE_SIZES_GIMPLIFIED (TREE_TYPE (*to_p)))
+	gimplify_type_sizes (TREE_TYPE (*to_p), pre_p);
+      gimplify_vla_decl (*to_p, pre_p);
+    }
+
   /* Trying to simplify a clobber using normal logic doesn't work,
      so handle it here.  */
   if (TREE_CLOBBER_P (*from_p))
@@ -8809,15 +8838,33 @@ gimplify_target_expr (tree *expr_p, gimple_seq *pre_p, gimple_seq *post_p)
     {
       gimple_seq init_pre_p = NULL;
       bool is_vla = false;
+      tree old_late_alloca_tmp = gimplify_ctxp->late_alloca_tmp;
+      tree old_late_alloca_bind = gimplify_ctxp->late_alloca_bind;
+
+      /* A statement expression can declare the type of its own value, as in
+	 ({ int m = f (); struct { char a[m]; } t; t; }), and then the size of
+	 the temporary isn't known until the body has run.  Allocate it at the
+	 assignment that ends the body rather than here, and keep the stack
+	 from being restored at the end of the body since the value has to
+	 outlive it.  The space is reclaimed with the rest of the temporaries
+	 of the enclosing full expression.  */
+      bool late_alloca = (!poly_int_tree_p (DECL_SIZE (temp))
+			  && !TYPE_SIZES_GIMPLIFIED (TREE_TYPE (temp))
+			  && TREE_CODE (init) == BIND_EXPR
+			  && VOID_TYPE_P (TREE_TYPE (init)));
 
       /* TARGET_EXPR temps aren't part of the enclosing block, so add it
 	 to the temps list.  Handle also variable length TARGET_EXPRs.  */
-      if (!poly_int_tree_p (DECL_SIZE (temp)))
+      if (late_alloca)
+	{
+	  gimplify_ctxp->late_alloca_tmp = temp;
+	  gimplify_ctxp->late_alloca_bind = init;
+	  is_vla = true;
+	}
+      else if (!poly_int_tree_p (DECL_SIZE (temp)))
 	{
 	  if (!TYPE_SIZES_GIMPLIFIED (TREE_TYPE (temp)))
 	    gimplify_type_sizes (TREE_TYPE (temp), &init_pre_p);
-	  /* FIXME: this is correct only when the size of the type does
-	     not depend on expressions evaluated in init.  */
 	  if (tmp_type_needs_alloca_p (TREE_TYPE (temp)))
 	    gimplify_alloca_tmp_decl (temp, &init_pre_p);
 	  else
@@ -8834,7 +8881,11 @@ gimplify_target_expr (tree *expr_p, gimple_seq *pre_p, gimple_seq *post_p)
 	  gimple_add_tmp_var (temp);
 	}
 
-      if (var_needs_auto_init_p (temp) && VOID_TYPE_P (TREE_TYPE (init)))
+      /* A late allocation is written whole right after it's made, so there's
+	 nothing to initialize.  */
+      if (!late_alloca
+	  && var_needs_auto_init_p (temp)
+	  && VOID_TYPE_P (TREE_TYPE (init)))
 	{
 	  gimple_add_init_for_auto_var (temp, flag_auto_var_init, &init_pre_p);
 	  if ((flag_auto_var_init & ~AUTO_INIT_CXX26) == AUTO_INIT_PATTERN
@@ -8857,6 +8908,17 @@ gimplify_target_expr (tree *expr_p, gimple_seq *pre_p, gimple_seq *post_p)
 	  init = NULL;
 	  ggc_free (init_expr);
 	}
+
+      if (late_alloca)
+	{
+	  gimplify_ctxp->late_alloca_tmp = old_late_alloca_tmp;
+	  gimplify_ctxp->late_alloca_bind = old_late_alloca_bind;
+	  /* The body didn't reclaim its stack space, so make sure the enclosing
+	     full expression or BIND_EXPR does.  */
+	  gimplify_ctxp->stmt_alloca_tmp = true;
+	  gimplify_ctxp->save_stack = true;
+	}
+
       if (ret == GS_ERROR)
 	{
 	  /* PR c++/28266 Make sure this is expanded only once. */
