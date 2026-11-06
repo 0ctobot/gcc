@@ -168,6 +168,7 @@
 #include "expr.h"	/* For get_bit_range.  */
 #include "optabs-tree.h"
 #include "dbgcnt.h"
+#include "tree-ssa-dse.h"
 #include "selftest.h"
 
 /* The maximum size (in bits) of the stores this pass should generate.  */
@@ -2662,8 +2663,12 @@ pass_store_merging::terminate_all_aliasing_chains (imm_store_chain_info
 {
   bool ret = false;
 
+  /* Stores to memory visible outside of the function have to be in place when
+     the function stops running, whatever the statement does to memory.  */
+  bool may_end_function = stmt_may_end_function_p (cfun, stmt);
+
   /* If the statement doesn't touch memory it can't alias.  */
-  if (!gimple_vuse (stmt))
+  if (!may_end_function && !gimple_vuse (stmt))
     return false;
 
   for (imm_store_chain_info *next = m_stores_head, *cur = next; cur; cur = next)
@@ -2682,7 +2687,8 @@ pass_store_merging::terminate_all_aliasing_chains (imm_store_chain_info
 	  tree lhs = gimple_assign_lhs (info->stmt);
 	  ao_ref lhs_ref;
 	  ao_ref_init (&lhs_ref, lhs);
-	  if (ref_maybe_used_by_stmt_p (stmt, &lhs_ref)
+	  if ((may_end_function && ref_may_alias_global_p (&lhs_ref, true))
+	      || ref_maybe_used_by_stmt_p (stmt, &lhs_ref)
 	      || stmt_may_clobber_ref_p_1 (stmt, &lhs_ref, false))
 	    {
 	      if (dump_file && (dump_flags & TDF_DETAILS))
