@@ -58,7 +58,7 @@ struct GTY(()) object_size
   tree wholesize;
   /* For a maximum dynamic subobject size, NULL when SIZE is always a size, or
      else nonzero when SIZE may be one of the encodings of a pointer outside
-     of its subobject that size_below_subobject describes.  */
+     of its subobject that size_outside_subobject describes.  */
   tree encoded;
 };
 
@@ -73,6 +73,7 @@ static void collect_object_sizes_for (struct object_size_info *, tree);
 static void expr_object_size (struct object_size_info *, tree, tree);
 static bool merge_object_sizes (struct object_size_info *, tree, tree);
 static bool plus_stmt_object_size (struct object_size_info *, tree, gimple *);
+static bool object_size_variable_offset_p (tree, bool = false);
 static bool cond_expr_object_size (struct object_size_info *, tree, gimple *);
 static void init_offset_limit (void);
 static void check_for_plus_in_loops (struct object_size_info *, tree);
@@ -100,6 +101,10 @@ static unsigned HOST_WIDE_INT offset_limit;
 /* Tell the generic SSA updater what kind of update is needed after the pass
    executes.  */
 static unsigned todo;
+
+/* Whether the object size pass running now is the early one, which sees a
+   function's own statements before they're optimized.  */
+static bool object_sizes_early;
 
 /* Return true if VAL represents an initial size for OBJECT_SIZE_TYPE.  */
 
@@ -1972,6 +1977,41 @@ merge_object_sizes (struct object_size_info *osi, tree dest, tree orig)
 }
 
 
+/* Return true if the offset OP1 from OP0 in STMT may come from several pointer
+   steps folded together, e.g., container_of, a member access and a step turned
+   into a single positive offset.  Such an offset can look like it leaves a
+   subobject when none of the steps in the source do.  The early pass runs
+   before a function's own statements are optimized, so only a statement from an
+   inlined function can be folded by then, since the inlined body already went
+   through the optimizations of its own function.  Any statement can be folded
+   after that, but a function's own statement only counts when the early pass
+   capped its size with the estimate from before the folding.
+   __builtin_dynamic_object_size gets no such cap with a non-constant offset,
+   and a cap from before the folding is of no use to it when OP0 may be one of
+   several pointers, since the size depends on the pointer in use at run time.
+   Offsets in these cases have to be taken at face value in order to catch one
+   that really leaves the subobject.  */
+
+static bool
+object_size_offset_folded_p (int object_size_type, gimple *stmt, tree op0,
+			     tree op1)
+{
+  if (!object_sizes_early
+      && (!(object_size_type & OST_DYNAMIC)
+	  || (TREE_CODE (op1) == INTEGER_CST
+	      && !object_size_merged_p (op0)
+	      && !object_size_variable_offset_p (op0))))
+    return true;
+
+  for (tree block = gimple_block (stmt);
+       block && TREE_CODE (block) == BLOCK;
+       block = BLOCK_SUPERCONTEXT (block))
+    if (inlined_function_outer_scope_p (block))
+      return true;
+
+  return false;
+}
+
 /* OP0 has a static maximum subobject size in a subobject of WHOLESIZE bytes,
    whose end is TOP bytes from its start, and OP0 + OP1 stays in the subobject
    for that size.  The maximum size belongs to the pointer closest to the start
@@ -1996,17 +2036,18 @@ offset_stays_in_subobject_p (tree op0, tree op1, tree wholesize, tree top)
 }
 
 /* OP0 has a maximum subobject size of *PBYTES in a subobject of *PWHOLESIZE
-   bytes, and OP1 is a negative or runtime offset.  If OP0 + OP1 lands below the
-   start of the subobject, e.g., container_of on a member, then the subobject
-   says nothing about it and the only upper bound left comes from the enclosing
-   object.  Update *PBYTES and *PWHOLESIZE to account for this and return true,
-   or return false if OP0 + OP1 is known to stay in the subobject.  *PENCODED
-   is the flag that tells whether *PBYTES may be an encoding, which is updated
-   along with it.  */
+   bytes.  If OP0 + OP1 lands outside of the subobject, e.g., container_of on a
+   member, then the subobject says nothing about it and the only upper bound
+   left comes from the enclosing object.  Update *PBYTES and *PWHOLESIZE to
+   account for this and return true, or return false if OP0 + OP1 is known to
+   stay in the subobject.  Landing past the end of the subobject only counts
+   when the offset is FOLDED, since an offset straight from the source really
+   does overflow the subobject there.  *PENCODED is the flag that tells whether
+   *PBYTES may be an encoding, which is updated along with it.  */
 
 static bool
-size_below_subobject (int object_size_type, tree op0, tree op1,
-		      tree *pbytes, tree *pwholesize, tree *pencoded)
+size_outside_subobject (int object_size_type, tree op0, tree op1, bool folded,
+			tree *pbytes, tree *pwholesize, tree *pencoded)
 {
   bool dynamic = (object_size_type & OST_DYNAMIC) != 0;
   tree bytes = *pbytes;
@@ -2017,15 +2058,23 @@ size_below_subobject (int object_size_type, tree op0, tree op1,
   tree net = fold_build2 (PLUS_EXPR, sizetype, top,
 			  fold_convert (sizetype, op1));
   net = fold_build2 (MINUS_EXPR, sizetype, net, bytes);
-  tree below = fold_build2 (GT_EXPR, boolean_type_node, net,
-			    build_int_cstu (sizetype, offset_limit));
+
+  /* A net offset that wrapped around is larger than any valid one, so comparing
+     against the end of the subobject also catches an offset below its
+     start.  */
+  tree outside = (folded
+		  ? fold_build2 (GE_EXPR, boolean_type_node, net, top)
+		  : fold_build2 (GT_EXPR, boolean_type_node, net,
+				 build_int_cstu (sizetype, offset_limit)));
 
   /* The net offset of a static pair merged from several pointers is meaningless
      and may look like it stays in the subobject when it doesn't for the pointer
-     actually used, unless the minimum size can prove otherwise.  */
-  if (integer_zerop (below)
+     actually used, unless the minimum size can prove otherwise.  A folded
+     offset needs that proof as well, since a pointer stepped in a loop can have
+     any position in its subobject even without a merge.  */
+  if (integer_zerop (outside)
       && (dynamic
-	  || !object_size_merged_p (op0)
+	  || (!folded && !object_size_merged_p (op0))
 	  || offset_stays_in_subobject_p (op0, op1, wholesize, top)))
     return false;
 
@@ -2035,6 +2084,10 @@ size_below_subobject (int object_size_type, tree op0, tree op1,
   bool known = !size_unknown_p (sz, object_size_type);
   if (size_unknown_p (whole, object_size_type))
     whole = sz;
+
+  /* There's nothing around a subobject that is the whole object.  */
+  if (known && operand_equal_p (whole, wholesize, 0))
+    return false;
 
   /* When only some of the pointers that OP0 may come from have an open start,
      the enclosing object's size is unknown at a negative offset, so treat it
@@ -2052,7 +2105,7 @@ size_below_subobject (int object_size_type, tree op0, tree op1,
      case in plus_stmt_object_size does.  */
   tree res = known ? size_for_offset (sz, op1, offwhole, dynamic) : sz;
 
-  if (!dynamic || integer_onep (below))
+  if (!dynamic || integer_onep (outside))
     {
       *pbytes = res;
       *pwholesize = whole;
@@ -2061,7 +2114,7 @@ size_below_subobject (int object_size_type, tree op0, tree op1,
     }
 
   /* Only the run time can tell, so pick between the two results without a
-     branch: the size for the subobject is 0 whenever BELOW holds.  The whole
+     branch: the size for the subobject is 0 whenever OUTSIDE holds.  The whole
      size stays that of the subobject when the enclosing object is known, since
      size_for_offset uses the larger of the size and the whole size, which
      still leaves the right result for further offsets in both cases.  An
@@ -2078,13 +2131,13 @@ size_below_subobject (int object_size_type, tree op0, tree op1,
     {
       res = build_int_cstu (sizetype, offset_limit);
       tree all = size_binop (MULT_EXPR,
-			     fold_convert (sizetype, unshare_expr (below)),
+			     fold_convert (sizetype, unshare_expr (outside)),
 			     size_unknown (object_size_type));
       *pwholesize = size_binop (MAX_EXPR, wholesize, all);
       *pencoded = size_one_node;
     }
   *pbytes = size_binop (PLUS_EXPR, size_for_offset (bytes, op1, wholesize),
-			size_binop (MULT_EXPR, fold_convert (sizetype, below),
+			size_binop (MULT_EXPR, fold_convert (sizetype, outside),
 				    res));
   return true;
 }
@@ -2101,6 +2154,7 @@ plus_stmt_object_size (struct object_size_info *osi, tree var, gimple *stmt)
   tree bytes, wholesize, encoded = NULL_TREE;
   tree op0, op1;
   bool reexamine = false;
+  bool in_loop = false;
 
   if (gimple_assign_rhs_code (stmt) == POINTER_PLUS_EXPR)
     {
@@ -2126,7 +2180,15 @@ plus_stmt_object_size (struct object_size_info *osi, tree var, gimple *stmt)
       if (TREE_CODE (op0) == SSA_NAME)
 	{
 	  if (osi->pass == 0)
-	    collect_object_sizes_for (osi, op0);
+	    {
+	      /* If VAR is in a dependency loop through OP0, then OP0 was
+		 already visited or walking it gets back to VAR and marks it for
+		 reexamination.  A loop entered elsewhere can get past this,
+		 which can only make the maximum larger.  */
+	      in_loop = bitmap_bit_p (osi->visited, SSA_NAME_VERSION (op0));
+	      collect_object_sizes_for (osi, op0);
+	      in_loop |= bitmap_bit_p (osi->reexamine, varno);
+	    }
 
 	  bytes = object_sizes_get (osi, SSA_NAME_VERSION (op0));
 	  wholesize = object_sizes_get (osi, SSA_NAME_VERSION (op0), true);
@@ -2145,6 +2207,12 @@ plus_stmt_object_size (struct object_size_info *osi, tree var, gimple *stmt)
       bool pos_offset = (size_valid_p (op1, 0)
 			 && compare_tree_int (op1, offset_limit) <= 0);
 
+      bool maxsub = ((object_size_type & (OST_SUBOBJECT | OST_MINIMUM))
+		     == OST_SUBOBJECT);
+      bool folded = (maxsub
+		     && object_size_offset_folded_p (object_size_type, stmt,
+						     op0, op1));
+
       /* A static non-constant offset is presumed to stay in the subobject,
 	 as described below, so it doesn't go below the start of an object
 	 reached through a parameter either.  The bias for that could only
@@ -2152,8 +2220,7 @@ plus_stmt_object_size (struct object_size_info *osi, tree var, gimple *stmt)
       tree offwhole = wholesize;
       if (!pos_offset
 	  && !size_unknown_p (bytes, 0)
-	  && !(((object_size_type & (OST_SUBOBJECT | OST_MINIMUM))
-		== OST_SUBOBJECT)
+	  && !(maxsub
 	       && !(object_size_type & OST_DYNAMIC)
 	       && TREE_CODE (op1) != INTEGER_CST))
 	offwhole = wholesize_for_offset (op0, op1, wholesize,
@@ -2168,16 +2235,17 @@ plus_stmt_object_size (struct object_size_info *osi, tree var, gimple *stmt)
 	 since a static maximum subobject size would be of no use for such
 	 pointers otherwise.  The same goes for a static pointer stepped in a
 	 loop, whose sizes only settle at the fixed point.  Anything else may
-	 leave the subobject downward.  */
-      else if (!pos_offset
-	       && ((object_size_type & (OST_SUBOBJECT | OST_MINIMUM))
-		   == OST_SUBOBJECT)
+	 leave the subobject downward, or in either direction when the offset
+	 may be folded, which includes a folded offset applied after such a
+	 loop.  */
+      else if (maxsub
+	       && (!pos_offset || folded)
 	       && ((object_size_type & OST_DYNAMIC)
 		   || (TREE_CODE (op1) == INTEGER_CST
-		       && !reexamine
-		       && osi->pass == 0))
-	       && size_below_subobject (object_size_type, op0, op1, &bytes,
-					&wholesize, &encoded))
+		       && osi->pass == 0
+		       && (!reexamine || (folded && !in_loop))))
+	       && size_outside_subobject (object_size_type, op0, op1, folded,
+					  &bytes, &wholesize, &encoded))
 	;
       /* No whole size works for a pointer that may come from both a parameter
 	 and something else, since a step back may leave the parameter's object
@@ -2985,6 +3053,7 @@ static unsigned int
 object_sizes_execute (function *fun, bool early)
 {
   todo = 0;
+  object_sizes_early = early;
   auto_bitmap sdce_worklist;
 
   basic_block bb;
@@ -3087,6 +3156,7 @@ object_sizes_execute (function *fun, bool early)
     }
 
   fini_object_sizes ();
+  object_sizes_early = false;
   simple_dce_from_worklist (sdce_worklist);
   return todo;
 }
