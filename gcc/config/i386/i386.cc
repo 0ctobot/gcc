@@ -29778,28 +29778,39 @@ ix86_libm_function_max_error (unsigned cfn, machine_mode mode,
 #undef TARGET_LIBM_FUNCTION_MAX_ERROR
 #define TARGET_LIBM_FUNCTION_MAX_ERROR ix86_libm_function_max_error
 
-#if TARGET_MACHO
+/* Implement TARGET_CANNOT_COPY_INSN_P.  */
+
 static bool
 ix86_cannot_copy_insn_p (rtx_insn *insn)
 {
-  if (TARGET_64BIT)
+  rtx set = single_set (insn);
+  if (!set)
     return false;
 
-  rtx set = single_set (insn);
-  if (set)
-    {
-      rtx src = SET_SRC (set);
-      if (GET_CODE (src) == UNSPEC
-	  && XINT (src, 1) == UNSPEC_SET_GOT)
-	return true;
-    }
+  rtx src = SET_SRC (set);
+
+  /* Keep a single copy of a prologue that realigns the stack through the DRAP
+     register.  dwarf2cfi tracks whether the stack has been realigned per
+     function rather than per trace and records register saves differently
+     once it has, so the saves preceding the realignment in a second copy
+     wouldn't match those in the first copy where their traces join.  */
+  if (RTX_FRAME_RELATED_P (insn)
+      && SET_DEST (set) == stack_pointer_rtx
+      && GET_CODE (src) == AND)
+    return true;
+
+#if TARGET_MACHO
+  if (!TARGET_64BIT
+      && GET_CODE (src) == UNSPEC
+      && XINT (src, 1) == UNSPEC_SET_GOT)
+    return true;
+#endif
+
   return false;
 }
 
 #undef TARGET_CANNOT_COPY_INSN_P
 #define TARGET_CANNOT_COPY_INSN_P ix86_cannot_copy_insn_p
-
-#endif
 
 #if CHECKING_P
 #undef TARGET_RUN_TARGET_SELFTESTS
