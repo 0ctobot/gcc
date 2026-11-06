@@ -6968,17 +6968,22 @@ simplify_set (rtx x)
 	}
       else
 	{
-	  rtx pat = PATTERN (other_insn);
-	  undobuf.other_insn = other_insn;
-	  SUBST (*cc_use, tmp);
+	  /* Put the known result in CC's user through simplify_replace_rtx
+	     rather than a bare SUBST.  A ZERO_EXTEND or SUBREG around the
+	     comparison takes its operand's mode from the comparison, and a
+	     CONST_INT has no mode, so the enclosing expression must be folded
+	     during the replacement or else the operand's mode is lost.  */
+	  rtx new_pat = simplify_replace_rtx (PATTERN (other_insn), *cc_use,
+					      tmp);
 
-	  /* Attempt to simplify CC user.  */
-	  if (GET_CODE (pat) == SET)
-	    {
-	      rtx new_rtx = simplify_rtx (SET_SRC (pat));
-	      if (new_rtx != NULL_RTX)
-		SUBST (SET_SRC (pat), new_rtx);
-	    }
+	  /* simplify_replace_rtx gives back a SUBREG unchanged when it can't
+	     simplify it.  CC's user still reads DEST in that case, so fail the
+	     combination rather than deleting the comparison.  */
+	  if (reg_referenced_p (dest, new_pat))
+	    return gen_rtx_CLOBBER (VOIDmode, const0_rtx);
+
+	  undobuf.other_insn = other_insn;
+	  SUBST (PATTERN (other_insn), new_pat);
 
 	  /* Convert X into a no-op move.  */
 	  SUBST (SET_DEST (x), pc_rtx);
