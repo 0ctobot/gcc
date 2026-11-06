@@ -2156,12 +2156,19 @@ foperator_unordered_equal::op1_range (frange &r, tree type,
   switch (get_bool_state (r, lhs, type))
     {
     case BRS_TRUE:
-      // If it's true, the result is the same as OP2 plus a NAN.
-      r = op2;
-      // Add both zeros if there's the possibility of zero equality.
-      frange_add_zeros (r, type);
-      // Add the possibility of a NAN.
-      r.update_nan ();
+      // A NAN in OP2 makes this true no matter what OP1 is, so OP2 says
+      // nothing about OP1 unless it can't be a NAN.
+      if (op2.maybe_isnan ())
+	r.set_varying (type);
+      else
+	{
+	  // If it's true, the result is the same as OP2 plus a NAN.
+	  r = op2;
+	  // Add both zeros if there's the possibility of zero equality.
+	  frange_add_zeros (r, type);
+	  // Add the possibility of a NAN.
+	  r.update_nan ();
+	}
       break;
 
     case BRS_FALSE:
@@ -2253,12 +2260,19 @@ foperator_ltgt::op1_range (frange &r, tree type,
       break;
 
     case BRS_FALSE:
-      // If it's false, the result is the same as OP2 plus a NAN.
-      r = op2;
-      // Add both zeros if there's the possibility of zero equality.
-      frange_add_zeros (r, type);
-      // Add the possibility of a NAN.
-      r.update_nan ();
+      // A NAN in OP2 makes this false no matter what OP1 is, so OP2 says
+      // nothing about OP1 unless it can't be a NAN.
+      if (op2.maybe_isnan ())
+	r.set_varying (type);
+      else
+	{
+	  // If it's false, the result is the same as OP2 plus a NAN.
+	  r = op2;
+	  // Add both zeros if there's the possibility of zero equality.
+	  frange_add_zeros (r, type);
+	  // Add the possibility of a NAN.
+	  r.update_nan ();
+	}
       break;
 
     default:
