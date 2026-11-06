@@ -2085,6 +2085,15 @@ do_pragma (cpp_reader *pfile)
 	}
     }
 
+  /* A deferred pragma leaves a CPP_PRAGMA token behind for the caller of
+     cpp_get_token to consume along with the CPP_PRAGMA_EOL that ends it.
+     Traditional preprocessing only runs for -E and copies out whole logical
+     lines without ever fetching tokens, so nothing would end the pragma and
+     the next directive would trip over a stale in_deferred_pragma.  Print the
+     line like that of an unknown pragma instead.  */
+  if (p && p->is_deferred && CPP_OPTION (pfile, traditional))
+    p = NULL;
+
   if (p)
     {
       if (p->is_deferred)
