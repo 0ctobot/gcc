@@ -5828,11 +5828,43 @@ expand_bitquery (internal_fn fn, gcall *stmt)
   return true;
 }
 
+/* Expand STMT, a call to the unary bit query internal function FN, using
+   OPTAB.  Use the optab's insn directly if the current function has one.
+   It might not, since the call can come from a function with different
+   target options through inlining or function multiversioning, and enabling
+   a target feature can disable an insn that was available without it.  The
+   generic expansion of the optab can still do the operation, using a wider
+   mode, a different bit query or a libcall.  */
+
+static void
+expand_bitquery_optab_fn (internal_fn fn, gcall *stmt, direct_optab optab)
+{
+  tree arg = gimple_call_arg (stmt, 0);
+  machine_mode mode = TYPE_MODE (TREE_TYPE (arg));
+  if (direct_optab_handler (optab, mode) != CODE_FOR_nothing)
+    {
+      expand_unary_optab_fn (fn, stmt, optab);
+      return;
+    }
+
+  tree lhs = gimple_call_lhs (stmt);
+  rtx res = expand_unop (mode, optab, expand_normal (arg), NULL_RTX,
+			 optab != clrsb_optab);
+  gcc_assert (res);
+  res = convert_to_mode (TYPE_MODE (TREE_TYPE (lhs)), res,
+			 optab != clrsb_optab);
+  rtx target = expand_expr (lhs, NULL_RTX, VOIDmode, EXPAND_WRITE);
+  if (GET_CODE (target) == SUBREG && SUBREG_PROMOTED_VAR_P (target))
+    convert_move (SUBREG_REG (target), res, SUBREG_PROMOTED_SIGN (target));
+  else
+    emit_move_insn (target, res);
+}
+
 void
 expand_CLRSB (internal_fn fn, gcall *stmt)
 {
   if (expand_bitquery (fn, stmt))
-    expand_unary_optab_fn (fn, stmt, clrsb_optab);
+    expand_bitquery_optab_fn (fn, stmt, clrsb_optab);
 }
 
 /* Expand STMT, a call to the IFN_CLZ or IFN_CTZ internal function FN,
@@ -5857,7 +5889,7 @@ expand_clz_ctz (internal_fn fn, gcall *stmt, direct_optab optab)
   if (gimple_call_num_args (stmt) == 1
       || (defined == 2 && wi::to_widest (gimple_call_arg (stmt, 1)) == val))
     {
-      expand_unary_optab_fn (fn, stmt, optab);
+      expand_bitquery_optab_fn (fn, stmt, optab);
       return;
     }
   /* The vectorizer creates vector calls only with the value of the
@@ -5908,14 +5940,14 @@ void
 expand_FFS (internal_fn fn, gcall *stmt)
 {
   if (expand_bitquery (fn, stmt))
-    expand_unary_optab_fn (fn, stmt, ffs_optab);
+    expand_bitquery_optab_fn (fn, stmt, ffs_optab);
 }
 
 void
 expand_PARITY (internal_fn fn, gcall *stmt)
 {
   if (expand_bitquery (fn, stmt))
-    expand_unary_optab_fn (fn, stmt, parity_optab);
+    expand_bitquery_optab_fn (fn, stmt, parity_optab);
 }
 
 void
@@ -5925,7 +5957,7 @@ expand_POPCOUNT (internal_fn fn, gcall *stmt)
     return;
   if (gimple_call_num_args (stmt) == 1)
     {
-      expand_unary_optab_fn (fn, stmt, popcount_optab);
+      expand_bitquery_optab_fn (fn, stmt, popcount_optab);
       return;
     }
   /* If .POPCOUNT call has 2 arguments, match_single_bit_test marked it
@@ -5948,7 +5980,7 @@ expand_POPCOUNT (internal_fn fn, gcall *stmt)
   machine_mode lhsmode = TYPE_MODE (TREE_TYPE (lhs));
   do_pending_stack_adjust ();
   start_sequence ();
-  expand_unary_optab_fn (fn, stmt, popcount_optab);
+  expand_bitquery_optab_fn (fn, stmt, popcount_optab);
   rtx_insn *popcount_insns = end_sequence ();
   start_sequence ();
   rtx plhs = expand_expr (lhs, NULL_RTX, VOIDmode, EXPAND_WRITE);
