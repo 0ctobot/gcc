@@ -4633,6 +4633,10 @@ ipa_merge_fn_summary_after_inlining (struct cgraph_edge *edge)
       summarize_calls_size_and_time (edge->callee, info);
     }
 
+  /* propagate_malloc runs after inlining and still needs to know whether the
+     inlined callee's result reaches the caller's return value.  */
+  edge->inlined_return_callee_uncaptured = es->is_return_callee_uncaptured;
+
   /* Free summaries that are not maintained for inline clones/edges.  */
   ipa_call_summaries->remove (edge);
   ipa_fn_summaries->remove (edge->callee);
