@@ -22,6 +22,7 @@
 #include "system.h"
 #include "coretypes.h"
 #include "backend.h"
+#include "target.h"
 #include "rtl.h"
 #include "tree.h"
 #include "gimple.h"
@@ -766,6 +767,17 @@ get_constraint_for_address_of (tree t, vec<ce_s> *results)
     }
 }
 
+/* Return true if TYPE points into an address space where address zero is
+   valid, meaning that a zero of this type isn't a null pointer.  */
+
+static bool
+zero_valid_pointer_type_p (tree type)
+{
+  return (POINTER_TYPE_P (type)
+	  && (targetm.addr_space.zero_address_valid
+	      (TYPE_ADDR_SPACE (TREE_TYPE (type)))));
+}
+
 /* Given a tree T, return the constraint expression for it.  */
 
 static void
@@ -795,7 +807,10 @@ get_constraint_for_1 (tree t, vec<ce_s> *results, bool address_p,
       || (TREE_CODE (t) == CONSTRUCTOR
 	  && CONSTRUCTOR_NELTS (t) == 0))
     {
-      if (flag_delete_null_pointer_checks)
+      /* Zero isn't a null pointer in an address space where it's a valid
+	 address, so it points to memory we know nothing about.  */
+      if (flag_delete_null_pointer_checks
+	  && !zero_valid_pointer_type_p (TREE_TYPE (t)))
 	temp.var = nothing_id;
       else
 	temp.var = nonlocal_id;
@@ -3645,6 +3660,13 @@ create_variable_info_for (tree decl, const char *name, bool add_id)
 	 this variable, and that function can return anything nonlocal.  */
       if (in_ipa_mode && TREE_CODE (decl) == FUNCTION_DECL)
 	make_copy_constraint (vi, nonlocal_id);
+      /* A zero-initialized aggregate is only seen as holding pointers to
+	 nothing, but a pointer loaded from it is a usable address if zero is
+	 valid for that pointer.  */
+      else if (TREE_CODE (decl) == SSA_NAME
+	       && flag_delete_null_pointer_checks
+	       && zero_valid_pointer_type_p (TREE_TYPE (decl)))
+	make_constraint_from (vi, nonlocal_id);
       return id;
     }
 
