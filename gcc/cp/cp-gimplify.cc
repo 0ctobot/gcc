@@ -267,7 +267,10 @@ genericize_if_stmt (tree *stmt_p)
   else if (integer_zerop (cond) && !TREE_SIDE_EFFECTS (then_))
     stmt = else_;
   else
-    stmt = build3 (COND_EXPR, void_type_node, cond, then_, else_);
+    {
+      stmt = build3 (COND_EXPR, void_type_node, cond, then_, else_);
+      COND_EXPR_IF_STMT_P (stmt) = 1;
+    }
   protected_set_expr_location_if_unset (stmt, locus);
   *stmt_p = stmt;
 }
