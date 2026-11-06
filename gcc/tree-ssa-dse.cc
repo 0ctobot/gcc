@@ -1098,7 +1098,8 @@ compute_reaches_exit (function *fun, sbitmap reaches_exit)
    endless loop or a statement without a virtual use from
    stmt_may_end_function_p, and also a volatile access, which only uses the
    memory it accesses.  A call with a virtual use doesn't count since it already
-   keeps every store in front of it for tree DCE.  */
+   keeps every store in front of it for tree DCE, and neither does a resx since
+   resuming the unwind ends the frame along with its local variables.  */
 
 bool
 function_may_stop_unseen_p (function *fun)
@@ -1123,7 +1124,8 @@ function_may_stop_unseen_p (function *fun)
 	   gsi_next (&gsi))
 	{
 	  gimple *stmt = gsi_stmt (gsi);
-	  if (stmt_may_end_function_p (fun, stmt)
+	  if (gimple_code (stmt) != GIMPLE_RESX
+	      && stmt_may_end_function_p (fun, stmt)
 	      && !(is_gimple_call (stmt) && gimple_vuse (stmt)))
 	    return true;
 	}
