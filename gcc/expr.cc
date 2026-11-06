@@ -14534,7 +14534,17 @@ tree_expr_size (const_tree exp)
 {
   if (DECL_P (exp)
       && DECL_SIZE_UNIT (exp) != 0)
-    return DECL_SIZE_UNIT (exp);
+    {
+      /* The data of a flexible array member makes a variable bigger than its
+	 type, and the value of the variable doesn't include that data.  */
+      tree type_size = TYPE_SIZE_UNIT (TREE_TYPE (exp));
+      if (type_size
+	  && TREE_CODE (type_size) == INTEGER_CST
+	  && TREE_CODE (DECL_SIZE_UNIT (exp)) == INTEGER_CST
+	  && tree_int_cst_lt (type_size, DECL_SIZE_UNIT (exp)))
+	return type_size;
+      return DECL_SIZE_UNIT (exp);
+    }
   else
     return size_in_bytes (TREE_TYPE (exp));
 }

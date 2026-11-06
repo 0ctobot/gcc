@@ -5390,7 +5390,12 @@ check_string_literal (tree string, unsigned HOST_WIDE_INT size)
   tree type = TREE_TYPE (string);
   tree eltype = TREE_TYPE (type);
   unsigned HOST_WIDE_INT elts = tree_to_uhwi (TYPE_SIZE_UNIT (eltype));
-  unsigned HOST_WIDE_INT mem_size = tree_to_uhwi (TYPE_SIZE_UNIT (type));
+  /* The C front end keeps the array type of flexible array member data in a
+     static compound literal incomplete, which leaves the string as the only
+     source of its size.  */
+  unsigned HOST_WIDE_INT mem_size
+    = (COMPLETE_TYPE_P (type)
+       ? tree_to_uhwi (TYPE_SIZE_UNIT (type)) : TREE_STRING_LENGTH (string));
   int len = TREE_STRING_LENGTH (string);
 
   if (elts != 1 && elts != 2 && elts != 4)
@@ -5877,7 +5882,11 @@ output_constructor_regular_field (oc_local_state *local)
 	{
 	  unsigned HOST_WIDE_INT fldsize
 	    = array_size_for_constructor (local->val);
-	  fieldsize = int_size_in_bytes (TREE_TYPE (local->val));
+	  /* The C front end leaves the array type of the data in a static
+	     compound literal incomplete, which leaves the initializer as the
+	     only source of its size.  */
+	  fieldsize = (COMPLETE_TYPE_P (TREE_TYPE (local->val))
+		       ? int_size_in_bytes (TREE_TYPE (local->val)) : fldsize);
 	  /* In most cases fieldsize == fldsize as the size of the initializer
 	     determines how many elements the flexible array member has.  For
 	     C++ fldsize can be smaller though, if the last or several last or
