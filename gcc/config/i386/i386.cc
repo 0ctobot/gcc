@@ -14888,10 +14888,11 @@ ix86_print_operand (FILE *file, rtx x, int code)
 	  (file, addr, MEM_ADDR_SPACE (x), code == 'p' || code == 'P');
     }
 
-  else if (CONST_DOUBLE_P (x) && GET_MODE (x) == HFmode)
+  else if (CONST_DOUBLE_P (x)
+	   && (GET_MODE (x) == HFmode || GET_MODE (x) == BFmode))
     {
       long l = real_to_target (NULL, CONST_DOUBLE_REAL_VALUE (x),
-			       REAL_MODE_FORMAT (HFmode));
+			       REAL_MODE_FORMAT (GET_MODE (x)));
       if (ASSEMBLER_DIALECT == ASM_ATT)
 	putc ('$', file);
       fprintf (file, "0x%04x", (unsigned int) l);
