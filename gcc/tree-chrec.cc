@@ -421,6 +421,23 @@ chrec_fold_minus (tree type,
   if (integer_zerop (op1))
     return op0;
 
+  /* Subtracting an IV negates its step, and negating the most negative value
+     yields that same value when overflow is undefined.  The resulting step has
+     the wrong sign, which makes the number of iterations analysis derive a
+     bogus bound on the loop even though the source has no overflow.  Do the
+     subtraction in the unsigned type, where the negation is well defined.  */
+  if (INTEGRAL_TYPE_P (type)
+      && TYPE_OVERFLOW_UNDEFINED (type)
+      && TREE_CODE (op1) == POLYNOMIAL_CHREC
+      && TREE_CODE (CHREC_RIGHT (op1)) == INTEGER_CST
+      && tree_int_cst_equal (CHREC_RIGHT (op1), TYPE_MIN_VALUE (type)))
+    {
+      tree utype = unsigned_type_for (type);
+      tree tem = chrec_fold_minus (utype, chrec_convert_rhs (utype, op0),
+				   chrec_convert_rhs (utype, op1));
+      return chrec_convert_rhs (type, tem);
+    }
+
   return chrec_fold_plus_1 (MINUS_EXPR, type, op0, op1);
 }
 
