@@ -4682,6 +4682,19 @@ hoist_adjacent_loads (basic_block bb0, basic_block bb1,
       ref1 = gimple_assign_rhs1 (def1);
       ref2 = gimple_assign_rhs1 (def2);
 
+      /* A bool load hoisted by an earlier run of this function reads the
+	 whole mode of the field through a VIEW_CONVERT_EXPR, see below.
+	 Sinking can move it back into the arm, so look through the
+	 conversion in order to hoist it again.  */
+      if (TREE_CODE (ref1) == VIEW_CONVERT_EXPR
+	  && (TYPE_MODE (TREE_TYPE (ref1))
+	      == TYPE_MODE (TREE_TYPE (TREE_OPERAND (ref1, 0)))))
+	ref1 = TREE_OPERAND (ref1, 0);
+      if (TREE_CODE (ref2) == VIEW_CONVERT_EXPR
+	  && (TYPE_MODE (TREE_TYPE (ref2))
+	      == TYPE_MODE (TREE_TYPE (TREE_OPERAND (ref2, 0)))))
+	ref2 = TREE_OPERAND (ref2, 0);
+
       if (TREE_CODE (ref1) != COMPONENT_REF
 	  || TREE_CODE (ref2) != COMPONENT_REF)
 	continue;
@@ -4752,16 +4765,34 @@ hoist_adjacent_loads (basic_block bb0, basic_block bb1,
 
       /* The conditions are satisfied; hoist the loads from bb1 and bb2 into
 	 bb0.  We hoist the first one first so that a cache miss is handled
-         efficiently regardless of hardware cache-fill policy.  */
+	 efficiently regardless of hardware cache-fill policy.
+
+	 A load of a type with padding bits such as bool assumes that those
+	 bits are zero, which only holds where the original code loaded the
+	 value.  Executing it on a path that didn't load it can read a byte
+	 that isn't a valid value of the type and later passes then produce
+	 wrong code from it.  Hoist such a load as a load of the whole mode
+	 and leave its conversion to the narrower type in the arm.  The
+	 conversions get factored out of the PHI afterwards, so the arms
+	 still end up empty.  */
       gsi2 = gsi_for_stmt (def1);
+      if (gimple_needing_rewrite_undefined (def1))
+	rewrite_to_defined_unconditional (&gsi2);
       gsi_move_to_bb_end (&gsi2, bb0);
       gsi2 = gsi_for_stmt (def2);
+      if (gimple_needing_rewrite_undefined (def2))
+	rewrite_to_defined_unconditional (&gsi2);
       gsi_move_to_bb_end (&gsi2, bb0);
       /* Clear range info from the defs we've moved from under the
 	 condition.  */
       reset_flow_sensitive_info (gimple_assign_lhs (def1));
       reset_flow_sensitive_info (gimple_assign_lhs (def2));
       statistics_counter_event (cfun, "hoisted loads", 1);
+
+      /* Anything known about the results from the conditional paths no
+	 longer holds now that the loads execute unconditionally.  */
+      reset_flow_sensitive_info (gimple_assign_lhs (def1));
+      reset_flow_sensitive_info (gimple_assign_lhs (def2));
 
       if (dump_file && (dump_flags & TDF_DETAILS))
 	{
