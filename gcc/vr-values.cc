@@ -990,7 +990,7 @@ simplify_using_ranges::set_and_propagate_unexecutable (edge e)
     return;
 
   e->flags |= m_not_executable_flag;
-  m_flag_set_edges.safe_push (e);
+  m_flag_set_p = true;
 
   // Check if the destination block needs to propagate the property.
   basic_block bb = e->dest;
@@ -1406,7 +1406,7 @@ simplify_using_ranges::simplify_switch_using_ranges (gswitch *stmt)
 	{
 	  fprintf (dump_file, "removing unreachable case label\n");
 	}
-      to_remove_edges.safe_push (e);
+      to_remove_edges.safe_push (std::make_pair (stmt, e));
       set_and_propagate_unexecutable (e);
       e->flags &= ~EDGE_EXECUTABLE;
       e->flags |= EDGE_IGNORE;
@@ -1423,19 +1423,29 @@ void
 simplify_using_ranges::cleanup_edges_and_switches (void)
 {
   int i;
-  edge e;
+  std::pair<gswitch *, edge> *re;
   switch_update *su;
 
-  /* Clear any edges marked as not executable.  */
-  if (m_not_executable_flag)
+  /* Clear any edges marked as not executable.  This runs after the purge of
+     dead EH and abnormal edges at the end of substitute_and_fold, which can
+     free marked edges along with the blocks it deletes, so find the edges by
+     walking the CFG instead of remembering them.  */
+  if (m_flag_set_p)
     {
-      FOR_EACH_VEC_ELT (m_flag_set_edges, i, e)
-	e->flags &= ~m_not_executable_flag;
+      basic_block bb;
+      edge e;
+      edge_iterator ei;
+      FOR_ALL_BB_FN (bb, cfun)
+	FOR_EACH_EDGE (e, ei, bb->succs)
+	  e->flags &= ~m_not_executable_flag;
     }
   /* Remove dead edges from SWITCH_EXPR optimization.  This leaves the
-     CFG in a broken state and requires a cfg_cleanup run.  */
-  FOR_EACH_VEC_ELT (to_remove_edges, i, e)
-    remove_edge (e);
+     CFG in a broken state and requires a cfg_cleanup run.  An edge of a switch
+     that the same purge deleted is already gone, and deleting the block of the
+     switch detached the switch without freeing it.  */
+  FOR_EACH_VEC_ELT (to_remove_edges, i, re)
+    if (gimple_bb (re->first))
+      remove_edge (re->second);
 
   /* Update SWITCH_EXPR case label vector.  */
   FOR_EACH_VEC_ELT (to_update_switch_stmts, i, su)
@@ -1748,13 +1758,12 @@ simplify_using_ranges::simplify_using_ranges (range_query *query,
   to_remove_edges = vNULL;
   to_update_switch_stmts = vNULL;
   m_not_executable_flag = not_executable_flag;
-  m_flag_set_edges = vNULL;
+  m_flag_set_p = false;
 }
 
 simplify_using_ranges::~simplify_using_ranges ()
 {
   cleanup_edges_and_switches ();
-  m_flag_set_edges.release ();
 }
 
 /* Simplify STMT using ranges if possible.  */

@@ -93,7 +93,8 @@ public:
   bool remove ();
   bool remove_and_update_globals ();
   bool fully_replaceable (tree name, basic_block bb);
-  vec<edge> m_list;
+  // Each condition with an unreachable arm, with the edge that stays live.
+  vec<std::pair<gimple *, edge> > m_list;
   range_query &m_ranger;
   bool final_p;
   bitmap m_tmp;
@@ -131,7 +132,7 @@ remove_unreachable::maybe_register (gimple *s)
   if (!final_p)
     handle_early (s, e);
   else
-    m_list.safe_push (e);
+    m_list.safe_push (std::make_pair (s, e));
 }
 
 // Return true if all uses of NAME are dominated by block BB.  1 use
@@ -266,9 +267,17 @@ remove_unreachable::remove ()
   unsigned i;
   for (i = 0; i < m_list.length (); i++)
     {
-      edge e = m_list[i];
-      gimple *s = gimple_outgoing_range_stmt_p (e->src);
-      gcc_checking_assert (gimple_code (s) == GIMPLE_COND);
+      gimple *s = m_list[i].first;
+      // Purging dead EH and abnormal edges at the end of substitute_and_fold
+      // deletes the blocks that only those edges reach and frees the edges of
+      // those blocks.  Deleting a block detaches its statements without freeing
+      // them, so look at the condition before touching its edge.  The edge of a
+      // condition that's still in the CFG hasn't been freed: the purge only
+      // targets EH and abnormal edges, and the deleted blocks have no
+      // predecessors outside of the deleted set.
+      if (!gimple_bb (s))
+	continue;
+      edge e = m_list[i].second;
 
       tree name = gimple_range_ssa_p (gimple_cond_lhs (s));
       if (!name)
@@ -317,9 +326,11 @@ remove_unreachable::remove_and_update_globals ()
   auto_bitmap all_exports;
   for (i = 0; i < m_list.length (); i++)
     {
-      edge e = m_list[i];
-      gimple *s = gimple_outgoing_range_stmt_p (e->src);
-      gcc_checking_assert (gimple_code (s) == GIMPLE_COND);
+      gimple *s = m_list[i].first;
+      // The block may be gone, see remove ().
+      if (!gimple_bb (s))
+	continue;
+      edge e = m_list[i].second;
 
       bool dominate_exit_p = true;
       FOR_EACH_GORI_EXPORT_NAME (m_ranger.gori_ssa (), e->src, name)
