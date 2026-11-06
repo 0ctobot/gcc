@@ -7359,18 +7359,18 @@ gimplify_modify_expr_rhs (tree *expr_p, tree *from_p, tree *to_p,
 		   GIMPLE cannot deal with a variable-sized assignment
 		   embedded in a call statement.  */
 		use_target = true;
-	      else if (TREE_CODE (*to_p) != SSA_NAME
-		      && (!is_gimple_variable (*to_p)
-			  || needs_to_live_in_memory (*to_p)))
-		/* Don't use the original target if it's already addressable;
-		   if its address escapes, and the called function uses the
-		   NRV optimization, a conforming program could see *to_p
-		   change before the called function returns; see c++/19317.
-		   When optimizing, the return_slot pass marks more functions
-		   as safe after we have escape info.  */
-		use_target = false;
 	      else
-		use_target = true;
+		/* Don't use the original target for an assignment.  If its
+		   address escapes, and the called function uses the NRV
+		   optimization, a conforming program could see *to_p change
+		   before the called function returns; see c++/19317.  This
+		   holds for any variable, addressable or not, if the call
+		   doesn't return normally: a handler or a setjmp receiver in
+		   this function must see the old value of *to_p, and neither
+		   is known here; see PR128312.  When optimizing, the
+		   return_slot pass marks the calls that are safe after we have
+		   escape info and the CFG.  */
+		use_target = false;
 
 	      if (use_target)
 		{
