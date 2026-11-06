@@ -544,10 +544,10 @@ void
 sort_sibling_loops (function *fn)
 {
   /* Match flow_loops_find in the order we sort sibling loops.  */
-  sort_sibling_loops_cmp_rpo = XNEWVEC (int, last_basic_block_for_fn (cfun));
+  sort_sibling_loops_cmp_rpo = XCNEWVEC (int, last_basic_block_for_fn (cfun));
   int *rc_order = XNEWVEC (int, n_basic_blocks_for_fn (cfun));
-  pre_and_rev_post_order_compute_fn (fn, NULL, rc_order, false);
-  for (int i = 0; i < n_basic_blocks_for_fn (cfun) - NUM_FIXED_BLOCKS; ++i)
+  int n = pre_and_rev_post_order_compute_fn (fn, NULL, rc_order, false);
+  for (int i = 0; i < n; ++i)
     sort_sibling_loops_cmp_rpo[rc_order[i]] = i;
   free (rc_order);
 

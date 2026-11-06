@@ -970,7 +970,8 @@ inverted_rev_post_order_compute (struct function *fn,
    point as quickly as possible.
 
    In case the function has unreachable blocks the number of nodes
-   visited does not include them.
+   visited does not include them, and both arrays only hold that many
+   entries, starting at index zero.
 
    pre_order is a really a preorder numbering of the graph.
    rev_post_order is really a reverse postorder numbering of the graph.  */
@@ -1058,6 +1059,13 @@ pre_and_rev_post_order_compute_fn (struct function *fn,
       if (rev_post_order)
 	rev_post_order[rev_post_order_num--] = ENTRY_BLOCK;
     }
+
+  /* Unreachable blocks leave the start of REV_POST_ORDER unwritten since it's
+     filled from the end.  Move the entries down to start at index zero, which
+     is where callers and the loop below expect them.  */
+  if (rev_post_order && rev_post_order_num >= 0)
+    memmove (rev_post_order, rev_post_order + rev_post_order_num + 1,
+	     pre_order_num * sizeof (int));
 
   /* Clear the temporarily allocated flag.  */
   if (!rev_post_order)
