@@ -154,6 +154,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "lcm.h"
 #include "cfgcleanup.h"
 #include "expr.h"
+#include "except.h"
 #include "intl.h"
 #include "tree-pass.h"
 #include "dbgcnt.h"
@@ -1788,6 +1789,77 @@ free_pre_mem (void)
   pre_optimal = pre_redundant = pre_insert_map = pre_delete_map = NULL;
 }
 
+/* Return true if INSN might keep execution from reaching the insn after it,
+   or has an effect that must be seen before a later insn traps.  This covers
+   a call that may not return, in the same way as the scheduler's
+   last_function_call_may_noreturn, and a volatile access, such as an asm that
+   talks to the hardware.  */
+
+static bool
+insn_may_stop_execution_p (rtx_insn *insn)
+{
+  if (!NONDEBUG_INSN_P (insn))
+    return false;
+
+  if (CALL_P (insn)
+      && (!RTL_CONST_OR_PURE_CALL_P (insn)
+	  || RTL_LOOPING_CONST_OR_PURE_CALL_P (insn)
+	  || can_throw_external (insn)))
+    return true;
+
+  return volatile_refs_p (PATTERN (insn));
+}
+
+/* Keep each potentially trapping expression in TRAP_EXPRS from moving above an
+   insn that might stop execution, since a fault that the program would never
+   have reached otherwise could then happen first.
+
+   Such an insn doesn't kill the expression's value, so nothing else in the
+   local properties reflects it: calls only kill memory that they could write,
+   and a division's operands don't change across a call at all.  Make the
+   expression not transparent in the block, and not anticipatable when its
+   first occurrence comes after that insn.  An occurrence stays computed, so
+   its value remains available to the blocks that follow it.  */
+
+static void
+prune_trapping_exprs_at_barriers (sbitmap trap_exprs)
+{
+  unsigned int ui;
+  basic_block bb;
+
+  int *barrier_luid = XNEWVEC (int, last_basic_block_for_fn (cfun));
+
+  FOR_EACH_BB_FN (bb, cfun)
+    {
+      rtx_insn *insn;
+
+      barrier_luid[bb->index] = -1;
+      FOR_BB_INSNS (bb, insn)
+	if (insn_may_stop_execution_p (insn))
+	  {
+	    barrier_luid[bb->index] = DF_INSN_LUID (insn);
+	    bitmap_and_compl (transp[bb->index], transp[bb->index],
+			      trap_exprs);
+	    break;
+	  }
+    }
+
+  for (ui = 0; ui < expr_hash_table.size; ui++)
+    for (struct gcse_expr *expr = expr_hash_table.table[ui]; expr;
+	 expr = expr->next_same_hash)
+      if (bitmap_bit_p (trap_exprs, expr->bitmap_index))
+	for (occr_t occr = expr->antic_occr; occr; occr = occr->next)
+	  {
+	    int b = BLOCK_FOR_INSN (occr->insn)->index;
+
+	    if (barrier_luid[b] >= 0
+		&& DF_INSN_LUID (occr->insn) > barrier_luid[b])
+	      bitmap_clear_bit (antloc[b], expr->bitmap_index);
+	  }
+
+  free (barrier_luid);
+}
+
 /* Remove certain expressions from anticipatable and transparent
    sets of basic blocks that have incoming abnormal edge.
    For PRE remove potentially trapping expressions to avoid placing
@@ -1802,7 +1874,9 @@ prune_expressions (bool pre_p)
   basic_block bb;
 
   auto_sbitmap prune_exprs (expr_hash_table.n_elems);
+  auto_sbitmap trap_exprs (expr_hash_table.n_elems);
   bitmap_clear (prune_exprs);
+  bitmap_clear (trap_exprs);
   for (ui = 0; ui < expr_hash_table.size; ui++)
     {
       for (expr = expr_hash_table.table[ui]; expr; expr = expr->next_same_hash)
@@ -1811,6 +1885,7 @@ prune_expressions (bool pre_p)
 	  if (may_trap_p (expr->expr))
 	    {
 	      bitmap_set_bit (prune_exprs, expr->bitmap_index);
+	      bitmap_set_bit (trap_exprs, expr->bitmap_index);
 	      continue;
 	    }
 
@@ -1885,6 +1960,9 @@ prune_expressions (bool pre_p)
 	    break;
 	  }
     }
+
+  if (!bitmap_empty_p (trap_exprs))
+    prune_trapping_exprs_at_barriers (trap_exprs);
 }
 
 /* It may be necessary to insert a large number of insns on edges to
@@ -3356,6 +3434,16 @@ hoist_code (void)
 		 output or memory clobbered by an asm goto.  */
 	      if (JUMP_P (BB_END (bb))
 		  && modified_in_p (expr->expr, BB_END (bb)))
+		continue;
+
+	      /* The same placement must not put a trapping EXPR above a final
+		 insn that might stop execution, which BB's transparency says
+		 nothing about since the walk from an occurrence stops at BB.
+		 insert_insn_end_basic_block also goes before a call that ends
+		 BB.  */
+	      if ((JUMP_P (BB_END (bb)) || CALL_P (BB_END (bb)))
+		  && insn_may_stop_execution_p (BB_END (bb))
+		  && may_trap_p (expr->expr))
 		continue;
 
 	      /* If an expression is computed in BB and is available at end of
