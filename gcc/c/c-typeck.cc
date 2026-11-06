@@ -10752,6 +10752,453 @@ finish_implicit_inits (location_t loc, struct obstack *braced_init_obstack)
     }
 }
 
+/* Return true if VALUE has a tree code INIT_SPLIT_REF_P applies to.  */
+
+static bool
+init_split_ref_code_p (tree value)
+{
+  return (TREE_CODE (value) == COMPONENT_REF
+	  || TREE_CODE (value) == ARRAY_REF
+	  || TREE_CODE (value) == BIT_FIELD_REF);
+}
+
+/* Return true if VALUE is a reference whole_init_as_constructor built to read
+   one part of a whole initializer.  */
+
+static bool
+init_split_ref_p (tree value)
+{
+  return init_split_ref_code_p (value) && INIT_SPLIT_REF_P (value);
+}
+
+/* Return VALUE without conversions that don't change its type, e.g., the one
+   convert_lvalue_to_rvalue adds to drop the qualifiers of a const object.  */
+
+static tree
+strip_init_conversions (tree value)
+{
+  while ((CONVERT_EXPR_P (value) || TREE_CODE (value) == VIEW_CONVERT_EXPR)
+	 && (TYPE_MAIN_VARIANT (TREE_TYPE (value))
+	     == TYPE_MAIN_VARIANT (TREE_TYPE (TREE_OPERAND (value, 0)))))
+    value = TREE_OPERAND (value, 0);
+  return value;
+}
+
+/* Return true if replacing the initializer OLD_VALUE drops a side effect worth
+   a warning.  A split reference reads a SAVE_EXPR, which always claims to have
+   side effects, yet dropping one reference loses nothing since the other parts
+   still evaluate the SAVE_EXPR.  */
+
+static bool
+init_override_side_effects_p (tree old_value)
+{
+  if (!TREE_SIDE_EFFECTS (old_value))
+    return false;
+  old_value = strip_init_conversions (old_value);
+  if (init_split_ref_p (old_value))
+    return false;
+  if (TREE_CODE (old_value) == CONSTRUCTOR)
+    {
+      unsigned HOST_WIDE_INT ix;
+      tree elt;
+      FOR_EACH_CONSTRUCTOR_VALUE (CONSTRUCTOR_ELTS (old_value), ix, elt)
+	if (init_override_side_effects_p (elt))
+	  return true;
+      return false;
+    }
+  return true;
+}
+
+/* Return VALUE with the read-only flag dropped from its accesses and from the
+   operations above them, copying each node that changes.  Folding rebuilds an
+   operation with a flag computed from its operands, so dropping the flag from
+   the operation alone wouldn't last.  Declared objects, constants and saved
+   values keep the flag.  */
+
+static tree
+init_drop_readonly (tree value)
+{
+  enum tree_code code = TREE_CODE (value);
+  if (DECL_P (value)
+      || CONSTANT_CLASS_P (value)
+      || code == SAVE_EXPR
+      || code == TARGET_EXPR)
+    return value;
+
+  tree copy = NULL_TREE;
+  if (UNARY_CLASS_P (value)
+      || BINARY_CLASS_P (value)
+      || truth_value_p (code)
+      || code == COND_EXPR
+      || code == REALPART_EXPR
+      || code == IMAGPART_EXPR
+      || code == VIEW_CONVERT_EXPR)
+    for (int i = 0; i < TREE_CODE_LENGTH (code); i++)
+      {
+	tree op = TREE_OPERAND (value, i);
+	tree new_op = op ? init_drop_readonly (op) : op;
+	if (new_op != op)
+	  {
+	    if (!copy)
+	      copy = copy_node (value);
+	    TREE_OPERAND (copy, i) = new_op;
+	  }
+      }
+
+  if (!copy)
+    {
+      if (!TREE_READONLY (value))
+	return value;
+      copy = copy_node (value);
+    }
+  TREE_READONLY (copy) = 0;
+  return copy;
+}
+
+/* Return VALUE, an initializer that several subobjects will share, wrapped so
+   that it's evaluated just once.  save_expr doesn't save a read-only access,
+   even under conversions or arithmetic, and folding removes a SAVE_EXPR around
+   one, since both assume the access reads the same value each time.  A
+   const-qualified access doesn't mean the object can't change, though, so
+   drop the flag from copies of such accesses.  Only a declared const object
+   is known to stay the same, and a constant initializer can't depend on when
+   it's read.  */
+
+static tree
+save_init_value (tree value)
+{
+  if (require_constant_value)
+    return save_expr (value);
+  return save_expr (init_drop_readonly (value));
+}
+
+/* Return an expression of the main variant of constructor_type to read the
+   parts of the whole initializer VALUE from, which evaluates VALUE only once
+   no matter how many parts survive.  A split reference already reads a saved
+   value.  Compatible C23 tagged types have different FIELD_DECLs, hence the
+   VIEW_CONVERT_EXPR.  */
+
+static tree
+init_split_base (tree value)
+{
+  tree base = strip_init_conversions (value);
+  if (!init_split_ref_p (base))
+    base = save_init_value (base);
+  if (TYPE_MAIN_VARIANT (TREE_TYPE (base))
+      != TYPE_MAIN_VARIANT (constructor_type))
+    base = build1 (VIEW_CONVERT_EXPR, TYPE_MAIN_VARIANT (constructor_type),
+		   base);
+  return base;
+}
+
+/* Return a split reference to member FIELD of BASE.  */
+
+static tree
+build_init_member_ref (tree base, tree field)
+{
+  tree ref = build3 (COMPONENT_REF, TREE_TYPE (field), base, field, NULL_TREE);
+  TREE_READONLY (ref) = TREE_READONLY (field);
+  TREE_THIS_VOLATILE (ref) = TREE_THIS_VOLATILE (field);
+  INIT_SPLIT_REF_P (ref) = 1;
+  return ref;
+}
+
+/* Return CTOR, the initializer of an object being copied into a subobject,
+   without the data of any flexible array member.  A copy of a struct doesn't
+   include that member, and nothing reserves room for its data in the object
+   holding the copy.  Finishing the definition of an object completes the array
+   type of that data, which tells it apart from the data of a compound literal
+   that stands in for a brace-enclosed list and keeps it.  CTOR can be the
+   DECL_INITIAL of the object, so copy CTOR rather than change it.  */
+
+static tree
+init_drop_copied_flexible_elts (tree ctor)
+{
+  tree ret = ctor;
+  for (unsigned i = 0; i < CONSTRUCTOR_NELTS (ret); i++)
+    {
+      constructor_elt *elt = CONSTRUCTOR_ELT (ret, i);
+      tree val = elt->value;
+      bool drop = (elt->index
+		   && TREE_CODE (elt->index) == FIELD_DECL
+		   && flexible_array_member_type_p (TREE_TYPE (elt->index))
+		   && !flexible_array_member_type_p (TREE_TYPE (val)));
+      tree inner = strip_init_conversions (val);
+      if (!drop && TREE_CODE (inner) == CONSTRUCTOR)
+	{
+	  tree stripped = init_drop_copied_flexible_elts (inner);
+	  if (stripped != inner)
+	    val = stripped;
+	}
+      if (!drop && val == elt->value)
+	continue;
+
+      if (ret == ctor)
+	{
+	  ret = copy_node (ctor);
+	  CONSTRUCTOR_ELTS (ret) = vec_safe_copy (CONSTRUCTOR_ELTS (ctor));
+	}
+      if (drop)
+	CONSTRUCTOR_ELTS (ret)->ordered_remove (i--);
+      else
+	CONSTRUCTOR_ELT (ret, i)->value = val;
+    }
+  return ret;
+}
+
+/* Return true if VALUE, a member or element reference, reads a part of a
+   declared object through nothing but members and elements at constant
+   indexes.  A static initializer folds such a part of a const object with a
+   constant braced initializer to the element for that part in the object's
+   list, the same as it does for a part whole_init_as_constructor split off
+   the whole object.  */
+
+static bool
+init_object_part_p (tree value)
+{
+  while (TREE_CODE (value) == COMPONENT_REF || TREE_CODE (value) == ARRAY_REF)
+    {
+      if (TREE_CODE (value) == ARRAY_REF
+	  && TREE_CODE (TREE_OPERAND (value, 1)) != INTEGER_CST)
+	return false;
+      value = TREE_OPERAND (value, 0);
+    }
+  return VAR_P (value);
+}
+
+/* Return the braced list that VALUE, an earlier initializer for the subobject
+   push_init_level just entered, comes from, or NULL_TREE if VALUE isn't a
+   compound literal whose address isn't taken, a const object with a constant
+   braced initializer or a part of either.  A part is a reference
+   whole_init_as_constructor built into a saved literal or object, or a member
+   or element of a const object written in the initializer, and it leads to
+   the element for that part in the braced list.  */
+
+static tree
+init_literal_braced_list (tree value)
+{
+  value = strip_init_conversions (value);
+  if (TREE_CODE (value) == SAVE_EXPR)
+    value = strip_init_conversions (TREE_OPERAND (value, 0));
+  if (TREE_CODE (value) == CONSTRUCTOR)
+    return value;
+  if (TREE_CODE (value) == COMPOUND_LITERAL_EXPR)
+    {
+      tree decl = COMPOUND_LITERAL_EXPR_DECL (value);
+      tree init = DECL_INITIAL (decl);
+      if (TREE_ADDRESSABLE (decl) || !init || TREE_CODE (init) != CONSTRUCTOR)
+	return NULL_TREE;
+      return init;
+    }
+  /* A static initializer folds a const object with a constant braced list to
+     that list, so a union in the object loses its bytes to a designator for
+     another member there.  Use the same list in automatic storage, so the
+     object gets the same contents in both.  Copy the list, since the caller
+     can change its elements.  */
+  if (VAR_P (value))
+    {
+      tree init = decl_constant_value_1 (value, true);
+      if (init == value || TREE_CODE (init) != CONSTRUCTOR)
+	return NULL_TREE;
+      return unshare_expr (init);
+    }
+  if ((TREE_CODE (value) != COMPONENT_REF && TREE_CODE (value) != ARRAY_REF)
+      || (!INIT_SPLIT_REF_P (value) && !init_object_part_p (value)))
+    return NULL_TREE;
+
+  tree ctor = init_literal_braced_list (TREE_OPERAND (value, 0));
+  if (!ctor)
+    return NULL_TREE;
+  tree part = TREE_OPERAND (value, 1);
+  unsigned HOST_WIDE_INT ix;
+  tree index, elt;
+  FOR_EACH_CONSTRUCTOR_ELT (CONSTRUCTOR_ELTS (ctor), ix, index, elt)
+    {
+      bool match;
+      if (TREE_CODE (value) == COMPONENT_REF)
+	match = index == part;
+      else if (!index)
+	match = false;
+      else if (TREE_CODE (index) == RANGE_EXPR)
+	match = (tree_int_cst_le (TREE_OPERAND (index, 0), part)
+		 && tree_int_cst_le (part, TREE_OPERAND (index, 1)));
+      else
+	match = (TREE_CODE (index) == INTEGER_CST
+		 && tree_int_cst_equal (index, part));
+      if (match)
+	return init_literal_braced_list (elt);
+    }
+  return NULL_TREE;
+}
+
+/* VALUE is what an earlier designator stored for the subobject push_init_level
+   just entered, as in { .s = x, .s.a = 1 }.  The initializers that follow
+   replace only parts of that subobject, and the remaining parts must keep
+   their values from VALUE (C DR 413).  The new level can only start from a
+   CONSTRUCTOR, so return VALUE in that form when possible.  A conversion can
+   hide a CONSTRUCTOR.  Anything else is only known at run time, which calls
+   for a list of references to the parts of VALUE.  */
+
+static tree
+whole_init_as_constructor (tree value)
+{
+  bool vector_p = gnu_vector_type_p (constructor_type);
+  tree_code code = TREE_CODE (constructor_type);
+  if (!vector_p
+      && code != RECORD_TYPE
+      && code != UNION_TYPE
+      && code != ARRAY_TYPE)
+    return value;
+  if (value == error_mark_node || TREE_TYPE (value) == error_mark_node)
+    return value;
+
+  tree inner = strip_init_conversions (value);
+  /* A compound literal of a union initializes one named member, and a
+     designator for another member replaces that member, as it does after a
+     braced list.  The literal's bytes would wrongly fill the other member in
+     the null-index element below, so take the braced list of the literal
+     instead.  output_init_element does the same in a static initializer, and
+     the gimplifier does it anyway for a literal whose address isn't taken.
+
+     The same goes for a union inside a literal of a struct or an array, as in
+     { .w = (struct W) { .u = (union U) { .l = -1 } }, .w.u.c[1] = 9 }, where
+     the level above made VALUE a reference to the union in the saved literal.
+     A static initializer sees the braced lists of both literals there, so look
+     the union up in them too.  The saved literal still runs its initializer
+     when another of its parts survives, so only do that when the braced list
+     of the union has no side effects that would then run twice.
+
+     A const object with a constant braced initializer, or a union inside
+     one, is looked up the same way, since a static initializer folds the
+     object to that list.  That includes a union member or element of such an
+     object named in the initializer itself, as in { .u = h0c.u, .u.s.hi = 1 }
+     or { .u = ua[1], .u.s.hi = 1 }, which a static initializer folds to the
+     element in the list as well.  */
+  if (code == UNION_TYPE && TREE_CODE (inner) != CONSTRUCTOR)
+    {
+      tree init = init_literal_braced_list (inner);
+      if (init
+	  && (TREE_CODE (inner) == COMPOUND_LITERAL_EXPR
+	      || (!TREE_SIDE_EFFECTS (init)
+		  && (TYPE_MAIN_VARIANT (TREE_TYPE (init))
+		      == TYPE_MAIN_VARIANT (constructor_type)))))
+	inner = init;
+    }
+  if (!vector_p && TREE_CODE (inner) == CONSTRUCTOR)
+    return init_drop_copied_flexible_elts (inner);
+  if (TREE_CODE (inner) == STRING_CST || TREE_CODE (inner) == RAW_DATA_CST)
+    return value;
+  if (!comptypes (TYPE_MAIN_VARIANT (TREE_TYPE (value)),
+		  TYPE_MAIN_VARIANT (constructor_type)))
+    return value;
+
+  vec<constructor_elt, va_gc> *elts = NULL;
+  if (vector_p)
+    {
+      /* Vector elements can't be designated and are output in sequence, so
+	 list all of them for output_init_element to replace.  */
+      unsigned HOST_WIDE_INT nelts;
+      if (!TYPE_VECTOR_SUBPARTS (constructor_type).is_constant (&nelts))
+	return value;
+      tree elttype = TREE_TYPE (constructor_type);
+      bool cst_p = TREE_CODE (inner) == VECTOR_CST;
+      bool ctor_p = TREE_CODE (inner) == CONSTRUCTOR && TREE_CONSTANT (inner);
+      tree base = NULL_TREE;
+      if (!cst_p && !ctor_p)
+	{
+	  /* A nonconstant value in a static initializer already got an
+	     error.  */
+	  if (require_constant_value)
+	    return value;
+	  base = init_split_base (value);
+	}
+      for (unsigned HOST_WIDE_INT i = 0; i < nelts; i++)
+	{
+	  tree elt;
+	  if (cst_p)
+	    elt = VECTOR_CST_ELT (inner, i);
+	  else if (ctor_p)
+	    {
+	      elt = (i < CONSTRUCTOR_NELTS (inner)
+		     ? CONSTRUCTOR_ELT (inner, i)->value
+		     : build_zero_cst (elttype));
+	      if (VECTOR_TYPE_P (TREE_TYPE (elt)))
+		return value;
+	    }
+	  else
+	    {
+	      unsigned HOST_WIDE_INT bits = tree_to_uhwi (TYPE_SIZE (elttype));
+	      elt = build3 (BIT_FIELD_REF, elttype, base, TYPE_SIZE (elttype),
+			    bitsize_int (i * bits));
+	      INIT_SPLIT_REF_P (elt) = 1;
+	    }
+	  CONSTRUCTOR_APPEND_ELT (elts, bitsize_int (i), elt);
+	}
+      tree ctor = build_constructor (constructor_type, elts);
+      TREE_STATIC (ctor) = cst_p || (ctor_p && TREE_STATIC (inner));
+      CONSTRUCTOR_NON_CONST (ctor) = ctor_p && CONSTRUCTOR_NON_CONST (inner);
+      return ctor;
+    }
+
+  /* A nonconstant value in a static initializer already got an error.  */
+  if (require_constant_value)
+    return value;
+
+  /* A struct or an array below gets an element for each of its parts, each
+     reading its part out of VALUE.  An array of N elements thus costs N
+     elements and N stores even when a single element gets overridden, plus a
+     copy of VALUE into a temporary at -O0 when VALUE gets saved.  That cost is
+     intended: it only comes up for an override after a run-time whole value in
+     an automatic initializer, which used to lose the rest of the value.  */
+  if (code == UNION_TYPE)
+    {
+      /* The next designator picks the member, so keep the whole of VALUE in an
+	 element with a null index until then.  find_init_member turns it into
+	 a reference to the member and output_init_element replaces it.  */
+      if (!TYPE_FIELDS (constructor_type))
+	return value;
+      CONSTRUCTOR_APPEND_ELT (elts, NULL_TREE, value);
+    }
+  else if (code == RECORD_TYPE)
+    {
+      tree base = init_split_base (value);
+      for (tree field = TYPE_FIELDS (constructor_type); field;
+	   field = DECL_CHAIN (field))
+	{
+	  if (TREE_TYPE (field) == error_mark_node
+	      || DECL_UNNAMED_BIT_FIELD (field)
+	      || !COMPLETE_TYPE_P (TREE_TYPE (field))
+	      || integer_zerop (DECL_SIZE (field)))
+	    continue;
+	  CONSTRUCTOR_APPEND_ELT (elts, field,
+				  build_init_member_ref (base, field));
+	}
+    }
+  else
+    {
+      tree domain = TYPE_DOMAIN (constructor_type);
+      if (!domain
+	  || !TYPE_MAX_VALUE (domain)
+	  || !tree_fits_uhwi_p (TYPE_MAX_VALUE (domain))
+	  || !TYPE_SIZE (constructor_type)
+	  || TREE_CODE (TYPE_SIZE (constructor_type)) != INTEGER_CST
+	  || integer_zerop (TYPE_SIZE (constructor_type)))
+	return value;
+      tree base = init_split_base (value);
+      tree elttype = TREE_TYPE (constructor_type);
+      tree idxtype = TREE_TYPE (TYPE_MAX_VALUE (domain));
+      unsigned HOST_WIDE_INT max = tree_to_uhwi (TYPE_MAX_VALUE (domain));
+      for (unsigned HOST_WIDE_INT i = 0; i <= max; i++)
+	{
+	  tree ref = build4 (ARRAY_REF, elttype, base,
+			     build_int_cst (idxtype, i), NULL_TREE, NULL_TREE);
+	  INIT_SPLIT_REF_P (ref) = 1;
+	  CONSTRUCTOR_APPEND_ELT (elts, bitsize_int (i), ref);
+	}
+    }
+  return build_constructor (constructor_type, elts);
+}
+
 /* Push down into a subobject, for initialization.
    If this is for an explicit set of braces, IMPLICIT is 0.
    If it is because the next element belongs at a lower level,
@@ -10855,6 +11302,9 @@ push_init_level (location_t loc, int implicit,
       constructor_unfilled_fields = NULL_TREE;
       return;
     }
+
+  if (value)
+    value = whole_init_as_constructor (value);
 
   if (value && TREE_CODE (value) == CONSTRUCTOR)
     {
@@ -11123,6 +11573,13 @@ pop_init_level (location_t loc, int implicit,
     {
       if (constructor_erroneous)
 	ret.value = error_mark_node;
+      /* A union level that still holds a whole initializer in its null-index
+	 element only saw initializers for empty members, which left the value
+	 intact.  Pass the value out since a null index can't reach gimple.  */
+      else if (TREE_CODE (constructor_type) == UNION_TYPE
+	       && vec_safe_length (constructor_elements) == 1
+	       && !(*constructor_elements)[0].index)
+	ret.value = (*constructor_elements)[0].value;
       else
 	{
 	  ret.value = build_constructor (constructor_type,
@@ -11574,7 +12031,7 @@ add_pending_init (location_t loc, tree purpose, tree value, tree origtype,
 			 && wi::to_widest (r->purpose) < w)
 		    {
 		      ++cnt;
-		      if (TREE_SIDE_EFFECTS (r->value))
+		      if (init_override_side_effects_p (r->value))
 			warning_init (loc, OPT_Woverride_init_side_effects,
 				      "initialized field with side-effects "
 				      "overwritten");
@@ -11635,7 +12092,7 @@ add_pending_init (location_t loc, tree purpose, tree value, tree origtype,
 		}
 	      if (!implicit)
 		{
-		  if (TREE_SIDE_EFFECTS (p->value))
+		  if (init_override_side_effects_p (p->value))
 		    warning_init (loc, OPT_Woverride_init_side_effects,
 				  "initialized field with side-effects "
 				  "overwritten");
@@ -11682,7 +12139,7 @@ add_pending_init (location_t loc, tree purpose, tree value, tree origtype,
 	    {
 	      if (!implicit)
 		{
-		  if (TREE_SIDE_EFFECTS (p->value))
+		  if (init_override_side_effects_p (p->value))
 		    warning_init (loc, OPT_Woverride_init_side_effects,
 				  "initialized field with side-effects "
 				  "overwritten");
@@ -12031,6 +12488,14 @@ find_init_member (tree field, struct obstack * braced_init_obstack)
       if (!vec_safe_is_empty (constructor_elements)
 	  && (constructor_elements->last ().index == field))
 	return constructor_elements->last ().value;
+      /* A null index marks a whole initializer that hasn't been replaced yet,
+	 see whole_init_as_constructor.  */
+      if (!vec_safe_is_empty (constructor_elements)
+	  && !constructor_elements->last ().index)
+	{
+	  tree whole = constructor_elements->last ().value;
+	  return build_init_member_ref (init_split_base (whole), field);
+	}
     }
   return NULL_TREE;
 }
@@ -12068,6 +12533,8 @@ output_init_element (location_t loc, tree value, tree origtype,
       constructor_erroneous = 1;
       return;
     }
+
+  bool split_ref = init_split_ref_p (value);
   if (TREE_CODE (TREE_TYPE (value)) == ARRAY_TYPE
       && (TREE_CODE (value) == STRING_CST
 	  || TREE_CODE (value) == COMPOUND_LITERAL_EXPR)
@@ -12103,6 +12570,9 @@ output_init_element (location_t loc, tree value, tree origtype,
       value = TREE_OPERAND (value, 0);
     }
   value = c_fully_fold (value, require_constant_value, &maybe_const);
+  /* Folding can rebuild the reference without its flag.  */
+  if (split_ref && init_split_ref_code_p (value))
+    INIT_SPLIT_REF_P (value) = 1;
   /* TODO: this may not detect all cases of expressions folding to
      constants that are not arithmetic constant expressions.  */
   if (!maybe_const)
@@ -12145,10 +12615,14 @@ output_init_element (location_t loc, tree value, tree origtype,
      outer level.  In the case of a constexpr initializer for a
      pointer, avoid converting a null pointer constant to something
      that is not a null pointer constant to avoid a spurious error
-     from that second processing.  */
-  if (!require_constexpr_value
-      || !npc
-      || TREE_CODE (constructor_type) != POINTER_TYPE)
+     from that second processing.  A pending element needs no digesting since
+     it was digested on its way in or is part of a whole initializer that was,
+     and digest_init would reject a split reference with array type or a
+     flexible array member completed to the size of its initializer.  */
+  if (pending
+      && (!require_constexpr_value
+	  || !npc
+	  || TREE_CODE (constructor_type) != POINTER_TYPE))
     new_value = digest_init (loc,
 			     RECORD_OR_UNION_TYPE_P (constructor_type)
 			     ? field : constructor_fields
@@ -12266,12 +12740,48 @@ output_init_element (location_t loc, tree value, tree origtype,
 			braced_init_obstack);
       return;
     }
+  else if (gnu_vector_type_p (constructor_type)
+	   && tree_fits_uhwi_p (field)
+	   && tree_to_uhwi (field) < vec_safe_length (constructor_elements))
+    {
+      /* This overrides an element of a whole vector that
+	 whole_init_as_constructor listed in this level.  */
+      constructor_elt *elt = &(*constructor_elements)[tree_to_uhwi (field)];
+      if (!implicit)
+	{
+	  if (init_override_side_effects_p (elt->value))
+	    warning_init (loc, OPT_Woverride_init_side_effects,
+			  "initialized field with side-effects overwritten");
+	  else if (warn_override_init)
+	    warning_init (loc, OPT_Woverride_init,
+			  "initialized field overwritten");
+	}
+      elt->value = value;
+      return;
+    }
+  else if (TREE_CODE (constructor_type) == UNION_TYPE
+	   && !vec_safe_is_empty (constructor_elements)
+	   && field
+	   && COMPLETE_TYPE_P (TREE_TYPE (field))
+	   && integer_zerop (TYPE_SIZE (TREE_TYPE (field))))
+    {
+      /* An empty member holds no bytes, so initializing it overrides nothing
+	 in the value the union already holds.  That is either a whole
+	 initializer still waiting for a member to replace it or a member that
+	 a braced list initialized, and both spellings keep it.  Only the side
+	 effects of the empty member's initializer need to be kept.  */
+      tree &whole = constructor_elements->last ().value;
+      if (TREE_SIDE_EFFECTS (value))
+	whole = build2 (COMPOUND_EXPR, TREE_TYPE (whole), value, whole);
+      return;
+    }
   else if (TREE_CODE (constructor_type) == UNION_TYPE
 	   && !vec_safe_is_empty (constructor_elements))
     {
       if (!implicit)
 	{
-	  if (TREE_SIDE_EFFECTS (constructor_elements->last ().value))
+	  if (init_override_side_effects_p
+		(constructor_elements->last ().value))
 	    warning_init (loc, OPT_Woverride_init_side_effects,
 			  "initialized field with side-effects overwritten");
 	  else if (warn_override_init)
@@ -12720,7 +13230,7 @@ retry:
 	      semantic_type = TREE_TYPE (value.value);
 	      value.value = TREE_OPERAND (value.value, 0);
 	    }
-	  value.value = save_expr (value.value);
+	  value.value = save_init_value (value.value);
 	  if (semantic_type)
 	    value.value = build1 (EXCESS_PRECISION_EXPR, semantic_type,
 				  value.value);
