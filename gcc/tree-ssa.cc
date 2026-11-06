@@ -1362,10 +1362,12 @@ ssa_undefined_value_p (tree t, bool partial)
 
   /* The value is undefined if the definition statement is a call
      to .DEFERRED_INIT function.  Except for AUTO_INIT_CXX26 which is
-     undefined but needs to have the same value in all uses.  */
+     undefined but needs to have the same value in all uses, and for
+     AUTO_INIT_ZERO since code built with it can rely on reading zero.  */
   if (gimple_call_internal_p (def_stmt, IFN_DEFERRED_INIT))
     {
-      if (tree_to_uhwi (gimple_call_arg (def_stmt, 1)) & AUTO_INIT_CXX26)
+      if (tree_to_uhwi (gimple_call_arg (def_stmt, 1))
+	  & (AUTO_INIT_CXX26 | AUTO_INIT_ZERO))
 	return false;
       else
 	return true;
@@ -1402,7 +1404,8 @@ ssa_undefined_value_p (tree t, bool partial)
       tree real_imag_part = TREE_OPERAND (gimple_assign_rhs1 (def_stmt), 0);
       if (TREE_CODE (real_imag_part) == SSA_NAME
 	 && gimple_call_internal_p (SSA_NAME_DEF_STMT (real_imag_part),
-				    IFN_DEFERRED_INIT))
+				    IFN_DEFERRED_INIT)
+	 && ssa_undefined_value_p (real_imag_part, false))
 	return true;
     }
 

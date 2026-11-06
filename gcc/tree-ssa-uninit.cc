@@ -76,14 +76,46 @@ get_mask_first_set_bit (unsigned mask)
 }
 #define MASK_FIRST_SET_BIT(mask) get_mask_first_set_bit (mask)
 
-/* Return true if T, an SSA_NAME, has an undefined value.  */
+/* Return true if T, an SSA_NAME, has an undefined value.  Note that
+   ssa_undefined_value_p considers the value of .DEFERRED_INIT to be defined
+   for AUTO_INIT_ZERO and AUTO_INIT_CXX26, but the program still didn't
+   initialize the variable, so check for its result and for parts of it.  */
 static bool
 has_undefined_value_p (tree t)
 {
-  return (ssa_undefined_value_p (t)
-	  || gimple_call_internal_p (SSA_NAME_DEF_STMT (t), IFN_DEFERRED_INIT)
-	  || (possibly_undefined_names
-	      && possibly_undefined_names->contains (t)));
+  if (ssa_undefined_value_p (t)
+      || (possibly_undefined_names
+	  && possibly_undefined_names->contains (t)))
+    return true;
+
+  gimple *def_stmt = SSA_NAME_DEF_STMT (t);
+  if (gimple_call_internal_p (def_stmt, IFN_DEFERRED_INIT))
+    return true;
+
+  if (!is_gimple_assign (def_stmt))
+    return false;
+
+  switch (gimple_assign_rhs_code (def_stmt))
+    {
+    case REALPART_EXPR:
+    case IMAGPART_EXPR:
+      {
+	tree part = TREE_OPERAND (gimple_assign_rhs1 (def_stmt), 0);
+	return (TREE_CODE (part) == SSA_NAME
+		&& gimple_call_internal_p (SSA_NAME_DEF_STMT (part),
+					   IFN_DEFERRED_INIT));
+      }
+    case COMPLEX_EXPR:
+      {
+	tree rhs1 = gimple_assign_rhs1 (def_stmt);
+	tree rhs2 = gimple_assign_rhs2 (def_stmt);
+	return ((TREE_CODE (rhs1) == SSA_NAME && has_undefined_value_p (rhs1))
+		|| (TREE_CODE (rhs2) == SSA_NAME
+		    && has_undefined_value_p (rhs2)));
+      }
+    default:
+      return false;
+    }
 }
 
 /* Return true if EXPR should suppress either uninitialized warning.  */
