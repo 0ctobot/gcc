@@ -1443,6 +1443,9 @@ struct GTY(()) tree_base {
        CALL_EXPR_RETURN_SLOT_OPT in
            CALL_EXPR
 
+       COND_EXPR_IF_STMT_P in
+	   COND_EXPR
+
        OMP_SECTION_LAST in
            OMP_SECTION
 
