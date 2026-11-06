@@ -583,7 +583,7 @@ localize_node (bool whole_program, symtab_node *node)
 	   next != node; next = next->same_comdat_group)
 	{
 	  next->set_comdat_group (NULL);
-	  if (!next->alias)
+	  if (!next->alias && next->implicit_section)
 	    next->set_section (NULL);
 	  if (!next->transparent_alias)
 	    next->make_decl_local ();
@@ -607,7 +607,7 @@ localize_node (bool whole_program, symtab_node *node)
 
   if (TREE_PUBLIC (node->decl))
     node->set_comdat_group (NULL);
-  if (DECL_COMDAT (node->decl) && !node->alias)
+  if (DECL_COMDAT (node->decl) && !node->alias && node->implicit_section)
     node->set_section (NULL);
   if (!node->transparent_alias)
     {
