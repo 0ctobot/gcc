@@ -610,6 +610,11 @@ struct ivopts_data
   /* The bitmap of indices in version_info whose value was changed.  */
   bitmap relevant;
 
+  /* The pointers that the function converted from integers before any loop in
+     it got rewritten.  Rewritten code does that too, since candidates for
+     pointers are integers.  */
+  bitmap int_to_ptr_names;
+
   /* The uses of induction variables.  */
   vec<iv_group *> vgroups;
 
@@ -1090,6 +1095,7 @@ tree_ssa_iv_optimize_init (struct ivopts_data *data)
   data->version_info_size = 2 * num_ssa_names;
   data->version_info = XCNEWVEC (struct version_info, data->version_info_size);
   data->relevant = BITMAP_ALLOC (NULL);
+  data->int_to_ptr_names = BITMAP_ALLOC (NULL);
   data->important_candidates = BITMAP_ALLOC (NULL);
   data->max_inv_var_id = 0;
   data->max_inv_expr_id = 0;
@@ -1105,6 +1111,21 @@ tree_ssa_iv_optimize_init (struct ivopts_data *data)
   data->iv_common_cands.create (20);
   decl_rtl_to_reset.create (20);
   gcc_obstack_init (&data->iv_obstack);
+
+  basic_block bb;
+  FOR_EACH_BB_FN (bb, cfun)
+    for (gimple_stmt_iterator gsi = gsi_start_bb (bb); !gsi_end_p (gsi);
+	 gsi_next (&gsi))
+      {
+	gimple *stmt = gsi_stmt (gsi);
+	if (is_gimple_assign (stmt)
+	    && CONVERT_EXPR_CODE_P (gimple_assign_rhs_code (stmt))
+	    && POINTER_TYPE_P (TREE_TYPE (gimple_assign_lhs (stmt)))
+	    && INTEGRAL_TYPE_P (TREE_TYPE (gimple_assign_rhs1 (stmt)))
+	    && TREE_CODE (gimple_assign_lhs (stmt)) == SSA_NAME)
+	  bitmap_set_bit (data->int_to_ptr_names,
+			  SSA_NAME_VERSION (gimple_assign_lhs (stmt)));
+      }
 }
 
 /* walk_tree callback for determine_base_object.  */
@@ -7757,6 +7778,147 @@ get_alias_ptr_type_for_ptr_address (iv_use *use)
 }
 
 
+/* Return true if the function made pointer PTR by converting an integer,
+   looking back through pointer arithmetic, pointer conversions and PHI nodes.
+   The base of an iv can't answer this since an address lowered to an affine
+   combination also gets rewritten as an integer sum, even when the function
+   only did pointer arithmetic on it.  VISITED holds the names seen so far and
+   DEPTH the length of the chain, and an overly long chain counts as a
+   conversion.
+
+   Unless CHAIN is null, add PTR to it along with the names that PTR was
+   computed from up to the first PHI node.  The walk never enters the integer
+   operand of a conversion or the offset of a pointer addition, so PTR is
+   computed from each of those names by pointer arithmetic alone.  That
+   doesn't hold for the arguments of a PHI node since PTR only gets one of
+   them, and a loop's PHI node can take the pointer that the previous
+   iteration converted from an integer.  */
+
+static bool
+pointer_from_integer_p (struct ivopts_data *data, tree ptr, bitmap visited,
+			bitmap chain, unsigned depth)
+{
+  if (TREE_CODE (ptr) != SSA_NAME
+      || !bitmap_set_bit (visited, SSA_NAME_VERSION (ptr)))
+    return false;
+
+  if (chain)
+    bitmap_set_bit (chain, SSA_NAME_VERSION (ptr));
+
+  if ((int) depth >= param_ssa_name_def_chain_limit)
+    return true;
+
+  gimple *def = SSA_NAME_DEF_STMT (ptr);
+  if (gphi *phi = dyn_cast <gphi *> (def))
+    {
+      for (unsigned i = 0; i < gimple_phi_num_args (phi); i++)
+	if (pointer_from_integer_p (data, gimple_phi_arg_def (phi, i), visited,
+				    NULL, depth + 1))
+	  return true;
+      return false;
+    }
+
+  if (!is_gimple_assign (def))
+    return false;
+
+  tree rhs = gimple_assign_rhs1 (def);
+  switch (gimple_assign_rhs_code (def))
+    {
+    CASE_CONVERT:
+      if (INTEGRAL_TYPE_P (TREE_TYPE (rhs)))
+	return bitmap_bit_p (data->int_to_ptr_names, SSA_NAME_VERSION (ptr));
+      /* FALLTHRU */
+    case SSA_NAME:
+    case POINTER_PLUS_EXPR:
+      return pointer_from_integer_p (data, rhs, visited, chain, depth + 1);
+
+    case ADDR_EXPR:
+      rhs = get_base_address (TREE_OPERAND (rhs, 0));
+      if (rhs && (TREE_CODE (rhs) == MEM_REF
+		  || TREE_CODE (rhs) == TARGET_MEM_REF))
+	return pointer_from_integer_p (data, TREE_OPERAND (rhs, 0), visited,
+				       chain, depth + 1);
+      return false;
+
+    default:
+      return false;
+    }
+}
+
+/* AFF is the address of memory reference USE.  An affine combination looks
+   through conversions, so a pointer element of AFF doesn't have to be a pointer
+   that the access is based on.  It can be a term of an integer sum, as in
+   (T *) ((uintptr_t) &obj + off) where OFF was computed from the address of
+   another object, and it can come from the base of an unrelated candidate.
+   create_mem_ref would make such an element the base or symbol of the
+   reference, which claims that the access lies within that object, and the
+   alias oracle believes it.
+
+   Convert the pointer elements that create_mem_ref could pick to integers,
+   except for the candidate in BASE_HINT and for those in the base of USE's
+   iv.  If the function made the pointer used by USE from an integer, the base
+   of the iv can also hold pointers that the access isn't confined to, such as
+   terms of the integer sum.  Only keep the ones in the chain recorded by
+   pointer_from_integer_p in that case, since the original reference was
+   computed from those by pointer arithmetic and was already based on them.
+   Return true if that leaves AFF with nothing to use as a base.  */
+
+static bool
+demote_foreign_pointers (struct ivopts_data *data, iv_use *use, aff_tree *aff,
+			 tree base_hint)
+{
+  bool demoted = false, kept = false;
+  aff_tree trusted;
+  auto_bitmap visited, chain;
+
+  tree ptr = *use->op_p;
+  if (use->type != USE_PTR_ADDRESS)
+    {
+      ptr = get_base_address (ptr);
+      if (ptr && (TREE_CODE (ptr) == MEM_REF
+		  || TREE_CODE (ptr) == TARGET_MEM_REF))
+	ptr = TREE_OPERAND (ptr, 0);
+    }
+
+  bool from_int = ptr && pointer_from_integer_p (data, ptr, visited, chain, 0);
+  tree_to_aff_combination (use->iv->base, aff->type, &trusted);
+
+  for (unsigned i = 0; i < aff->n; i++)
+    {
+      tree val = aff->elts[i].val;
+
+      if (aff->elts[i].coef != 1)
+	continue;
+
+      if (base_hint && operand_equal_p (val, base_hint, 0))
+	{
+	  kept = true;
+	  continue;
+	}
+
+      if (!POINTER_TYPE_P (TREE_TYPE (val)))
+	continue;
+
+      unsigned j;
+      for (j = 0; j < trusted.n; j++)
+	if (operand_equal_p (val, trusted.elts[j].val, 0))
+	  break;
+
+      if (j < trusted.n
+	  && (!from_int
+	      || (TREE_CODE (val) == SSA_NAME
+		  && bitmap_bit_p (chain, SSA_NAME_VERSION (val)))))
+	kept = true;
+      else
+	{
+	  aff->elts[i].val = fold_convert (sizetype, val);
+	  demoted = true;
+	}
+    }
+
+  return demoted && !kept;
+}
+
 /* Rewrites USE (address that is an iv) using candidate CAND.  */
 
 static void
@@ -7785,6 +7947,19 @@ rewrite_use_address (struct ivopts_data *data,
   tree iv = var_at_stmt (data->current_loop, cand, use->stmt);
   tree base_hint = (cand->iv->base_object) ? iv : NULL_TREE;
   gimple_stmt_iterator bsi = gsi_for_stmt (use->stmt);
+
+  /* Without a real base, compute the whole address as an integer and base the
+     reference on the result.  A pointer made from any single term could be
+     folded back into the object's address.  The reference can't get a plain
+     integer base because create_mem_ref only knows how to add to pointers.  */
+  if (demote_foreign_pointers (data, use, &aff, base_hint))
+    {
+      tree addr = fold_convert (ptr_type_node, aff_combination_to_tree (&aff));
+      addr = force_gimple_operand_gsi (&bsi, addr, true, NULL_TREE,
+				       true, GSI_SAME_STMT);
+      aff_combination_elt (&aff, aff.type, addr);
+    }
+
   tree type = use->mem_type;
   tree alias_ptr_type;
   if (use->type == USE_PTR_ADDRESS)
@@ -8163,6 +8338,7 @@ tree_ssa_iv_optimize_finalize (struct ivopts_data *data)
   free_loop_data (data);
   free (data->version_info);
   BITMAP_FREE (data->relevant);
+  BITMAP_FREE (data->int_to_ptr_names);
   BITMAP_FREE (data->important_candidates);
 
   decl_rtl_to_reset.release ();
