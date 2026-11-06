@@ -657,6 +657,44 @@ empty_eh_cleanup (basic_block bb, int *eh_has_tsan_func_exit, int cnt)
 static live_vars_map *live_vars;
 static vec<bitmap_head> live_vars_vec;
 
+/* Return true if the tail call CALL may be able to see the address of the local
+   variable VAR, even if it never accesses VAR through that address.  The call
+   starts on top of the frame holding VAR once it's a tail call, or reuses that
+   frame in the case of tail recursion.  Either way, an object of the callee can
+   then share the address of VAR while VAR is still live, so comparing the two
+   addresses gives the wrong answer.  */
+
+static bool
+call_may_see_address_p (gcall *call, tree var)
+{
+  /* An escaped address can be read back from memory, which only a const call
+     cannot do.  */
+  if (!(gimple_call_flags (call) & ECF_CONST)
+      && pt_solution_includes (&cfun->gimple_df->escaped, var))
+    return true;
+
+  auto value_may_hold_address_p = [var] (tree val)
+    {
+      if (CONSTANT_CLASS_P (val))
+	return false;
+      tree type = TREE_TYPE (val);
+      if (POINTER_TYPE_P (type))
+	return ptr_deref_may_alias_decl_p (val, var);
+
+      /* Points-to information only exists for pointers, so assume any other
+	 value that's large enough can hide an address.  */
+      return (!tree_fits_uhwi_p (TYPE_SIZE (type))
+	      || tree_to_uhwi (TYPE_SIZE (type)) >= POINTER_SIZE);
+    };
+
+  for (unsigned int i = 0; i < gimple_call_num_args (call); i++)
+    if (value_may_hold_address_p (gimple_call_arg (call, i)))
+      return true;
+
+  return (gimple_call_chain (call)
+	  && value_may_hold_address_p (gimple_call_chain (call)));
+}
+
 /* Finds tailcalls falling into basic block BB when coming from edge ESUCC (or
    NULL).  The list of found tailcalls is added to the start of RET.
    When ONLY_MUSTTAIL is set only handle musttail.
@@ -1153,7 +1191,8 @@ find_tail_calls (basic_block bb, edge esucc, struct tailcall **ret,
 	  && auto_var_in_fn_p (var, cfun->decl)
 	  && may_be_aliased (var)
 	  && (ref_maybe_used_by_stmt_p (call, var, false)
-	      || call_may_clobber_ref_p (call, var, false)))
+	      || call_may_clobber_ref_p (call, var, false)
+	      || call_may_see_address_p (call, var)))
 	{
 	  if (!VAR_P (var))
 	    {
