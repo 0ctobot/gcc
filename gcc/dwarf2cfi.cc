@@ -1848,11 +1848,6 @@ dwarf2out_frame_debug_expr (rtx expr)
 	    }
 	  else
 	    {
-	      /* Saving a register in a register.  */
-	      gcc_assert (!fixed_regs [REGNO (dest)]
-			  /* For the SPARC and its register window.  */
-			  || (dwf_regno (src) == DWARF_FRAME_RETURN_COLUMN));
-
               /* After stack is aligned, we can only save SP in FP
 		 if drap register is used.  In this case, we have
 		 to restore stack pointer with the CFA value and we
@@ -1874,7 +1869,17 @@ dwarf2out_frame_debug_expr (rtx expr)
 		  dwarf2out_flush_queued_reg_saves ();
 		}
 	      else
-		queue_reg_save (src, dest, 0);
+		{
+		  /* Saving a register in a register.  This has to come after
+		     the check above, since setting up the frame pointer after
+		     the stack has been realigned saves nothing, and a fixed
+		     register can serve as the frame pointer.  */
+		  gcc_assert (!fixed_regs [REGNO (dest)]
+			      /* For the SPARC and its register window.  */
+			      || (dwf_regno (src)
+				  == DWARF_FRAME_RETURN_COLUMN));
+		  queue_reg_save (src, dest, 0);
+		}
 	    }
 	  break;
 
