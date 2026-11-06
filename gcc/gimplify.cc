@@ -262,6 +262,14 @@ struct gimplify_ctx
   /* The formal temporary table.  Should this be persistent?  */
   hash_table<gimplify_hasher> *temp_htab;
 
+  /* The number of places gimplified so far in the current BIND_EXPR, including
+     its closed inner ones, that control can come back to without leaving the
+     BIND_EXPR.  See gimplify_decl_expr.  */
+  unsigned reinit_points;
+  /* The declaration being initialized if the initialization may run again in
+     the same lifetime.  */
+  tree reinit_decl;
+
   int conditions;
   unsigned into_ssa : 1;
   unsigned allow_rhs_cond_expr : 1;
@@ -1550,6 +1558,7 @@ gimplify_bind_expr (tree *expr_p, gimple_seq *pre_p)
   tree bind_expr = *expr_p;
   bool old_keep_stack = gimplify_ctxp->keep_stack;
   bool old_save_stack = gimplify_ctxp->save_stack;
+  unsigned old_reinit_points = gimplify_ctxp->reinit_points;
   tree t;
   gbind *bind_stmt;
   gimple_seq body, cleanup;
@@ -1558,6 +1567,10 @@ gimplify_bind_expr (tree *expr_p, gimple_seq *pre_p)
   tree ret_clauses = NULL;
 
   tree temp = voidify_wrapper_expr (bind_expr, NULL);
+
+  /* Coming back to a point before this BIND_EXPR ends the lifetime of its
+     variables, so only points inside it count for them.  */
+  gimplify_ctxp->reinit_points = 0;
 
   /* Mark variables seen in this bind expr.  */
   for (t = BIND_EXPR_VARS (bind_expr); t ; t = DECL_CHAIN (t))
@@ -2000,6 +2013,7 @@ gimplify_bind_expr (tree *expr_p, gimple_seq *pre_p)
   if (!gimplify_ctxp->keep_stack)
     gimplify_ctxp->keep_stack = old_keep_stack;
   gimplify_ctxp->save_stack = old_save_stack;
+  gimplify_ctxp->reinit_points += old_reinit_points;
 
   gimple_pop_bind_expr ();
 
@@ -2376,9 +2390,36 @@ gimplify_decl_expr (tree *stmt_p, gimple_seq *seq_p)
 	  if (!TREE_STATIC (decl))
 	    {
 	      DECL_INITIAL (decl) = NULL_TREE;
+	      /* In C, a jump back to a place inside the block of DECL doesn't
+		 end its lifetime, so DECL can hold a value when its initializer
+		 runs again.  If a call in the initializer then abandons the
+		 initialization with a longjmp, DECL must still hold that value.
+		 C++ ends the lifetime on the jump back and needs copy elision.
+		 Only a user label or a setjmp before the declaration allows
+		 this, since a loop body is a block of its own.  */
+	      tree old_reinit_decl = gimplify_ctxp->reinit_decl;
+	      gimplify_ctxp->reinit_decl = NULL_TREE;
+	      if (gimplify_ctxp->reinit_points
+		  && (lang_GNU_C () || lang_GNU_OBJC ()))
+		{
+		  gimplify_ctxp->reinit_decl = decl;
+		  /* The gimplifier stores the parts of an aggregate one by one
+		     and may clear it first, so build it elsewhere if a call
+		     can abandon the initialization.  */
+		  tree ctor = init;
+		  if (TREE_CODE (ctor) == COMPOUND_LITERAL_EXPR)
+		    ctor = DECL_INITIAL (COMPOUND_LITERAL_EXPR_DECL (ctor));
+		  if (ctor
+		      && TREE_CODE (ctor) == CONSTRUCTOR
+		      && TREE_SIDE_EFFECTS (ctor)
+		      && AGGREGATE_TYPE_P (TREE_TYPE (decl))
+		      && TREE_CODE (DECL_SIZE_UNIT (decl)) == INTEGER_CST)
+		    init = get_initialized_tmp_var (init, seq_p);
+		}
 	      init = build2 (INIT_EXPR, void_type_node, decl, init);
 	      gimplify_and_add (init, seq_p);
 	      ggc_free (init);
+	      gimplify_ctxp->reinit_decl = old_reinit_decl;
 	      /* Clear TREE_READONLY if we really have an initialization.  */
 	      if (!DECL_INITIAL (decl)
 		  && !omp_privatize_by_reference (decl))
@@ -3342,6 +3383,8 @@ gimplify_label_expr (tree *expr_p, gimple_seq *pre_p)
 
   tree label = LABEL_EXPR_LABEL (*expr_p);
   glabel *label_stmt = gimple_build_label (label);
+  if (!DECL_ARTIFICIAL (label))
+    gimplify_ctxp->reinit_points++;
   gimple_set_location (label_stmt, EXPR_LOCATION (*expr_p));
   gimplify_seq_add_stmt (pre_p, label_stmt);
 
@@ -5084,7 +5127,8 @@ gimplify_call_expr (tree *expr_p, gimple_seq *pre_p, fallback_t fallback)
      we add an abnormal incoming edge to the call.  So do not use SSA
      vars there.  */
   bool returns_twice = call_expr_flags (*expr_p) & ECF_RETURNS_TWICE;
-
+  if (returns_twice)
+    gimplify_ctxp->reinit_points++;
 
   /* Gimplify the function arguments.  */
   if (nargs > 0)
@@ -7342,9 +7386,11 @@ gimplify_modify_expr_rhs (tree *expr_p, tree *from_p, tree *to_p,
 		       || (DECL_P (*to_p) && DECL_REGISTER (*to_p)))
 		/* Don't force regs into memory.  */
 		use_target = false;
-	      else if (TREE_CODE (*expr_p) == INIT_EXPR)
+	      else if (TREE_CODE (*expr_p) == INIT_EXPR
+		       && *to_p != gimplify_ctxp->reinit_decl)
 		/* It's OK to use the target directly if it's being
-		   initialized. */
+		   initialized, unless it can hold a value from an earlier
+		   run of the same initialization; see gimplify_decl_expr.  */
 		use_target = true;
 	      else if (TREE_CODE (TYPE_SIZE_UNIT (TREE_TYPE (*to_p)))
 		       != INTEGER_CST)
