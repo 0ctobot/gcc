@@ -1158,11 +1158,18 @@ strdup_object_size (const gcall *call, int object_size_type, bool is_strndup)
 {
   tree src = gimple_call_arg (call, 0);
   tree sz = size_unknown (object_size_type);
+  tree bound = NULL_TREE;
   tree n = NULL_TREE;
 
   if (is_strndup)
-    n = fold_build2 (PLUS_EXPR, sizetype, size_one_node,
-		     gimple_call_arg (call, 1));
+    {
+      bound = fold_convert (sizetype, gimple_call_arg (call, 1));
+      /* Saturate since BOUND + 1 wraps to zero when BOUND is SIZE_MAX, which
+	 strndup accepts as no limit beyond the end of the string.  */
+      n = fold_build2 (MAX_EXPR, sizetype, bound,
+		       fold_build2 (PLUS_EXPR, sizetype, size_one_node,
+				    unshare_expr (bound)));
+    }
   /* For strdup, simply emit strlen (SRC) + 1 and let the optimizer fold it the
      way it likes.  */
   else
@@ -1176,10 +1183,9 @@ strdup_object_size (const gcall *call, int object_size_type, bool is_strndup)
 	}
     }
 
-  /* In all other cases, return the size of SRC since the object size cannot
-     exceed that.  We cannot do this for OST_MINIMUM unless SRC points into a
-     string constant since otherwise the object size could go all the way down
-     to zero.  */
+  /* In all other cases, the size of SRC limits the object size.  We cannot use
+     it for OST_MINIMUM unless SRC points into a string constant since otherwise
+     the object size could go all the way down to zero.  */
   if (!size_valid_p (sz, object_size_type)
        || size_unknown_p (sz, object_size_type))
     {
@@ -1197,10 +1203,26 @@ strdup_object_size (const gcall *call, int object_size_type, bool is_strndup)
 	}
 
       /* For maximum estimate, our next best guess is the object size of the
-	 source.  */
+	 source.  The duplicate is a new object with no subobjects of its own,
+	 and we don't assume the string ends within a member of SRC's object,
+	 so a member of that object doesn't limit the duplicate.  */
       if (size_unknown_p (sz, object_size_type)
 	  && !(object_size_type & OST_MINIMUM))
-	compute_builtin_object_size (src, object_size_type, &sz);
+	{
+	  compute_builtin_object_size (src, object_size_type & ~OST_SUBOBJECT,
+				       &sz);
+
+	  /* strndup doesn't need a NUL within the first BOUND bytes of SRC and
+	     appends one when there isn't any, so a BOUND that fits in SRC can
+	     allocate BOUND + 1 bytes, one more than SRC when BOUND is exactly
+	     its size.  Only a BOUND past the end of SRC requires the NUL to be
+	     in SRC, which is when the size of SRC limits the duplicate.  */
+	  if (is_strndup && !size_unknown_p (sz, object_size_type))
+	    return fold_build3 (COND_EXPR, sizetype,
+				fold_build2 (GT_EXPR, boolean_type_node,
+					     unshare_expr (bound), sz),
+				unshare_expr (sz), n);
+	}
     }
 
   /* String duplication allocates at least one byte, so we should never fail
