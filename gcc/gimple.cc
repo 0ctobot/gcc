@@ -3439,6 +3439,13 @@ preprocess_case_label_vec_for_gimple (vec<tree> &labels,
 		}
 	    }
 
+	  /* The front end can hand us a label with TREE_OVERFLOW set, which has
+	     no place in the IL.  */
+	  if (TREE_OVERFLOW (low))
+	    low = drop_tree_overflow (low);
+	  if (high && TREE_OVERFLOW (high))
+	    high = drop_tree_overflow (high);
+
 	  CASE_LOW (elt) = low;
 	  CASE_HIGH (elt) = high;
 	}

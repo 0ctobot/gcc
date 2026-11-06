@@ -54,7 +54,8 @@ force_gimple_operand_1 (tree expr, gimple_seq *stmts,
      because most gimple predicates do not work recursively.  */
   if (is_gimple_val (expr)
       && (*gimple_test_f) (expr))
-    return expr;
+    /* Like gimplify_expr, don't let an overflowed constant into the IL.  */
+    return TREE_OVERFLOW_P (expr) ? drop_tree_overflow (expr) : expr;
 
   push_gimplify_context (gimple_in_ssa_p (cfun), true);
   saved_location = input_location;
