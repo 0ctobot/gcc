@@ -613,6 +613,21 @@ lto_symtab_merge_p (tree prevailing, tree decl)
 		     "noreturn attribute mismatch\n");
 	  return false;
 	}
+
+      /* Callers through a noipa declaration must not see the body, even when
+	 the prevailing declaration doesn't have the attribute.  Keep such a
+	 declaration as a transparent alias, since the availability of an alias
+	 with noipa on its chain hides the body from its own callers only.  The
+	 other way around needs no alias: merging into a noipa declaration just
+	 hides the body from more callers.  */
+      if (lookup_attribute ("noipa", DECL_ATTRIBUTES (decl))
+	  && !lookup_attribute ("noipa", DECL_ATTRIBUTES (prevailing)))
+	{
+	  if (dump_file)
+	    fprintf (dump_file, "Not merging decls; "
+		     "noipa attribute mismatch\n");
+	  return false;
+	}
     }
   return true;
 }
