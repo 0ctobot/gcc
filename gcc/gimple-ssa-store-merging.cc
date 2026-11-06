@@ -168,6 +168,7 @@
 #include "expr.h"	/* For get_bit_range.  */
 #include "optabs-tree.h"
 #include "dbgcnt.h"
+#include "tree-ssa-loop-ivopts.h"
 #include "selftest.h"
 
 /* The maximum size (in bits) of the stores this pass should generate.  */
@@ -335,6 +336,13 @@ init_symbolic_number (struct symbolic_number *n, tree src)
   if (!INTEGRAL_TYPE_P (TREE_TYPE (src)) && !POINTER_TYPE_P (TREE_TYPE (src)))
     return false;
 
+  /* The replacement reads the source at the statement it replaces, which can
+     be past a definition of another version of the same variable.  Versions
+     of an abnormal SSA name must coalesce and thus cannot overlap, so don't
+     track through one.  */
+  if (TREE_CODE (src) == SSA_NAME && SSA_NAME_OCCURS_IN_ABNORMAL_PHI (src))
+    return false;
+
   n->base_addr = n->offset = n->alias_set = n->vuse = NULL_TREE;
   n->src = src;
 
@@ -421,6 +429,11 @@ find_bswap_or_nop_load (gimple *stmt, tree ref, struct symbolic_number *n)
   if (!multiple_p (bitsize, BITS_PER_UNIT))
     return false;
   if (reversep)
+    return false;
+
+  /* Similarly, an address using an abnormal SSA name can't be reused.  */
+  if (contains_abnormal_ssa_name_p (base_addr)
+      || contains_abnormal_ssa_name_p (offset))
     return false;
 
   if (!init_symbolic_number (n, ref))
@@ -5230,7 +5243,11 @@ handled_load (gimple *stmt, store_operand_info *op,
 	= mem_valid_for_store_merging (mem, &op->bitsize, &op->bitpos,
 				       &op->bitregion_start,
 				       &op->bitregion_end);
+      /* The merged load is emitted at the last store, past which an abnormal
+	 SSA name in the address can't be used since it could then overlap
+	 another version of its variable.  */
       if (op->base_addr != NULL_TREE
+	  && !contains_abnormal_ssa_name_p (op->base_addr)
 	  && known_eq (op->bitsize, bitsize)
 	  && multiple_p (op->bitpos - bitpos, BITS_PER_UNIT)
 	  && known_ge (op->bitpos - op->bitregion_start,
@@ -5277,7 +5294,13 @@ pass_store_merging::process_store (gimple *stmt)
   if (known_eq (bitsize, 0U))
     return false;
 
+  /* The merged stores are emitted at the last store in the group, and a split
+     store covering exactly one original store reuses that store's value there.
+     An abnormal SSA name can't be used that far down since it could then
+     overlap another version of its variable, so don't track such a store.  */
   bool invalid = (base_addr == NULL_TREE
+		  || (TREE_CODE (rhs) == SSA_NAME
+		      && SSA_NAME_OCCURS_IN_ABNORMAL_PHI (rhs))
 		  || (maybe_gt (bitsize,
 				(unsigned int) MAX_BITSIZE_MODE_ANY_INT)
 		      && TREE_CODE (rhs) != INTEGER_CST
@@ -5394,14 +5417,16 @@ pass_store_merging::process_store (gimple *stmt)
 	      || !multiple_p (bitpos, BITS_PER_UNIT))
 	  && const_bitsize <= MAX_FIXED_MODE_SIZE)
 	{
-	  /* Bypass a conversion to the bit-field type.  */
+	  /* Bypass a conversion to the bit-field type, unless that would use
+	     an abnormal SSA name at the last store.  */
 	  if (!bit_not_p
 	      && is_gimple_assign (def_stmt)
 	      && CONVERT_EXPR_CODE_P (rhs_code))
 	    {
 	      tree rhs1 = gimple_assign_rhs1 (def_stmt);
 	      if (TREE_CODE (rhs1) == SSA_NAME
-		  && INTEGRAL_TYPE_P (TREE_TYPE (rhs1)))
+		  && INTEGRAL_TYPE_P (TREE_TYPE (rhs1))
+		  && !SSA_NAME_OCCURS_IN_ABNORMAL_PHI (rhs1))
 		rhs = rhs1;
 	    }
 	  rhs_code = BIT_INSERT_EXPR;
