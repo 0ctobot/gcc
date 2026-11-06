@@ -844,10 +844,14 @@ builtin_macro (cpp_reader *pfile, cpp_hashnode *node,
   if (node->value.builtin == BT_PRAGMA)
     {
       /* Don't interpret _Pragma within directives.  The standard is
-         not clear on this, but to me this makes most sense.
+         not clear on this, but to me this makes most sense.  The tokens of
+         a deferred pragma are still part of its directive even though
+         in_directive has already been cleared by the time they're lexed.
          Similarly, don't interpret _Pragma inside expand_args, we might
          need to stringize it later on.  */
-      if (pfile->state.in_directive || pfile->state.ignore__Pragma)
+      if (pfile->state.in_directive
+	  || pfile->state.in_deferred_pragma
+	  || pfile->state.ignore__Pragma)
 	return 0;
 
       return _cpp_do__Pragma (pfile, loc);
