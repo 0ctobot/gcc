@@ -475,6 +475,10 @@ struct GTY(()) named_section {
   /* If nonnull, the VAR_DECL or FUNCTION_DECL with which the
      section is associated.  */
   tree decl;
+
+  /* If nonnull, the IDENTIFIER_NODE naming the COMDAT group that the section
+     belongs to.  */
+  tree group;
 };
 
 /* A callback that writes the assembly code for switching to an unnamed
