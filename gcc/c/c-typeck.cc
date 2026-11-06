@@ -10065,7 +10065,9 @@ digest_init (location_t init_loc, tree decl, tree type, tree init,
 				"is too long for C++ (%wu chars into %wu "
 				"available)", typ1, len, avail);
 		  else if (warn_unterminated_string_initialization
-			   && get_attr_nonstring_decl (decl) == NULL_TREE)
+			   /* A compound literal has no decl to look at.  */
+			   && (decl == NULL_TREE
+			       || get_attr_nonstring_decl (decl) == NULL_TREE))
 		    warning_at (init_loc,
 				OPT_Wunterminated_string_initialization,
 				"initializer-string for array of %qT "
@@ -10633,6 +10635,14 @@ really_start_incremental_init (tree type)
   constructor_braced_scalar = false;
   designator_depth = 0;
   designator_erroneous = 0;
+
+  /* A compound literal, or a declaration in a statement expression, can start
+     a new top-level initializer in the middle of another one, and it mustn't
+     inherit that one's current field.  Only record, union and scalar types
+     assign a field below, and pop_init_level would otherwise mistake an array
+     type with no upper bound for that field's flexible array member and
+     discard the initializer.  */
+  constructor_fields = NULL_TREE;
 
   if (RECORD_OR_UNION_TYPE_P (constructor_type))
     {
