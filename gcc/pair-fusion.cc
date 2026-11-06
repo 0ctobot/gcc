@@ -1645,6 +1645,8 @@ pair_fusion_bb_info::fuse_pair (bool load_p,
     PATTERN (first->rtl ()),
     PATTERN (second->rtl ())
   };
+  bool frame_related_p = (RTX_FRAME_RELATED_P (first->rtl ())
+			  || RTX_FRAME_RELATED_P (second->rtl ()));
 
   // Make copies of the patterns as we might need to refer to the original RTL
   // later, for example when updating debug uses (which is after we've updated
@@ -2033,6 +2035,12 @@ pair_fusion_bb_info::fuse_pair (bool load_p,
 
   for (auto uid : tombstone_uids)
     track_tombstone (uid);
+
+  // combine_reg_notes keeps the CFI notes of both accesses, but dwarf2cfi only
+  // looks at them if the insn holding them is marked as frame-related.  The
+  // pair can end up in either of the original insns or in a new one, so make
+  // sure the marking survives if just one of the accesses had it.
+  RTX_FRAME_RELATED_P (pair_change->insn ()->rtl ()) = frame_related_p;
 
   return true;
 }
