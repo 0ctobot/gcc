@@ -2051,6 +2051,16 @@ propagate_malloc (void)
 	  auto_vec<cgraph_node *, 16> callees;
 	  for (cgraph_edge *cs = node->callees; cs; cs = cs->next_callee)
 	    {
+	      /* An inlined edge has no call summary anymore.  Its callee is
+		 an inline clone that keeps its own malloc state, which still
+		 decides what this function returns.  */
+	      if (!cs->inline_failed)
+		{
+		  if (cs->inlined_return_callee_uncaptured)
+		    callees.safe_push (cs->callee);
+		  continue;
+		}
+
 	      ipa_call_summary *es = ipa_call_summaries->get_create (cs);
 	      if (es && es->is_return_callee_uncaptured)
 		callees.safe_push (cs->callee);
