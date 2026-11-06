@@ -1151,13 +1151,15 @@ sanitize_asan_mark_poison (void)
     }
 }
 
-/* Rewrite all usages of tree OP which is a PARM_DECL with a VAR_DECL
-   that is it's DECL_VALUE_EXPR.  */
+/* Rewrite all usages of tree OP which is a PARM_DECL in the set passed through
+   DATA with a VAR_DECL that is its DECL_VALUE_EXPR.  */
 
 static tree
-rewrite_usage_of_param (tree *op, int *walk_subtrees, void *)
+rewrite_usage_of_param (tree *op, int *walk_subtrees, void *data)
 {
-  if (TREE_CODE (*op) == PARM_DECL && DECL_HAS_VALUE_EXPR_P (*op))
+  walk_stmt_info *wi = (walk_stmt_info *) data;
+  hash_set<tree> *rewritten_params = (hash_set<tree> *) wi->info;
+  if (TREE_CODE (*op) == PARM_DECL && rewritten_params->contains (*op))
     {
       *op = DECL_VALUE_EXPR (*op);
       *walk_subtrees = 0;
@@ -1175,14 +1177,20 @@ sanitize_rewrite_addressable_params (function *fun)
 {
   gimple *g;
   gimple_seq stmts = NULL;
-  bool has_any_addressable_param = false;
+  hash_set<tree> rewritten_params;
   auto_vec<tree> clear_value_expr_list;
 
   for (tree arg = DECL_ARGUMENTS (current_function_decl);
        arg; arg = DECL_CHAIN (arg))
     {
       tree type = TREE_TYPE (arg);
+      /* Skip a parameter that already has a DECL_VALUE_EXPR.  Nested function
+	 lowering gives one to a parameter it moved into the frame object, which
+	 is protected like any other variable.  The parameter itself is still
+	 read once to initialize the frame field, and that read must stay as is
+	 since the field holds nothing yet.  */
       if (TREE_ADDRESSABLE (arg)
+	  && !DECL_HAS_VALUE_EXPR_P (arg)
 	  && !TREE_ADDRESSABLE (type)
 	  && !TREE_THIS_VOLATILE (arg)
 	  && TREE_CODE (TYPE_SIZE (type)) == INTEGER_CST)
@@ -1190,7 +1198,7 @@ sanitize_rewrite_addressable_params (function *fun)
 	  TREE_ADDRESSABLE (arg) = 0;
 	  DECL_NOT_GIMPLE_REG_P (arg) = 0;
 	  /* The parameter is no longer addressable.  */
-	  has_any_addressable_param = true;
+	  rewritten_params.add (arg);
 
 	  /* Create a new automatic variable.  */
 	  tree var = build_decl (DECL_SOURCE_LOCATION (arg),
@@ -1199,10 +1207,6 @@ sanitize_rewrite_addressable_params (function *fun)
 	  DECL_IGNORED_P (var) = 1;
 
 	  gimple_add_tmp_var (var);
-
-	  /* We skip parameters that have a DECL_VALUE_EXPR.  */
-	  if (DECL_HAS_VALUE_EXPR_P (arg))
-	    continue;
 
 	  if (dump_file)
 	    {
@@ -1244,8 +1248,12 @@ sanitize_rewrite_addressable_params (function *fun)
 	}
     }
 
-  if (!has_any_addressable_param)
+  if (rewritten_params.is_empty ())
     return;
+
+  walk_stmt_info wi;
+  memset (&wi, 0, sizeof (wi));
+  wi.info = &rewritten_params;
 
   /* Replace all usages of PARM_DECLs with the newly
      created variable VAR.  */
@@ -1257,7 +1265,7 @@ sanitize_rewrite_addressable_params (function *fun)
 	{
 	  gimple *stmt = gsi_stmt (gsi);
 	  gimple_stmt_iterator it = gsi_for_stmt (stmt);
-	  walk_gimple_stmt (&it, NULL, rewrite_usage_of_param, NULL);
+	  walk_gimple_stmt (&it, NULL, rewrite_usage_of_param, &wi);
 	}
       for (gsi = gsi_start_phis (bb); !gsi_end_p (gsi); gsi_next (&gsi))
 	{
@@ -1266,7 +1274,7 @@ sanitize_rewrite_addressable_params (function *fun)
 	    {
 	      hash_set<tree> visited_nodes;
 	      walk_tree (gimple_phi_arg_def_ptr (phi, i),
-			 rewrite_usage_of_param, NULL, &visited_nodes);
+			 rewrite_usage_of_param, &wi, &visited_nodes);
 	    }
 	}
     }
