@@ -10846,8 +10846,14 @@ gimple_get_virt_method_for_vtable (HOST_WIDE_INT token,
 
   /* Make sure we create a cgraph node for functions we'll reference.
      They can be non-existent if the reference comes from an entry
-     of an external vtable for example.  */
-  cgraph_node::get_create (fn);
+     of an external vtable for example.  Leave a function whose only node is
+     an inline clone alone: get_create would turn a new declaration into the
+     root of its clone tree.  This code also runs while LTRANS boundaries are
+     computed with -fdevirtualize-at-ltrans, and that new root doesn't get
+     into the encoder of a partition already holding the clone, which then
+     can't be streamed.  */
+  if (!cgraph_node::get (fn))
+    cgraph_node::get_create (fn);
 
   return fn;
 }
