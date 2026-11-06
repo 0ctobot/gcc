@@ -1111,11 +1111,21 @@ crc_optimization::swap_crc_and_data_if_needed (gphi *output_crc)
 
 bool crc_optimization::validate_crc_and_data ()
 {
-  /* Set m_crc_arg and check if fits in word_mode.  */
+  /* Set m_crc_arg and check if its polynomial fits in m_polynomial.  */
   gcc_assert (m_phi_for_crc);
   m_crc_arg = PHI_ARG_DEF_FROM_EDGE (m_phi_for_crc,
 				     loop_preheader_edge (m_crc_loop));
   gcc_assert (m_crc_arg);
+
+  /* The expanders for the CRC internal functions cannot go past 64 bits
+     either, so there's nothing to gain from representing a wider
+     polynomial.  */
+  if (TYPE_PRECISION (TREE_TYPE (m_crc_arg)) > HOST_BITS_PER_WIDE_INT)
+    {
+      if (dump_file && (dump_flags & TDF_DETAILS))
+	fprintf (dump_file, "CRC is wider than a HOST_WIDE_INT.\n");
+      return false;
+    }
 
   unsigned HOST_WIDE_INT
   data_size = tree_to_uhwi (m_crc_loop->nb_iterations) + 1;

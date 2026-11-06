@@ -536,10 +536,9 @@ assign_calc_vals_to_header_phis (const vec<state *> &prev_states,
 		  print_generic_expr (dump_file, lhs, dump_flags);
 		  fprintf (dump_file, " variable.\n");
 		}
-	      unsigned HOST_WIDE_INT calc_number
-		  = state::make_number (val_st1);
-	      tree calc_num_tree = build_int_cstu (TREE_TYPE (lhs),
-						   calc_number);
+	      tree calc_num_tree
+		= wide_int_to_tree (TREE_TYPE (lhs),
+				    state::make_number (val_st1));
 	      curr_state->do_operation (VAR_DECL, calc_num_tree, nullptr, lhs);
 	    }
 	}
