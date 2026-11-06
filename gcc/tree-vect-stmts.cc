@@ -1727,6 +1727,38 @@ vect_truncate_gather_scatter_offset (stmt_vec_info stmt_info, tree vectype,
   return false;
 }
 
+/* Return a vector type with the same layout as PUN_VECTYPE that can hold the
+   offsets { 0, STEP, 2 * STEP, ... } of a gather or scatter with one element
+   per lane of PUN_VECTYPE, or null if there isn't one.  */
+
+static tree
+vect_grouped_gather_offset_vectype (tree step, tree pun_vectype)
+{
+  /* Expansion adds the offsets to the base address in Pmode, which can be
+     wider than a pointer (as with -mabi=ilp32 on aarch64).  Offsets that
+     are at least as wide as Pmode wrap in the same way as the pointer
+     arithmetic they replace, so any step works.  */
+  unsigned int precision = TYPE_PRECISION (TREE_TYPE (pun_vectype));
+  if (precision >= GET_MODE_PRECISION (Pmode))
+    return pun_vectype;
+
+  /* Narrower offsets get extended to Pmode after they've been computed, so
+     each one has to be representable in the offset type.  We know nothing
+     about the range of a runtime step, which can be negative.  */
+  unsigned HOST_WIDE_INT nunits;
+  if (TREE_CODE (step) != INTEGER_CST
+      || !TYPE_VECTOR_SUBPARTS (pun_vectype).is_constant (&nunits))
+    return NULL_TREE;
+
+  widest_int range = wi::to_widest (step) * (nunits - 1);
+  signop sign = wi::neg_p (range) ? SIGNED : UNSIGNED;
+  if (wi::min_precision (range, sign) > precision)
+    return NULL_TREE;
+
+  return sign == SIGNED ? signed_type_for (pun_vectype)
+			: unsigned_type_for (pun_vectype);
+}
+
 /* Return true if we can use gather/scatter or strided internal functions
    to vectorize STMT_INFO, which is a grouped or strided load or store
    with multiple lanes and will be implemented by a type-punned access
@@ -1775,17 +1807,23 @@ vect_use_grouped_gather (dr_vec_info *dr_info, tree vectype,
     ? IFN_MASK_LEN_STRIDED_LOAD : IFN_MASK_LEN_STRIDED_STORE;
 
   /* Check if we have a gather/scatter with the new type.  We're just trying
-     with the type itself as offset for now.  If not, check if we have a
-     strided load/store.  These have fewer constraints (for example no offset
-     type must exist) so it is possible that even though a gather/scatter is
-     not available we still have a strided load/store.  */
+     with an integer type of the same layout as offset for now, as long as it
+     can hold the offsets.  If not, check if we have a strided load/store.
+     These have fewer constraints (for example no offset type must exist) so
+     it is possible that even though a gather/scatter is not available we
+     still have a strided load/store.  A sign-swapped offset type isn't usable
+     since vect_get_strided_load_store_ops doesn't convert to it.  */
   bool ok = false;
-  tree tmp_vectype;
+  tree tmp_vectype = NULL_TREE;
   int tmp_scale;
-  if (vect_gather_scatter_fn_p
-      (loop_vinfo, DR_IS_READ (dr), masked_p, *pun_vectype,
-       TREE_TYPE (*pun_vectype), *pun_vectype, 1, &tmp_scale, &ifn,
-       &offset_vectype, &tmp_vectype, elsvals))
+  tree gs_offset_vectype
+    = vect_grouped_gather_offset_vectype (DR_STEP (dr), *pun_vectype);
+  if (gs_offset_vectype
+      && vect_gather_scatter_fn_p
+	   (loop_vinfo, DR_IS_READ (dr), masked_p, *pun_vectype,
+	    TREE_TYPE (*pun_vectype), gs_offset_vectype, 1, &tmp_scale, &ifn,
+	    &offset_vectype, &tmp_vectype, elsvals)
+      && !tmp_vectype)
     ok = true;
   else if (internal_strided_fn_supported_p (strided_ifn, *pun_vectype,
 					    elsvals))
