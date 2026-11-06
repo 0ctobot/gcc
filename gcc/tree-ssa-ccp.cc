@@ -730,10 +730,12 @@ likely_value (gimple *stmt)
 
   /* .DEFERRED_INIT produces undefined except for AUTO_INIT_CXX26
      which produces varying because it is undefined that needs to have
-     the same value in all uses.  */
+     the same value in all uses, and for AUTO_INIT_ZERO which produces
+     varying since code built with it can rely on reading zero.  */
   if (gimple_call_internal_p (stmt, IFN_DEFERRED_INIT))
     {
-      if (tree_to_uhwi (gimple_call_arg (stmt, 1)) & AUTO_INIT_CXX26)
+      if (tree_to_uhwi (gimple_call_arg (stmt, 1))
+	  & (AUTO_INIT_CXX26 | AUTO_INIT_ZERO))
 	return VARYING;
       else
 	return UNDEFINED;

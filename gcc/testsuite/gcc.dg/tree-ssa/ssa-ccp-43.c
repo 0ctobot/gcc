@@ -9,4 +9,6 @@ int foo (int flag)
   return i;
 }
 
-/* { dg-final { scan-tree-dump "return 1;" "ccp1" } } */
+/* i is zero when flag is zero, so the return can't
+   fold to the assigned value.  */
+/* { dg-final { scan-tree-dump-not "return 1;" "ccp1" } } */

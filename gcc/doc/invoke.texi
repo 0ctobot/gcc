@@ -15465,8 +15465,10 @@ uninitialized memory disclosure and use.
 GCC still considers an automatic variable that doesn't have an explicit
 initializer as uninitialized, @option{-Wuninitialized} and
 @option{-Wanalyzer-use-of-uninitialized-value} will still report
-warning messages on such automatic variables or temporary objects and the
-compiler will perform optimization as if the variable were uninitialized.
+warning messages on such automatic variables or temporary objects.
+With @samp{pattern}, the compiler will perform optimization as if the
+variable were uninitialized.  With @samp{zero}, the compiler will not make
+that assumption, so reading such a variable always gives zero.
 With this option, GCC will also initialize any padding of automatic variables
 or temporary objects that have structure or union types to zeroes.
 However, the current implementation cannot initialize automatic variables
