@@ -312,6 +312,27 @@ get_section (const char *name, unsigned int flags, tree decl,
 	internal_error ("section already exists: %qs", name);
 
       sect = *slot;
+      /* A section in a COMDAT group is a separate ELF section from any other
+	 section with the same name, and the linker keeps or discards it along
+	 with its group, so it can't share a section object with them.  The hash
+	 table only has room for one section per name, so the others stay out of
+	 it, which is fine since the assembler goes by name and group.  */
+      if (HAVE_COMDAT_GROUP
+	  && decl
+	  && VAR_OR_FUNCTION_DECL_P (decl)
+	  && sect->named.decl
+	  && VAR_OR_FUNCTION_DECL_P (sect->named.decl)
+	  && ((sect->common.flags ^ flags)
+	      & ~(SECTION_DECLARED | SECTION_LINKONCE)) == 0
+	  && ((sect->common.flags | flags) & SECTION_LINKONCE)
+	  && DECL_COMDAT_GROUP (decl) != DECL_COMDAT_GROUP (sect->named.decl))
+	{
+	  sect = ggc_alloc<section> ();
+	  sect->named.common.flags = flags;
+	  sect->named.name = ggc_strdup (name);
+	  sect->named.decl = decl;
+	  return sect;
+	}
       /* It is fine if one of the sections has SECTION_NOTYPE as long as
          the other has none of the contrary flags (see the logic at the end
          of default_section_type_flags, below).  */
