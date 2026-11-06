@@ -6123,8 +6123,13 @@ finish_decl (tree decl, location_t init_loc, tree init,
 
   if (VAR_P (decl))
     {
+      /* A compound literal initializing an object with static storage leaves
+	 the brace-enclosed list it contains in DECL_INITIAL.  */
       if (init && TREE_CODE (init) == CONSTRUCTOR)
 	add_flexible_array_elts_to_size (decl, init);
+      else if (DECL_INITIAL (decl)
+	       && TREE_CODE (DECL_INITIAL (decl)) == CONSTRUCTOR)
+	add_flexible_array_elts_to_size (decl, DECL_INITIAL (decl));
 
       complete_flexible_array_elts (DECL_INITIAL (decl));
 
@@ -6578,6 +6583,11 @@ build_compound_literal (location_t loc, tree type, tree init, bool non_const,
 
   if (TREE_STATIC (decl))
     {
+      /* The literal is laid out from its type alone, which leaves out the data
+	 of a flexible array member.  */
+      if (DECL_INITIAL (decl) && TREE_CODE (DECL_INITIAL (decl)) == CONSTRUCTOR)
+	add_flexible_array_elts_to_size (decl, DECL_INITIAL (decl));
+
       /* This decl needs a name for the assembler output.  */
       set_compound_literal_name (decl);
       DECL_DEFER_OUTPUT (decl) = 1;
