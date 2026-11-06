@@ -31494,7 +31494,11 @@ c_parser_transaction_expression (c_parser *parser, enum rid keyword)
   matching_parens parens;
   if (parens.require_open (parser))
     {
-      tree expr = c_parser_expression (parser).value;
+      /* c_fully_fold doesn't walk into a TRANSACTION_EXPR, so fold the body
+	 now to keep any C_MAYBE_CONST_EXPR in it from reaching the
+	 gimplifier.  */
+      tree expr = c_fully_fold (c_parser_expression (parser).value, false,
+				NULL);
       ret.original_type = TREE_TYPE (expr);
       ret.value = build1 (TRANSACTION_EXPR, ret.original_type, expr);
       if (this_in & TM_STMT_ATTR_RELAXED)
