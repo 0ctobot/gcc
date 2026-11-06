@@ -90,19 +90,19 @@ test_kept (int k, long n)
   if (BOS (p, 1) != 0)
     FAIL ();
 
-  /* Staying inside the maximum keeps the size of the member.  */
-  p = arr[1].name + 2;
-  for (int j = 0; j < k; j++)
-    p += -1;
-  p += 8;
-  if (BOS (p, 1) != 8)
+  /* A chain of exact constants follows the pointer step by step.  */
+  p = arr[1].name + 10;
+  BARRIER ();
+  p += -2;
+  BARRIER ();
+  p += 1;
+  if (BOS (p, 1) != 7)
     FAIL ();
 
+  /* An index on its own is presumed to stay in the member.  */
   p = arr[1].name;
   p += n;
-  BARRIER ();
-  p += 4;
-  if (BOS (p, 1) != 12)
+  if (BOS (p, 1) != sizeof (arr[1].name))
     FAIL ();
 
   /* There's nothing around a whole object to go to.  */
