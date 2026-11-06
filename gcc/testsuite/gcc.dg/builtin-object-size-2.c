@@ -319,7 +319,9 @@ test2 (void)
       else if (__builtin_object_size (r + 6, 1) != 0)
 	FAIL ();
     }
-  else if (__builtin_object_size (r, 1) != 0)
+  /* This went past the end of a.buf1, which an offset folded from steps that
+     stay in it can do as well, so all that's left is the rest of a.  */
+  else if (__builtin_object_size (r, 1) != sizeof (a) - 17)
     FAIL ();
 #else
   if (__builtin_object_size (r, 1) != sizeof (buf3) - 13)
