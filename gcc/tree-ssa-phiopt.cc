@@ -4750,6 +4750,18 @@ hoist_adjacent_loads (basic_block bb0, basic_block bb1,
 	  || local_mem_dependence (def2, bb_for_def2))
 	continue;
 
+      /* A load of a type with padding bits such as bool assumes that those
+	 bits are zero, which only holds where the original code loaded the
+	 value.  Executing it on a path that didn't load it can read a byte
+	 that isn't a valid value of the type and later passes then produce
+	 wrong code from it.  Rewriting the load would add a mask to it, and
+	 that's enough for sinking to move the loads back into the arms and
+	 keep the mask, leaving nothing for a conditional move to use.  So
+	 don't speculate these loads at all.  */
+      if (gimple_needing_rewrite_undefined (def1)
+	  || gimple_needing_rewrite_undefined (def2))
+	continue;
+
       /* The conditions are satisfied; hoist the loads from bb1 and bb2 into
 	 bb0.  We hoist the first one first so that a cache miss is handled
          efficiently regardless of hardware cache-fill policy.  */
@@ -4762,6 +4774,11 @@ hoist_adjacent_loads (basic_block bb0, basic_block bb1,
       reset_flow_sensitive_info (gimple_assign_lhs (def1));
       reset_flow_sensitive_info (gimple_assign_lhs (def2));
       statistics_counter_event (cfun, "hoisted loads", 1);
+
+      /* Anything known about the results from the conditional paths no
+	 longer holds now that the loads execute unconditionally.  */
+      reset_flow_sensitive_info (gimple_assign_lhs (def1));
+      reset_flow_sensitive_info (gimple_assign_lhs (def2));
 
       if (dump_file && (dump_flags & TDF_DETAILS))
 	{
