@@ -1215,12 +1215,14 @@ alloc_object_size (const gcall *call, int object_size_type)
 
 /* Compute __builtin_object_size for CALL, which is a call to either
    BUILT_IN_STRDUP or BUILT_IN_STRNDUP; IS_STRNDUP indicates which it is.
-   OBJECT_SIZE_TYPE is the second argument from __builtin_object_size.
+   Set *REEXAMINE if the result depends on an SSA name that needs reexamination.
    If unknown, return size_unknown (object_size_type).  */
 
 static tree
-strdup_object_size (const gcall *call, int object_size_type, bool is_strndup)
+strdup_object_size (struct object_size_info *osi, const gcall *call,
+		    bool is_strndup, bool *reexamine)
 {
+  int object_size_type = osi->object_size_type;
   tree src = gimple_call_arg (call, 0);
   tree sz = size_unknown (object_size_type);
   tree bound = NULL_TREE;
@@ -1270,12 +1272,27 @@ strdup_object_size (const gcall *call, int object_size_type, bool is_strndup)
       /* For maximum estimate, our next best guess is the object size of the
 	 source.  The duplicate is a new object with no subobjects of its own,
 	 and we don't assume the string ends within a member of SRC's object,
-	 so a member of that object doesn't limit the duplicate.  */
+	 so a member of that object doesn't limit the duplicate.  The source can
+	 depend on this call through a PHI in a loop, so follow an SSA name with
+	 the current walk, which knows the names it's in the middle of.  A
+	 nested walk in the same mode doesn't know them and would come back to
+	 this call without end.  A walk for a subobject can stay nested since a
+	 walk for the whole object never comes back to one.  */
       if (size_unknown_p (sz, object_size_type)
 	  && !(object_size_type & OST_MINIMUM))
 	{
-	  compute_builtin_object_size (src, object_size_type & ~OST_SUBOBJECT,
-				       &sz);
+	  if (TREE_CODE (src) == SSA_NAME && POINTER_TYPE_P (TREE_TYPE (src))
+	      && !(object_size_type & OST_SUBOBJECT))
+	    {
+	      if (osi->pass == 0)
+		collect_object_sizes_for (osi, src);
+	      sz = object_sizes_get (osi, SSA_NAME_VERSION (src));
+	      *reexamine = bitmap_bit_p (osi->reexamine,
+					 SSA_NAME_VERSION (src));
+	    }
+	  else
+	    compute_builtin_object_size (src, object_size_type & ~OST_SUBOBJECT,
+					 &sz);
 
 	  /* strndup doesn't need a NUL within the first BOUND bytes of SRC and
 	     appends one when there isn't any, so a BOUND that fits in SRC can
@@ -1430,6 +1447,20 @@ propagate_unknowns (object_size_info *osi, tree expr, bitmap unknowns)
 					 unknowns);
 	  if (size_unknown_p (res, object_size_type))
 	    return res;
+	  return expr;
+	}
+    case COND_EXPR:
+	{
+	  /* The arms are enough since the condition of a size can only use a
+	     name that one of the arms uses too.  */
+	  tree res = propagate_unknowns (osi, TREE_OPERAND (expr, 1), unknowns);
+	  if (size_unknown_p (res, object_size_type))
+	    return res;
+
+	  res = propagate_unknowns (osi, TREE_OPERAND (expr, 2), unknowns);
+	  if (size_unknown_p (res, object_size_type))
+	    return res;
+
 	  return expr;
 	}
     case TREE_VEC:
@@ -1830,26 +1861,29 @@ expr_object_size (struct object_size_info *osi, tree ptr, tree value)
 }
 
 
-/* Compute object_sizes for PTR, defined to the result of a call.  */
+/* Compute object_sizes for PTR, defined to the result of a call.  Return true
+   if the object size might need reexamination later on.  */
 
-static void
+static bool
 call_object_size (struct object_size_info *osi, tree ptr, gcall *call)
 {
   int object_size_type = osi->object_size_type;
   unsigned int varno = SSA_NAME_VERSION (ptr);
   tree bytes = NULL_TREE;
+  bool reexamine = false;
 
   gcc_assert (is_gimple_call (call));
 
   gcc_assert (!object_sizes_unknown_p (object_size_type, varno));
-  gcc_assert (osi->pass == 0);
 
   bool is_strdup = gimple_call_builtin_p (call, BUILT_IN_STRDUP);
   bool is_strndup = gimple_call_builtin_p (call, BUILT_IN_STRNDUP);
   bool is_access_with_size
 	 = gimple_call_internal_p (call, IFN_ACCESS_WITH_SIZE);
+  /* Only string duplication depends on the size of another SSA name.  */
+  gcc_assert (osi->pass == 0 || is_strdup || is_strndup);
   if (is_strdup || is_strndup)
-    bytes = strdup_object_size (call, object_size_type, is_strndup);
+    bytes = strdup_object_size (osi, call, is_strndup, &reexamine);
   else if (is_access_with_size)
     bytes = access_with_size_object_size (call, object_size_type);
   else
@@ -1858,7 +1892,10 @@ call_object_size (struct object_size_info *osi, tree ptr, gcall *call)
   if (!size_valid_p (bytes, object_size_type))
     bytes = size_unknown (object_size_type);
 
-  object_sizes_set (osi, varno, bytes, bytes);
+  if (object_sizes_set (osi, varno, bytes, bytes))
+    osi->changed = true;
+
+  return reexamine;
 }
 
 
@@ -2329,8 +2366,10 @@ phi_dynamic_object_size (struct object_size_info *osi, tree var)
     }
 
   /* Point to the same TREE_VEC so that we can avoid emitting two PHI
-     nodes.  */
-  else if (!wholesize_needed)
+     nodes.  A dependency loop through this PHI has already handed out separate
+     placeholders for its size and whole size though, which then both need a
+     PHI to define them.  */
+  else if (!wholesize_needed && !bitmap_bit_p (osi->reexamine, varno))
     {
       ggc_free (wholesizes);
       wholesizes = sizes;
@@ -2446,7 +2485,7 @@ collect_object_sizes_for (struct object_size_info *osi, tree var)
               expr_object_size (osi, var, arg);
           }
         else
-          call_object_size (osi, var, call_stmt);
+	  reexamine = call_object_size (osi, var, call_stmt);
 	break;
       }
 
