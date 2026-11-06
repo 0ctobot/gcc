@@ -19005,9 +19005,9 @@ aarch64_possible_by_lane_insn_p (vec_info *m_vinfo, gimple *stmt)
 	switch (gimple_assign_rhs_code (rep_stmt))
 	  {
 	  case MULT_EXPR:
-	    return operand_equal_p (gimple_assign_rhs2 (new_stmt), var, 0);
+	    return operand_equal_p (gimple_assign_rhs2 (rep_stmt), var, 0);
 	  case DOT_PROD_EXPR:
-	    return operand_equal_p (gimple_assign_rhs3 (new_stmt), var, 0);
+	    return operand_equal_p (gimple_assign_rhs3 (rep_stmt), var, 0);
 	  default:
 	    continue;
 	  }
