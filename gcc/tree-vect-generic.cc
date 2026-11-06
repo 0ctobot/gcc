@@ -2246,10 +2246,7 @@ expand_vector_operations_1 (gimple_stmt_iterator *gsi)
   if (VECTOR_BOOLEAN_TYPE_P (type)
       && !VECTOR_MODE_P (TYPE_MODE (type))
       && TYPE_MODE (type) != BLKmode
-      && (TREE_CODE_CLASS (gimple_assign_rhs_code (stmt)) != tcc_comparison
-	  || (VECTOR_BOOLEAN_TYPE_P (TREE_TYPE (rhs1))
-	      && !VECTOR_MODE_P (TYPE_MODE (TREE_TYPE (rhs1)))
-	      && TYPE_MODE (TREE_TYPE (rhs1)) != BLKmode)))
+      && TREE_CODE_CLASS (gimple_assign_rhs_code (stmt)) != tcc_comparison)
     return;
 
   /* If the vector operation is operating on all same vector elements
