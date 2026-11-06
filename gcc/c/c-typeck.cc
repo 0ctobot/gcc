@@ -129,6 +129,7 @@ static tree init_drop_copied_flexible_elts (tree);
 static void output_init_element (location_t, tree, tree, bool, tree, tree, bool,
 				 bool, struct obstack *);
 static void output_pending_init_elements (int, struct obstack *);
+static int init_field_decl_cmp (tree, tree);
 static bool set_designator (location_t, bool, struct obstack *);
 static void push_range_stack (tree, struct obstack *);
 static void add_pending_init (location_t, tree, tree, tree, bool,
@@ -10556,6 +10557,14 @@ start_init (tree decl, tree asmspec_tree ATTRIBUTE_UNUSED,
     push_string (locus);
 }
 
+/* The place of each field in its chain for init_field_place, kept for the
+   length of the outermost initializer that needed it.  */
+static hash_map<tree, unsigned> *init_field_places;
+
+/* The field that each field of a same-tag type last got mapped to by
+   init_field_of_type, kept for as long as init_field_places.  */
+static hash_map<tree, tree> *init_field_mappings;
+
 void
 finish_init (void)
 {
@@ -10587,6 +10596,16 @@ finish_init (void)
   spelling_size = p->spelling_size;
   initializer_stack = p->next;
   XDELETE (p);
+
+  /* The garbage collector doesn't see this map, so it can't outlive the types
+     of the initializer it was built for.  */
+  if (!initializer_stack)
+    {
+      delete init_field_places;
+      init_field_places = NULL;
+      delete init_field_mappings;
+      init_field_mappings = NULL;
+    }
 }
 
 /* Call here when we see the initializer is surrounded by braces.
@@ -12041,15 +12060,13 @@ add_pending_init (location_t loc, tree purpose, tree value, tree origtype,
     }
   else
     {
-      tree bitpos;
-
-      bitpos = bit_position (purpose);
       while (*q != NULL)
 	{
 	  p = *q;
-	  if (tree_int_cst_lt (bitpos, bit_position (p->purpose)))
+	  int cmp = init_field_decl_cmp (purpose, p->purpose);
+	  if (cmp < 0)
 	    q = &p->left;
-	  else if (p->purpose != purpose)
+	  else if (cmp > 0)
 	    q = &p->right;
 	  else
 	    {
@@ -12237,6 +12254,33 @@ add_pending_init (location_t loc, tree purpose, tree value, tree origtype,
     }
 }
 
+/* Since C23, a struct type is compatible with a struct type of the same tag
+   declared in another scope, which has its own FIELD_DECLs for the same members
+   in the same order.  Return the field of the struct type TYPE at the place
+   that FIELD has in its own type.  */
+
+static tree
+init_field_of_type (tree field, tree type)
+{
+  tree from = TYPE_FIELDS (DECL_CONTEXT (field));
+  tree to = TYPE_FIELDS (type);
+  if (from == to)
+    return field;
+  /* Walking the chains for each field would make a literal quadratic in its
+     number of fields, so the first lookup maps all of the chain.  Another type
+     of the same tag can need a different mapping for the same field.  */
+  if (!init_field_mappings)
+    init_field_mappings = new hash_map<tree, tree>;
+  tree *mapped = init_field_mappings->get (field);
+  if (!mapped || DECL_CONTEXT (*mapped) != DECL_CONTEXT (to))
+    {
+      for (; from; from = DECL_CHAIN (from), to = DECL_CHAIN (to))
+	init_field_mappings->put (from, to);
+      mapped = init_field_mappings->get (field);
+    }
+  return *mapped;
+}
+
 /* Build AVL tree from a sorted chain.  */
 
 static void
@@ -12249,9 +12293,16 @@ set_nonincremental_init (struct obstack * braced_init_obstack)
       && TREE_CODE (constructor_type) != ARRAY_TYPE)
     return;
 
+  /* The elements can come from a whole initializer of a compatible type with
+     its own fields, as in { .s = (other_s) { 4, 5 }, .s.b = 9 }.  They have to
+     name the fields of this level for the later designators to find them.  */
   FOR_EACH_CONSTRUCTOR_ELT (constructor_elements, ix, index, value)
-    add_pending_init (input_location, index, value, NULL_TREE, true,
-		      braced_init_obstack);
+    {
+      if (TREE_CODE (constructor_type) == RECORD_TYPE)
+	index = init_field_of_type (index, constructor_type);
+      add_pending_init (input_location, index, value, NULL_TREE, true,
+			braced_init_obstack);
+    }
   constructor_elements = NULL;
   if (TREE_CODE (constructor_type) == RECORD_TYPE)
     {
@@ -12380,20 +12431,18 @@ find_init_member (tree field, struct obstack * braced_init_obstack)
     }
   else if (TREE_CODE (constructor_type) == RECORD_TYPE)
     {
-      tree bitpos = bit_position (field);
-
       if (constructor_incremental
 	  && (!constructor_unfilled_fields
-	      || tree_int_cst_lt (bitpos,
-				  bit_position (constructor_unfilled_fields))))
+	      || init_field_decl_cmp (field, constructor_unfilled_fields) < 0))
 	set_nonincremental_init (braced_init_obstack);
 
       p = constructor_pending_elts;
       while (p)
 	{
-	  if (field == p->purpose)
+	  int cmp = init_field_decl_cmp (field, p->purpose);
+	  if (cmp == 0)
 	    return p->value;
-	  else if (tree_int_cst_lt (bitpos, bit_position (p->purpose)))
+	  else if (cmp < 0)
 	    p = p->left;
 	  else
 	    p = p->right;
@@ -12678,18 +12727,9 @@ output_init_element (location_t loc, tree value, tree origtype,
 	 right away since it starts at the beginning of the union.  */
       if (constructor_incremental)
 	{
-	  if (!constructor_unfilled_fields)
+	  if (!constructor_unfilled_fields
+	      || init_field_decl_cmp (field, constructor_unfilled_fields) < 0)
 	    set_nonincremental_init (braced_init_obstack);
-	  else
-	    {
-	      tree bitpos, unfillpos;
-
-	      bitpos = bit_position (field);
-	      unfillpos = bit_position (constructor_unfilled_fields);
-
-	      if (tree_int_cst_lt (bitpos, unfillpos))
-		set_nonincremental_init (braced_init_obstack);
-	    }
 	}
 
       add_pending_init (loc, field, value, origtype, implicit,
@@ -12783,6 +12823,24 @@ output_init_element (location_t loc, tree value, tree origtype,
     output_pending_init_elements (0, braced_init_obstack);
 }
 
+/* Return the place of FIELD in the chain of fields of its struct type.  Finding
+   that by walking the chain would make an initializer with designators out of
+   order quadratic in the size of a long run of fields that share a position, so
+   the first lookup in a chain numbers all of it.  */
+
+static unsigned
+init_field_place (tree field)
+{
+  if (!init_field_places)
+    init_field_places = new hash_map<tree, unsigned>;
+  if (unsigned *place = init_field_places->get (field))
+    return *place;
+  unsigned next_place = 0;
+  for (tree f = TYPE_FIELDS (DECL_CONTEXT (field)); f; f = DECL_CHAIN (f))
+    init_field_places->put (f, next_place++);
+  return *init_field_places->get (field);
+}
+
 /* For two FIELD_DECLs in the same chain, return -1 if field1
    comes before field2, 1 if field1 comes after field2 and
    0 if field1 == field2.  */
@@ -12796,46 +12854,9 @@ init_field_decl_cmp (tree field1, tree field2)
   tree bitpos1 = bit_position (field1);
   tree bitpos2 = bit_position (field2);
   if (tree_int_cst_equal (bitpos1, bitpos2))
-    {
-      /* If one of the fields has non-zero bitsize, then that
-	 field must be the last one in a sequence of zero
-	 sized fields, fields after it will have bigger
-	 bit_position.  */
-      if (TREE_TYPE (field1) != error_mark_node
-	  && COMPLETE_TYPE_P (TREE_TYPE (field1))
-	  && integer_nonzerop (TREE_TYPE (field1)))
-	return 1;
-      if (TREE_TYPE (field2) != error_mark_node
-	  && COMPLETE_TYPE_P (TREE_TYPE (field2))
-	  && integer_nonzerop (TREE_TYPE (field2)))
-	return -1;
-      /* Otherwise, fallback to DECL_CHAIN walk to find out
-	 which field comes earlier.  Walk chains of both
-	 fields, so that if field1 and field2 are close to each
-	 other in either order, it is found soon even for large
-	 sequences of zero sized fields.  */
-      tree f1 = field1, f2 = field2;
-      while (1)
-	{
-	  f1 = DECL_CHAIN (f1);
-	  f2 = DECL_CHAIN (f2);
-	  if (f1 == NULL_TREE)
-	    {
-	      gcc_assert (f2);
-	      return 1;
-	    }
-	  if (f2 == NULL_TREE)
-	    return -1;
-	  if (f1 == field2)
-	    return -1;
-	  if (f2 == field1)
-	    return 1;
-	  if (!tree_int_cst_equal (bit_position (f1), bitpos1))
-	    return 1;
-	  if (!tree_int_cst_equal (bit_position (f2), bitpos1))
-	    return -1;
-	}
-    }
+    /* Zero sized fields can share a position, and then only their places in
+       the chain tell which one comes first.  */
+    return init_field_place (field1) < init_field_place (field2) ? -1 : 1;
   else if (tree_int_cst_lt (bitpos1, bitpos2))
     return -1;
   else
