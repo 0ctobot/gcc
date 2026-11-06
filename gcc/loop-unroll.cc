@@ -938,7 +938,8 @@ unroll_loop_runtime_iterations (class loop *loop)
   /* For loops that exit at end and whose number of iterations is reliable,
      add one to niter to account for first pass through loop body before
      reaching exit test. */
-  if (exit_at_end && !desc->noloop_assumptions)
+  bool niter_counts_first_pass = exit_at_end && !desc->noloop_assumptions;
+  if (niter_counts_first_pass)
     {
       niter = expand_simple_binop (desc->mode, PLUS,
 				   niter, const1_rtx,
@@ -1097,21 +1098,34 @@ unroll_loop_runtime_iterations (class loop *loop)
      of the loop.  After passing through the above code, we see that
      the correct new number of iterations is this:  */
   gcc_assert (!desc->const_iter);
+  rtx unroll_factor = gen_int_mode (max_unroll + 1, desc->mode);
+  /* OLD_NITER wraps to zero when the body runs 2^bitsize times, so a loop that
+     exits at the end must subtract one whole unrolled pass _before_ dividing
+     rather than after.  Reaching the unrolled loop means at least one whole
+     pass is left, which makes the subtraction exact modulo 2^bitsize.  */
   desc->niter_expr =
-    simplify_gen_binary (UDIV, desc->mode, old_niter,
-			 gen_int_mode (max_unroll + 1, desc->mode));
+    simplify_gen_binary (UDIV, desc->mode,
+			 exit_at_end
+			 ? simplify_gen_binary (MINUS, desc->mode, old_niter,
+						unroll_factor)
+			 : old_niter,
+			 unroll_factor);
+  /* The bounds count latch executions, so add the first pass if OLD_NITER has
+     it too.  Otherwise, the bound can end up one too small.  */
+  unsigned int first_pass = niter_counts_first_pass ? 1 : 0;
   loop->nb_iterations_upper_bound
-    = wi::udiv_trunc (loop->nb_iterations_upper_bound, max_unroll + 1);
+    = wi::udiv_trunc (loop->nb_iterations_upper_bound + first_pass,
+		      max_unroll + 1);
   if (loop->any_estimate)
     loop->nb_iterations_estimate
-      = wi::udiv_trunc (loop->nb_iterations_estimate, max_unroll + 1);
+      = wi::udiv_trunc (loop->nb_iterations_estimate + first_pass,
+			max_unroll + 1);
   if (loop->any_likely_upper_bound)
     loop->nb_iterations_likely_upper_bound
-      = wi::udiv_trunc (loop->nb_iterations_likely_upper_bound, max_unroll + 1);
+      = wi::udiv_trunc (loop->nb_iterations_likely_upper_bound + first_pass,
+			max_unroll + 1);
   if (exit_at_end)
     {
-      desc->niter_expr =
-	simplify_gen_binary (MINUS, desc->mode, desc->niter_expr, const1_rtx);
       desc->noloop_assumptions = NULL_RTX;
       --loop->nb_iterations_upper_bound;
       if (loop->any_estimate
