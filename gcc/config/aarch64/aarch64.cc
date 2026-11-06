@@ -3220,10 +3220,19 @@ aarch64_gen_compare_reg (RTX_CODE code, rtx x, rtx y)
 
       rtx x_lo = force_lowpart_subreg (DImode, x, TImode);
       rtx y_lo = force_lowpart_subreg (DImode, y, TImode);
-      emit_set_insn (cc_reg, gen_rtx_COMPARE (cc_mode, x_lo, y_lo));
-
       rtx x_hi = force_highpart_subreg (DImode, x, TImode);
       rtx y_hi = force_highpart_subreg (DImode, y, TImode);
+
+      /* Y can be a constant that's valid for its TImode user but not for the
+	 narrower immediates of CMP and CCMP, depending on which half of the
+	 constant each word holds.  Post-reload callers only pass a register or
+	 zero, so this never needs a new pseudo at that point.  */
+      if (!aarch64_plus_operand (y_lo, DImode))
+	y_lo = force_reg (DImode, y_lo);
+      if (!aarch64_ccmp_operand (y_hi, DImode))
+	y_hi = force_reg (DImode, y_hi);
+
+      emit_set_insn (cc_reg, gen_rtx_COMPARE (cc_mode, x_lo, y_lo));
       emit_insn (gen_ccmpccdi (cc_reg, cc_reg, x_hi, y_hi,
 			       gen_rtx_EQ (cc_mode, cc_reg, const0_rtx),
 			       GEN_INT (AARCH64_EQ)));
