@@ -2759,6 +2759,10 @@ vect_recog_widen_sum_pattern (vec_info *vinfo,
    Here type is the signed variant of the wider of type_out and the type
    of container.
 
+   If the bitfield isn't sign-extended, and masking first would leave the sign
+   bit of a signed container set for the shift, then the masking and shifting
+   are done in the unsigned variant of container to make the shift logical.
+
    The shifting is always optional depending on whether bitpos != 0.
 
    When the original bitfield was inside a gcond then an new gcond is also
@@ -2869,6 +2873,25 @@ vect_recog_bitfield_ref_pattern (vec_info *vinfo, stmt_vec_info stmt_info,
      code-path to shift_first.  */
   if (shift_n == 0)
     shift_first = true;
+
+  /* The mask doesn't clear the top bit of a field that ends at the sign bit of
+     a signed container, so the right shift after the mask would be arithmetic
+     and copy that bit into the upper bits of the result.  Since we aren't
+     sign-extending here, do the extraction in the unsigned variant of the
+     container in order to get a logical shift.  */
+  if (!shift_first
+      && !ref_sext
+      && !TYPE_UNSIGNED (container_type)
+      && shift_n + mask_width == prec)
+    {
+      tree type = gimple_unsigned_type (container_type);
+      pattern_stmt = gimple_build_assign (vect_recog_temp_ssa_var (type),
+					  NOP_EXPR, container);
+      container = gimple_get_lhs (pattern_stmt);
+      container_type = TREE_TYPE (container);
+      vectype = get_vectype_for_scalar_type (vinfo, container_type);
+      append_pattern_def_seq (vinfo, stmt_info, pattern_stmt, vectype);
+    }
 
   tree result;
   if (shift_first && !ref_sext)
