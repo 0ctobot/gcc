@@ -3207,7 +3207,10 @@ expand_call_stmt (gcall *stmt)
   exp = build_vl_exp (CALL_EXPR, gimple_call_num_args (stmt) + 3);
 
   CALL_EXPR_FN (exp) = gimple_call_fn (stmt);
-  builtin_p = decl && fndecl_built_in_p (decl);
+  builtin_p = (decl
+	       && fndecl_built_in_p (decl)
+	       && !noreturn_call_of_returning_builtin_p
+		     (decl, gimple_call_fntype (stmt)));
 
   /* If this is not a builtin function, the function type through which the
      call is made may be different from the type of the function.  */

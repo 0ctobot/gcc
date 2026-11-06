@@ -7327,7 +7327,9 @@ pass_forwprop::execute (function *fun)
 		  {
 		    tree callee = gimple_call_fndecl (stmt);
 		    if (callee != NULL_TREE
-			&& fndecl_built_in_p (callee, BUILT_IN_NORMAL))
+			&& fndecl_built_in_p (callee, BUILT_IN_NORMAL)
+			&& !noreturn_call_of_returning_builtin_p
+			      (callee, gimple_call_fntype (stmt)))
 		      changed |= simplify_builtin_call (&gsi, callee, full_walk);
 		    break;
 		  }

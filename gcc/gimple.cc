@@ -2928,6 +2928,11 @@ gimple_builtin_call_types_compatible_p (const gimple *stmt, tree fndecl)
 {
   gcc_checking_assert (DECL_BUILT_IN_CLASS (fndecl) != NOT_BUILT_IN);
 
+  /* gimple_call_ctrl_altering_p can't decide this because it isn't set until
+     the CFG exists, and statements get folded before that.  */
+  if (noreturn_call_of_returning_builtin_p (fndecl, gimple_call_fntype (stmt)))
+    return false;
+
   if (DECL_BUILT_IN_CLASS (fndecl) == BUILT_IN_NORMAL)
     if (tree decl = builtin_decl_explicit (DECL_FUNCTION_CODE (fndecl)))
       fndecl = decl;
