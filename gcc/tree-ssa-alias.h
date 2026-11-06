@@ -126,6 +126,7 @@ extern bool ao_ref_alignment (ao_ref *, unsigned int *,
 			      unsigned HOST_WIDE_INT *);
 extern bool ptr_deref_may_alias_global_p (tree, bool);
 extern bool ptr_deref_may_alias_auto_p (tree);
+extern bool ptr_deref_may_alias_decl_p (tree, tree);
 extern bool ptr_derefs_may_alias_p (tree, tree);
 extern bool ptrs_compare_unequal (tree, tree);
 extern bool ref_may_alias_global_p (tree, bool);
