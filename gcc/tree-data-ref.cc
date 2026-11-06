@@ -3367,6 +3367,228 @@ access_fn_components_comparable_p (tree ref_a, tree ref_b)
 			     TREE_TYPE (TREE_OPERAND (ref_b, 0)));
 }
 
+/* Work out what a step of STEP in the access function of a dimension says about
+   the distance between the objects of size SIZE that the dimension selects.
+   SCALE is the size of a unit of STEP, or null if STEP is in bytes.  Set
+   *ALIGNED_P if the step in bytes is a multiple of a power of 2 no smaller than
+   SIZE and set *MULTIPLE_P if it's a multiple of SIZE.  When all steps of the
+   dimension satisfy the same condition, the offsets that it reaches are all
+   multiples of a distance no smaller than SIZE, so its objects are either the
+   same or don't overlap at all.  */
+
+static void
+dr_classify_stride (tree step, tree scale, tree size,
+		    bool *aligned_p, bool *multiple_p)
+{
+  /* An array index scaled by the size of its element moves by whole elements,
+     which leaves just the evolution of a pointer to look at.  */
+  *multiple_p = scale != NULL_TREE;
+  *aligned_p = false;
+  if (scale
+      || !size
+      || !tree_fits_uhwi_p (size)
+      || integer_zerop (size))
+    return;
+
+  unsigned int size_bits = ceil_log2 (tree_to_uhwi (size));
+  if (TREE_CODE (step) == INTEGER_CST)
+    {
+      wide_int stride = wi::to_wide (fold_convert (sizetype, step));
+      if (wi::eq_p (stride, 0))
+	{
+	  *aligned_p = *multiple_p = true;
+	  return;
+	}
+      *aligned_p = (unsigned int) wi::ctz (stride) >= size_bits;
+      *multiple_p = wi::multiple_of_p (wi::abs (stride),
+				       wi::to_wide (fold_convert (sizetype,
+								  size)),
+				       UNSIGNED);
+      return;
+    }
+
+  *aligned_p = tree_ctz (step) >= size_bits;
+  *multiple_p = multiple_of_p (sizetype, step, size, true);
+}
+
+/* What a dimension of a reference says about the objects it selects.  */
+
+struct dr_outer_dim
+{
+  /* False for a dimension that doesn't step over objects, such as a field.  */
+  bool strided_p;
+
+  /* The size of the objects, and the size of a unit of the access function or
+     null if the access function is in bytes.  */
+  tree size;
+  tree scale;
+
+  /* The initial value of the access function.  */
+  tree init;
+
+  /* Whether all of the steps satisfy each of the conditions that
+     dr_classify_stride describes.  All steps of the dimension must satisfy the
+     same condition because mixing them doesn't compose: steps of 32 and 24 over
+     a 24-byte object combine to reach an offset of 8.  */
+  bool aligned_p;
+  bool multiple_p;
+};
+
+/* Add to DIMS what the access functions in ACCESS_FNS say about the objects
+   that they select at each dimension from FIRST outwards, for the reference
+   REF.  UNCONSTRAINED_BASE says whether the last dimension is the evolution of
+   the pointer in BASE_OBJECT.  Return false if an evolution isn't known.  */
+
+static bool
+dr_collect_outer_dims (tree ref, const vec<tree> &access_fns,
+		       unsigned int first, bool unconstrained_base,
+		       tree base_object, vec<dr_outer_dim> *dims)
+{
+  for (unsigned int i = 0; i < access_fns.length (); ++i)
+    {
+      dr_outer_dim dim = {};
+      dim.strided_p = true;
+      if (unconstrained_base && i + 1 == access_fns.length ())
+	dim.size = TYPE_SIZE_UNIT (TREE_TYPE (base_object));
+      else if (TREE_CODE (ref) == ARRAY_REF)
+	dim.scale = dim.size = array_ref_element_size (ref);
+      else
+	dim.strided_p = false;
+      if (handled_component_p (ref))
+	ref = TREE_OPERAND (ref, 0);
+      if (i < first)
+	continue;
+      if (!dim.strided_p)
+	{
+	  dims->safe_push (dim);
+	  continue;
+	}
+      tree fn = access_fns[i];
+      if (chrec_contains_undetermined (fn))
+	return false;
+      dim.aligned_p = dim.multiple_p = true;
+      for (; TREE_CODE (fn) == POLYNOMIAL_CHREC; fn = CHREC_LEFT (fn))
+	{
+	  tree step = CHREC_RIGHT (fn);
+	  if (tree_contains_chrecs (step, NULL))
+	    return false;
+	  bool aligned, multiple;
+	  dr_classify_stride (step, dim.scale, dim.size, &aligned, &multiple);
+	  dim.aligned_p &= aligned;
+	  dim.multiple_p &= multiple;
+	}
+      if (tree_contains_chrecs (fn, NULL))
+	return false;
+      dim.init = fn;
+      dims->safe_push (dim);
+    }
+  return true;
+}
+
+/* Return true if the objects that dimensions A and B of two references select
+   from the same enclosing object are either the same or fully disjoint.  That
+   always holds for array indices, which count whole elements.  A pointer walks
+   a set of byte offsets from its initial value instead, so this requires both
+   sets to be multiples of one distance that's no smaller than the objects, with
+   the initial values also a multiple of that distance apart.  Checking each
+   reference on its own proves nothing: a walk by 16 bytes and a walk by 12
+   bytes from the same address each keep their own 12-byte objects apart, yet
+   the object at offset 16 of the first overlaps the one at offset 12 of the
+   second.  */
+
+static bool
+dr_outer_dims_disjoint_p (const dr_outer_dim &a, const dr_outer_dim &b)
+{
+  if (!a.strided_p || !b.strided_p)
+    return a.strided_p == b.strided_p;
+
+  if (!a.size
+      || !b.size
+      || !operand_equal_p (a.size, b.size, 0)
+      || !a.scale != !b.scale
+      || (a.scale && !operand_equal_p (a.scale, b.scale, 0)))
+    return false;
+
+  if (a.scale)
+    return true;
+
+  bool aligned = a.aligned_p && b.aligned_p;
+  bool multiple = a.multiple_p && b.multiple_p;
+  if (!aligned && !multiple)
+    return false;
+
+  if (operand_equal_p (a.init, b.init, 0))
+    return true;
+
+  tree diff = fold_binary (MINUS_EXPR, ssizetype,
+			   fold_convert (ssizetype, a.init),
+			   fold_convert (ssizetype, b.init));
+  if (!diff
+      || TREE_CODE (diff) != INTEGER_CST
+      || !tree_fits_uhwi_p (a.size)
+      || integer_zerop (a.size))
+    return false;
+
+  offset_int bytes = wi::to_offset (diff);
+  if (bytes == 0)
+    return true;
+
+  if (aligned
+      && wi::ctz (bytes) >= ceil_log2 (tree_to_uhwi (a.size)))
+    return true;
+
+  return (multiple
+	  && wi::multiple_of_p (wi::abs (bytes), wi::to_offset (a.size),
+				UNSIGNED));
+}
+
+/* An access function describes which subobject of an enclosing object gets
+   used, and differing values for a dimension are taken as proof of independence
+   provided that the enclosing objects either coincide or are fully disjoint.
+   Return true if that holds for A and B, whose access functions are in
+   INDICES_A and INDICES_B and which share LENGTH dimensions starting at START_A
+   in A and START_B in B.
+
+   That proof is only needed for what's outside of the innermost dimension whose
+   access functions differ.  It doesn't follow from the types when strict
+   aliasing isn't in effect, since a stride smaller than the object then just
+   makes the objects of different iterations overlap.  */
+
+static bool
+dr_access_fns_separate_p (struct data_reference *a, struct data_reference *b,
+			  struct indices *indices_a, struct indices *indices_b,
+			  unsigned int start_a, unsigned int start_b,
+			  unsigned int length)
+{
+  if (flag_strict_aliasing)
+    return true;
+
+  unsigned int i;
+  for (i = 0; i < length; ++i)
+    if (!eq_evolutions_p (indices_a->access_fns[start_a + i],
+			  indices_b->access_fns[start_b + i]))
+      break;
+  if (i == length)
+    return true;
+
+  /* The decision is about the two references together, so that each dimension
+     from there outwards needs one rule that both of them satisfy.  */
+  auto_vec<dr_outer_dim, 4> dims_a, dims_b;
+  if (!dr_collect_outer_dims (DR_REF (a), indices_a->access_fns,
+			      start_a + i + 1, indices_a->unconstrained_base,
+			      indices_a->base_object, &dims_a)
+      || !dr_collect_outer_dims (DR_REF (b), indices_b->access_fns,
+				 start_b + i + 1, indices_b->unconstrained_base,
+				 indices_b->base_object, &dims_b)
+      || dims_a.length () != dims_b.length ())
+    return false;
+
+  for (unsigned int j = 0; j < dims_a.length (); ++j)
+    if (!dr_outer_dims_disjoint_p (dims_a[j], dims_b[j]))
+      return false;
+  return true;
+}
+
 /* Initialize a data dependence relation RES in LOOP_NEST.  USE_ALT_INDICES
    is true when the main indices of A and B were not comparable so we try again
    with alternate indices computed on an indirect reference.  */
@@ -3623,6 +3845,15 @@ initialize_data_dependence_relation (struct data_dependence_relation *res,
     }
   else
     full_seq = struct_seq;
+
+  /* Stop relying on the access functions if the enclosing objects could
+     partially overlap, so that the dependence comes from the addresses.  */
+  if (same_base_p
+      && !use_alt_indices
+      && !dr_access_fns_separate_p (a, b, indices_a, indices_b,
+				    full_seq.start_a, full_seq.start_b,
+				    full_seq.length))
+    full_seq.length = 0;
 
   /* Punt if we didn't find a suitable sequence.  */
   if (full_seq.length == 0)
