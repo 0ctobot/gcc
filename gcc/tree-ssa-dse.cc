@@ -973,6 +973,310 @@ contains_phi_arg (gphi *phi, tree arg)
    data reference.  If NULL data-ref analysis isn't used.  */
 static hash_map<gimple *, data_reference_p> *dse_stmt_to_dr_map;
 
+/* SSA versions of the virtual operands holding the memory state at a point
+   where the function may stop running without anything in the virtual use-def
+   chain showing it, as computed by compute_exit_vops.  The walk in
+   dse_classify_store only sees what follows a store through immediate uses, so
+   it would otherwise call a store dead when it finds a kill on every path it
+   can see.  NULL outside of pass_dse.  */
+static bitmap dse_exit_vops;
+
+/* Return true if the function may never get past STMT, which means that memory
+   visible outside of the function must hold everything stored before STMT even
+   when STMT doesn't read it.  An exception can leave the function here, and a
+   volatile access, a volatile asm or a call that isn't known to return can spin
+   or stop forever.  A clobber carries the volatile flag too, but it doesn't
+   access anything.  A normal builtin doesn't count since it either returns or
+   is a noreturn call, whose virtual definition has no uses and thus keeps
+   global memory live without any help.  */
+
+bool
+stmt_may_end_function_p (function *fun, gimple *stmt)
+{
+  if (gimple_clobber_p (stmt))
+    return false;
+
+  if (stmt_can_throw_external (fun, stmt) || gimple_has_volatile_ops (stmt))
+    return true;
+
+  if (gasm *asm_stmt = dyn_cast <gasm *> (stmt))
+    return gimple_asm_volatile_p (asm_stmt);
+
+  gcall *call = dyn_cast <gcall *> (stmt);
+  if (!call
+      || gimple_call_internal_p (call)
+      || gimple_call_builtin_p (call, BUILT_IN_NORMAL))
+    return false;
+
+  int flags = gimple_call_flags (call);
+  if (flags & (ECF_CONST | ECF_PURE))
+    return flags & ECF_LOOPING_CONST_OR_PURE;
+
+  bool interposed = false;
+  modref_summary *summary = get_modref_function_summary (call, &interposed);
+  return !summary || interposed || summary->side_effects;
+}
+
+/* Return true if BB has no successors because the function stops there, as
+   opposed to __builtin_unreachable saying that control never gets there.  */
+
+bool
+bb_ends_function_p (basic_block bb)
+{
+  if (EDGE_COUNT (bb->succs) != 0)
+    return false;
+
+  gcall *last = safe_dyn_cast <gcall *> (last_nondebug_stmt (bb));
+  return !(last
+	   && (gimple_call_builtin_p (last, BUILT_IN_UNREACHABLE)
+	       || gimple_call_builtin_p (last, BUILT_IN_UNREACHABLE_TRAP)));
+}
+
+/* Set the bit in REACHES_EXIT of each block in FUN that has a path to the end
+   of FUN.  A block without one runs into an endless loop or an unreachable
+   call.  */
+
+static void
+compute_reaches_exit (function *fun, sbitmap reaches_exit)
+{
+  basic_block bb;
+  edge e;
+  edge_iterator ei;
+  auto_vec<basic_block, 16> worklist;
+
+  bitmap_clear (reaches_exit);
+  bitmap_set_bit (reaches_exit, EXIT_BLOCK);
+  worklist.safe_push (EXIT_BLOCK_PTR_FOR_FN (fun));
+  FOR_EACH_BB_FN (bb, fun)
+    if (bb_ends_function_p (bb))
+      {
+	bitmap_set_bit (reaches_exit, bb->index);
+	worklist.safe_push (bb);
+      }
+  while (!worklist.is_empty ())
+    {
+      bb = worklist.pop ();
+      FOR_EACH_EDGE (e, ei, bb->preds)
+	if (bitmap_set_bit (reaches_exit, e->src->index))
+	  worklist.safe_push (e->src);
+    }
+}
+
+/* Return true if FUN may stop running for good at a point where its local
+   variables are still alive, without any virtual use showing that.  This is an
+   endless loop or a statement without a virtual use from
+   stmt_may_end_function_p, and also a volatile access, which only uses the
+   memory it accesses.  A call with a virtual use doesn't count since it already
+   keeps every store in front of it for tree DCE.  */
+
+bool
+function_may_stop_unseen_p (function *fun)
+{
+  basic_block bb;
+  auto_sbitmap reaches_exit (last_basic_block_for_fn (fun));
+
+  compute_reaches_exit (fun, reaches_exit);
+  mark_dfs_back_edges (fun);
+  FOR_EACH_BB_FN (bb, fun)
+    {
+      if (!bitmap_bit_p (reaches_exit, bb->index))
+	{
+	  edge e;
+	  edge_iterator ei;
+	  FOR_EACH_EDGE (e, ei, bb->succs)
+	    if (e->flags & EDGE_DFS_BACK)
+	      return true;
+	}
+
+      for (gimple_stmt_iterator gsi = gsi_start_bb (bb); !gsi_end_p (gsi);
+	   gsi_next (&gsi))
+	{
+	  gimple *stmt = gsi_stmt (gsi);
+	  if (stmt_may_end_function_p (fun, stmt)
+	      && !(is_gimple_call (stmt) && gimple_vuse (stmt)))
+	    return true;
+	}
+    }
+  return false;
+}
+
+/* Set the bit in ON_CYCLE of each block that may be on a cycle in the CFG, with
+   RPO holding the N blocks in FUN that compute_exit_vops was given.  The
+   position in RPO only goes down over a back edge, so a path leaving a block
+   and coming back to it has to cross that block's position over a back edge.
+   Therefore, sweeping over the range covered by each back edge finds every
+   block on a cycle, along with some that are merely ordered in between.  */
+
+static void
+compute_blocks_on_cycles (function *fun, const int *rpo, int n,
+			  sbitmap on_cycle)
+{
+  auto_vec<int> position;
+  position.safe_grow_cleared (last_basic_block_for_fn (fun), true);
+  for (int i = 0; i < n; ++i)
+    position[rpo[i]] = i;
+
+  bitmap_clear (on_cycle);
+  int end = -1;
+  for (int i = 0; i < n; ++i)
+    {
+      basic_block bb = BASIC_BLOCK_FOR_FN (fun, rpo[i]);
+      edge e;
+      edge_iterator ei;
+      FOR_EACH_EDGE (e, ei, bb->preds)
+	if (e->flags & EDGE_DFS_BACK)
+	  end = MAX (end, position[e->src->index]);
+      if (i <= end)
+	bitmap_set_bit (on_cycle, bb->index);
+    }
+}
+
+/* Mark the memory state in front of each statement in BB that may end the
+   function, given that BB isn't on a cycle in the CFG when ON_CYCLE is false.
+   Also mark the memory state at the end of BB if END_OF_BB is true.  Return
+   true if BB doesn't define the last state to mark, in which case that state
+   comes from the start of BB.  */
+
+static bool
+mark_exit_vops_in_bb (function *fun, basic_block bb, bool on_cycle,
+		      bool end_of_bb)
+{
+  bool pending = end_of_bb;
+  for (gimple_stmt_iterator gsi = gsi_last_bb (bb); !gsi_end_p (gsi);
+       gsi_prev (&gsi))
+    {
+      gimple *stmt = gsi_stmt (gsi);
+      tree vuse = gimple_vuse (stmt);
+      tree vdef = gimple_vdef (stmt);
+      if (pending && (vdef || vuse))
+	{
+	  bitmap_set_bit (dse_exit_vops, SSA_NAME_VERSION (vdef ? vdef : vuse));
+	  pending = false;
+	}
+      /* A volatile access can only get stuck by spinning on it, which isn't
+	 possible for one that runs just once.  */
+      if (stmt_may_end_function_p (fun, stmt)
+	  && (on_cycle
+	      || !is_gimple_assign (stmt)
+	      || stmt_can_throw_external (fun, stmt)))
+	{
+	  if (vuse)
+	    bitmap_set_bit (dse_exit_vops, SSA_NAME_VERSION (vuse));
+	  else
+	    pending = true;
+	}
+    }
+  return pending;
+}
+
+/* Mark the memory state at the start of BB.  If BB has no virtual PHI then the
+   state comes from its predecessors, which are queued on WORKLIST unless they
+   are in VISITED already.  */
+
+static void
+mark_exit_vop_at_bb_start (basic_block bb, sbitmap visited,
+			   vec<basic_block> &worklist)
+{
+  if (gphi *vphi = get_virtual_phi (bb))
+    {
+      bitmap_set_bit (dse_exit_vops,
+		      SSA_NAME_VERSION (gimple_phi_result (vphi)));
+      return;
+    }
+
+  edge e;
+  edge_iterator ei;
+  FOR_EACH_EDGE (e, ei, bb->preds)
+    if (e->src != ENTRY_BLOCK_PTR_FOR_FN (cfun)
+	&& bitmap_set_bit (visited, e->src->index))
+      worklist.safe_push (e->src);
+}
+
+/* Compute dse_exit_vops for FUN.  The function can stop running in a block
+   without successors such as one ending in an external GIMPLE_RESX, in a cycle
+   that has no path out to an exit, and at any statement satisfying
+   stmt_may_end_function_p.  A loop with a path out to an exit doesn't count on
+   its own, since whatever follows it still gets to see the stores made before
+   it.  RPO holds the N blocks of FUN in the order that set EDGE_DFS_BACK, which
+   needs to be up to date since there's a back edge in every cycle.  */
+
+static void
+compute_exit_vops (function *fun, const int *rpo, int n)
+{
+  basic_block bb;
+  edge e;
+  edge_iterator ei;
+  auto_sbitmap reaches_exit (last_basic_block_for_fn (fun));
+  auto_sbitmap on_cycle (last_basic_block_for_fn (fun));
+  auto_sbitmap visited (last_basic_block_for_fn (fun));
+  auto_vec<basic_block, 16> worklist;
+
+  dse_exit_vops = BITMAP_ALLOC (NULL);
+
+  compute_reaches_exit (fun, reaches_exit);
+  compute_blocks_on_cycles (fun, rpo, n, on_cycle);
+
+  bitmap_clear (visited);
+  FOR_EACH_BB_FN (bb, fun)
+    {
+      bool end_of_bb = bb_ends_function_p (bb);
+      if (!bitmap_bit_p (reaches_exit, bb->index))
+	FOR_EACH_EDGE (e, ei, bb->succs)
+	  if (e->flags & EDGE_DFS_BACK)
+	    end_of_bb = true;
+      if (mark_exit_vops_in_bb (fun, bb, bitmap_bit_p (on_cycle, bb->index),
+				end_of_bb))
+	mark_exit_vop_at_bb_start (bb, visited, worklist);
+    }
+  while (!worklist.is_empty ())
+    {
+      bb = worklist.pop ();
+      if (mark_exit_vops_in_bb (fun, bb, bitmap_bit_p (on_cycle, bb->index),
+				true))
+	mark_exit_vop_at_bb_start (bb, visited, worklist);
+    }
+}
+
+/* Return true if the memory state VOP may be the last one the outside world
+   gets to see from this function and REF is visible outside of it.  Unlike a
+   store followed by a return, this includes a local variable whose address
+   escaped since the function may still be running.  */
+
+static bool
+exit_vop_keeps_ref_live_p (tree vop, ao_ref *ref)
+{
+  return (dse_exit_vops
+	  && bitmap_bit_p (dse_exit_vops, SSA_NAME_VERSION (vop))
+	  && ref_may_alias_global_p (ref, true));
+}
+
+/* STMT is about to be removed, so whatever it left in memory is now up to the
+   store before it.  Move its dse_exit_vops mark there.  */
+
+static void
+transfer_exit_vop_mark (gimple *stmt)
+{
+  if (dse_exit_vops
+      && bitmap_bit_p (dse_exit_vops, SSA_NAME_VERSION (gimple_vdef (stmt))))
+    bitmap_set_bit (dse_exit_vops, SSA_NAME_VERSION (gimple_vuse (stmt)));
+}
+
+/* Likewise for a virtual PHI about to be removed.  */
+
+static void
+transfer_exit_vop_mark (gphi *phi)
+{
+  if (dse_exit_vops
+      && bitmap_bit_p (dse_exit_vops,
+		       SSA_NAME_VERSION (gimple_phi_result (phi))))
+    for (unsigned i = 0; i < gimple_phi_num_args (phi); ++i)
+      {
+	tree arg = gimple_phi_arg_def (phi, i);
+	if (TREE_CODE (arg) == SSA_NAME)
+	  bitmap_set_bit (dse_exit_vops, SSA_NAME_VERSION (arg));
+      }
+}
+
 /* A helper of dse_optimize_stmt.
    Given a GIMPLE_ASSIGN in STMT that writes to REF, classify it
    according to downstream uses and defs.  Sets *BY_CLOBBER_P to true
@@ -1025,6 +1329,15 @@ dse_classify_store (ao_ref *ref, gimple *stmt,
 	  /* If we're instructed to stop walking at region boundary, do so.  */
 	  if (defvar == stop_at_vuse)
 	    return DSE_STORE_LIVE;
+
+	  /* The function may stop running with this memory state, which only
+	     lets us drop the bytes the walk has seen overwritten so far.  */
+	  if (exit_vop_keeps_ref_live_p (defvar, ref))
+	    {
+	      if (byte_tracking_enabled && !gimple_clobber_p (stmt))
+		return DSE_STORE_MAYBE_PARTIAL_DEAD;
+	      return DSE_STORE_LIVE;
+	    }
 
 	  use_operand_p usep;
 	  FOR_EACH_IMM_USE_FAST (usep, ui, defvar)
@@ -1205,6 +1518,11 @@ dse_classify_store (ao_ref *ref, gimple *stmt,
 		*by_clobber_p = false;
 	      defs.unordered_remove (i);
 	    }
+	  /* The function may stop running right after this def, so keep the def
+	     for the walk to get to that point rather than dropping it below for
+	     having no uses or for feeding a PHI we've already looked at.  */
+	  else if (exit_vop_keeps_ref_live_p (vdef, ref))
+	    ++i;
 	  /* If the path ends here we do not need to process it further.
 	     This for example happens with calls to noreturn functions.  */
 	  else if (has_zero_uses (vdef))
@@ -1330,6 +1648,7 @@ delete_dead_or_redundant_call (gimple_stmt_iterator *gsi, const char *type)
     {
       tree ptr = gimple_call_arg (stmt, 0);
       gimple *new_stmt = gimple_build_assign (lhs, ptr);
+      transfer_exit_vop_mark (stmt);
       unlink_stmt_vdef (stmt);
       if (gsi_replace (gsi, new_stmt, true))
 	bitmap_set_bit (need_eh_cleanup, bb->index);
@@ -1337,6 +1656,7 @@ delete_dead_or_redundant_call (gimple_stmt_iterator *gsi, const char *type)
   else
     {
       /* Then we need to fix the operand of the consuming stmt.  */
+      transfer_exit_vop_mark (stmt);
       unlink_stmt_vdef (stmt);
 
       /* Remove the dead store.  */
@@ -1363,6 +1683,7 @@ delete_dead_or_redundant_assignment (gimple_stmt_iterator *gsi,
     }
 
   /* Then we need to fix the operand of the consuming stmt.  */
+  transfer_exit_vop_mark (stmt);
   unlink_stmt_vdef (stmt);
 
   /* Remove the dead store.  */
@@ -1712,6 +2033,7 @@ pass_dse::execute (function *fun)
   edge entry = single_succ_edge (ENTRY_BLOCK_PTR_FOR_FN (fun));
   int n = rev_post_order_and_mark_dfs_back_seme (fun, entry,
 						 exit_bbs, false, rpo, NULL);
+  compute_exit_vops (fun, rpo, n);
   for (int i = n; i != 0; --i)
     {
       basic_block bb = BASIC_BLOCK_FOR_FN (fun, rpo[i-1]);
@@ -1763,6 +2085,7 @@ pass_dse::execute (function *fun)
 		  print_gimple_stmt (dump_file, phi, 0, dump_flags);
 		  fprintf (dump_file, "\n");
 		}
+	      transfer_exit_vop_mark (phi);
 	      remove_phi_node (&si, true);
 	      removed_phi = true;
 	      released_def = true;
@@ -1790,6 +2113,7 @@ pass_dse::execute (function *fun)
 
   BITMAP_FREE (need_eh_cleanup);
   BITMAP_FREE (need_ab_cleanup);
+  BITMAP_FREE (dse_exit_vops);
 
   if (released_def)
     free_numbers_of_iterations_estimates (fun);

@@ -1,5 +1,5 @@
 /* { dg-do compile } */
-/* { dg-options "-O2 -fdump-tree-optimized"  } */
+/* { dg-options "-O2 -ffinite-loops -fdump-tree-optimized"  } */
 struct list
 {
 	 struct list *next;

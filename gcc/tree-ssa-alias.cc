@@ -548,9 +548,12 @@ ptrs_compare_unequal (tree ptr1, tree ptr2)
 static bool
 ref_may_alias_global_p_1 (tree base, bool escaped_local_p)
 {
+  /* The escaped solution says anything once an integer escapes, which doesn't
+     cover a local that cannot be pointed to since its address isn't taken.  */
   if (DECL_P (base))
     return (is_global_var (base)
 	    || (escaped_local_p
+		&& may_be_aliased (base)
 		&& pt_solution_includes (&cfun->gimple_df->escaped_return,
 					 base)));
   else if (TREE_CODE (base) == MEM_REF

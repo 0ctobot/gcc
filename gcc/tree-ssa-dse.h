@@ -34,4 +34,10 @@ dse_store_status dse_classify_store (ao_ref *, gimple *, bool, sbitmap,
 void delete_dead_or_redundant_assignment (gimple_stmt_iterator *, const char *,
 					  bitmap = NULL, bitmap = NULL);
 
+bool stmt_may_end_function_p (function *, gimple *);
+
+bool bb_ends_function_p (basic_block);
+
+bool function_may_stop_unseen_p (function *);
+
 #endif   /* GCC_TREE_SSA_DSE_H  */

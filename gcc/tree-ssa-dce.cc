@@ -71,6 +71,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "ipa-modref-tree.h"
 #include "ipa-modref.h"
 #include "memmodel.h"
+#include "tree-ssa-dse.h"
 
 static struct stmt_stats
 {
@@ -381,6 +382,10 @@ checks_return_value_of_removable_allocation_p (gimple *stmt)
 }
 
 
+/* True if a store to a local variable whose address escaped may be the last
+   thing that the outside world gets to see from this function.  */
+static bool escaped_locals_stay_visible;
+
 /* Mark STMT as necessary if it obviously is.  Add it to the worklist if
    it can make other statements necessary.
 
@@ -525,7 +530,7 @@ mark_stmt_if_obviously_necessary (gimple *stmt, bool aggressive)
     }
 
   if ((gimple_vdef (stmt) && keep_all_vdefs_p ())
-      || stmt_may_clobber_global_p (stmt, false))
+      || stmt_may_clobber_global_p (stmt, escaped_locals_stay_visible))
     {
       mark_stmt_necessary (stmt, true);
       return;
@@ -608,6 +613,12 @@ find_obviously_necessary_stmts (bool aggressive)
   edge e;
   gimple *phi, *stmt;
   int flags;
+
+  /* A local variable dies once the function returns, which makes a store to it
+     dead unless something reads it first.  That doesn't hold for a function
+     that stays around forever since whoever got the address of the variable
+     can still look at it.  */
+  escaped_locals_stay_visible = function_may_stop_unseen_p (cfun);
 
   FOR_EACH_BB_FN (bb, cfun)
     {
