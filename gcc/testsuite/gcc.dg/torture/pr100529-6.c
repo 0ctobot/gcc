@@ -4,7 +4,7 @@
 /* { dg-additional-options "-fno-builtin-memcpy -Wno-vla" } */
 /* { dg-additional-options "-Wno-stringop-overflow" } */
 
-/* An __auto_type variable can take a variable-sized type from its initializer.
+/* An __auto_type variable can take the type declared by its own initializer.
    The initializer then runs in a statement of its own, ahead of the allocation
    of the variable, so the temporary holding its value must stay allocated until
    it has been copied into the variable.  The copy of a variable-sized object is
@@ -61,7 +61,19 @@ check (const char *p, int n)
       __builtin_abort ();
 }
 
-/* The type is declared outside of the statement expression.  */
+/* The type is declared inside of the statement expression.  */
+
+__attribute__ ((noipa)) void
+own_type (void)
+{
+  __auto_type x = ({ int m = get_size (); struct { char a[m]; } t; fill (t.a, m); t; });
+  use (&x);
+  check (x.a, get_size ());
+  if (sizeof (x) != 4096)
+    __builtin_abort ();
+}
+
+/* The type is declared outside of it.  */
 
 __attribute__ ((noipa)) void
 outer_type (void)
@@ -73,11 +85,31 @@ outer_type (void)
   check (x.a, m);
 }
 
+/* The space must still come back at the end of the block.  */
+
+__attribute__ ((noipa)) void
+in_loop (void)
+{
+  char *first = 0;
+  for (int i = 0; i < 64; i++)
+    {
+      __auto_type x = ({ int m = get_size (); struct { char a[m]; } t; fill (t.a, m); t; });
+      use (&x);
+      check (x.a, get_size ());
+      if (!first)
+	first = x.a;
+      else if (x.a != first)
+	__builtin_abort ();
+    }
+}
+
 int
 main (void)
 {
   armed = 1;
+  own_type ();
   outer_type ();
+  in_loop ();
   armed = 0;
   return 0;
 }
