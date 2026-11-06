@@ -29,6 +29,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "gimple-pretty-print.h"
 #include "fold-const.h"
 #include "gimple-iterator.h"
+#include "gimple-walk.h"
 #include "tree-cfg.h"
 #include "tree-dfa.h"
 #include "tree-cfgcleanup.h"
@@ -981,6 +982,36 @@ static hash_map<gimple *, data_reference_p> *dse_stmt_to_dr_map;
    can see.  NULL outside of pass_dse.  */
 static bitmap dse_exit_vops;
 
+/* The first statement in a block that exposes the address of a local variable,
+   by its uid. Removing the statement later on leaves the uid in place, which
+   only makes the answer conservative.  */
+
+struct dse_exposure_site
+{
+  int bb_index;
+  unsigned first_uid;
+};
+
+/* Where the address of a local variable gets exposed in the function, sorted by
+   block index. REACHABLE holds the blocks reachable by at least one edge from
+   any of those blocks, computed on the first query for the variable.  */
+
+struct dse_local_exposure
+{
+  vec<dse_exposure_site> sites;
+  bitmap reachable;
+};
+
+/* The sites of each local variable with an exposed address, filled in on the
+   first query in a function. NULL outside of pass_dse.  */
+static hash_map<tree, dse_local_exposure> *dse_exposures;
+static bool dse_exposures_scanned;
+static bitmap_obstack dse_exposure_obstack;
+
+/* Scanning for exposures and walking the CFG for each variable that gets asked
+   about stops being worthwhile on functions with more blocks than this.  */
+static const int dse_exposure_max_blocks = 10000;
+
 /* Return true if the function may never get past STMT, which means that memory
    visible outside of the function must hold everything stored before STMT even
    when STMT doesn't read it.  An exception can leave the function here, and a
@@ -1269,6 +1300,165 @@ access_may_fault_apart_from_p (tree access, tree pointer)
   return !operand_equal_p (base, pointer, 0);
 }
 
+/* Return true if STMT only uses the pointers passed to it for the duration of
+   the call, without any way for them to outlive it.  */
+
+static bool
+call_keeps_args_private_p (gimple *stmt)
+{
+  if (!gimple_call_builtin_p (stmt, BUILT_IN_NORMAL))
+    return false;
+
+  switch (DECL_FUNCTION_CODE (gimple_call_fndecl (stmt)))
+    {
+    case BUILT_IN_MEMSET:
+    case BUILT_IN_MEMSET_CHK:
+    case BUILT_IN_MEMCPY:
+    case BUILT_IN_MEMCPY_CHK:
+    case BUILT_IN_MEMMOVE:
+    case BUILT_IN_MEMMOVE_CHK:
+      /* These return their first argument.  */
+      return !gimple_call_lhs (stmt);
+    case BUILT_IN_MEMCMP:
+    case BUILT_IN_BCMP:
+      return true;
+    default:
+      return false;
+    }
+}
+
+/* Callback for walk_stmt_load_store_addr_ops: record that STMT exposes the
+   address of ADDR's base, if that's a local variable.  */
+
+static bool
+note_local_exposure (gimple *stmt, tree addr, tree, void *)
+{
+  tree base = get_base_address (addr);
+  if (!base
+      || (!VAR_P (base) && TREE_CODE (base) != PARM_DECL)
+      || is_global_var (base))
+    return false;
+
+  bool existed;
+  dse_local_exposure &exposure = dse_exposures->get_or_insert (base, &existed);
+  if (!existed)
+    {
+      exposure.sites = vNULL;
+      exposure.reachable = NULL;
+    }
+
+  int bb_index = gimple_bb (stmt)->index;
+  if (exposure.sites.is_empty () || exposure.sites.last ().bb_index != bb_index)
+    {
+      dse_exposure_site site = { bb_index, gimple_uid (stmt) };
+      exposure.sites.safe_push (site);
+    }
+  return false;
+}
+
+/* Fill in dse_exposures for FUN. An access through MEM[&decl] doesn't count as
+   an exposure since the walk reports it as a load or store. Blocks are visited
+   in index order to get each variable's sites sorted by block index, and PHIs
+   come first in a block since their uids are lower than any statement's.  */
+
+static void
+scan_local_exposures (function *fun)
+{
+  for (int i = NUM_FIXED_BLOCKS; i < last_basic_block_for_fn (fun); ++i)
+    {
+      basic_block bb = BASIC_BLOCK_FOR_FN (fun, i);
+      if (!bb)
+	continue;
+
+      for (gphi_iterator gsi = gsi_start_phis (bb); !gsi_end_p (gsi);
+	   gsi_next (&gsi))
+	if (!virtual_operand_p (gimple_phi_result (gsi.phi ())))
+	  walk_stmt_load_store_addr_ops (gsi.phi (), NULL, NULL, NULL,
+					 note_local_exposure);
+
+      for (gimple_stmt_iterator gsi = gsi_start_bb (bb); !gsi_end_p (gsi);
+	   gsi_next (&gsi))
+	{
+	  gimple *stmt = gsi_stmt (gsi);
+	  if (!is_gimple_debug (stmt) && !call_keeps_args_private_p (stmt))
+	    walk_stmt_load_store_addr_ops (stmt, NULL, NULL, NULL,
+					   note_local_exposure);
+	}
+    }
+}
+
+/* Compute the blocks reachable from the sites in EXPOSURE by at least one edge.
+   An exposing block only lands in the result when it's reached that way, as in
+   a loop, which means that a statement in it can run after the exposure no
+   matter which of the two comes first in the block.  */
+
+static void
+compute_exposure_reachable (function *fun, dse_local_exposure *exposure)
+{
+  exposure->reachable = BITMAP_ALLOC (&dse_exposure_obstack);
+
+  auto_vec<basic_block, 32> stack;
+  for (const dse_exposure_site &site : exposure->sites)
+    stack.safe_push (BASIC_BLOCK_FOR_FN (fun, site.bb_index));
+
+  while (!stack.is_empty ())
+    {
+      edge e;
+      edge_iterator ei;
+      FOR_EACH_EDGE (e, ei, stack.pop ()->succs)
+	if (e->dest != EXIT_BLOCK_PTR_FOR_FN (fun)
+	    && bitmap_set_bit (exposure->reachable, e->dest->index))
+	  stack.safe_push (e->dest);
+    }
+}
+
+/* Order exposure sites by block index.  */
+
+static bool
+exposure_site_before_p (const dse_exposure_site &a, const dse_exposure_site &b)
+{
+  return a.bb_index < b.bb_index;
+}
+
+/* Return true if a statement exposing the address of the local variable DECL
+   can execute before STMT runs, or if that's unknown.  */
+
+static bool
+local_exposed_before_stmt_p (tree decl, gimple *stmt)
+{
+  function *fun = cfun;
+  if (!dse_exposures
+      || n_basic_blocks_for_fn (fun) > dse_exposure_max_blocks
+      /* STMT was created during this pass, so its uid says nothing.  */
+      || !gimple_uid (stmt))
+    return true;
+
+  if (!dse_exposures_scanned)
+    {
+      scan_local_exposures (fun);
+      dse_exposures_scanned = true;
+    }
+
+  dse_local_exposure *exposure = dse_exposures->get (decl);
+  if (!exposure)
+    return false;
+
+  if (!exposure->reachable)
+    compute_exposure_reachable (fun, exposure);
+
+  int bb_index = gimple_bb (stmt)->index;
+  if (bitmap_bit_p (exposure->reachable, bb_index))
+    return true;
+
+  /* STMT's block isn't reachable from any exposure, so the only exposure that
+     can come first is one earlier in the same block.  */
+  dse_exposure_site key = { bb_index, 0 };
+  unsigned ix = exposure->sites.lower_bound (key, exposure_site_before_p);
+  return (ix < exposure->sites.length ()
+	  && exposure->sites[ix].bb_index == bb_index
+	  && exposure->sites[ix].first_uid <= gimple_uid (stmt));
+}
+
 /* Return true if STMT may fault on memory unrelated to REF, in which case a
    signal handler gets to see what's in REF at that point even though the
    virtual use-def chain doesn't show it.  An access through the same pointer as
@@ -1292,7 +1482,18 @@ fault_at_stmt_keeps_ref_live_p (gimple *stmt, ao_ref *ref)
        || (gimple_assign_load_p (stmt)
 	   && access_may_fault_apart_from_p (gimple_assign_rhs1 (stmt),
 					     pointer)));
-  return may_fault && ref_may_alias_global_p (ref, true);
+  if (!may_fault || !ref_may_alias_global_p (ref, true))
+    return false;
+
+  /* ref_may_alias_global_p doesn't care about where the address of a local
+     variable escapes, and a local variable whose address hasn't been exposed
+     yet when STMT faults is one that no signal handler can know about.  */
+  tree base = get_base_address (ao_ref_base (ref));
+  if (base
+      && (VAR_P (base) || TREE_CODE (base) == PARM_DECL)
+      && !is_global_var (base))
+    return local_exposed_before_stmt_p (base, stmt);
+  return true;
 }
 
 /* STMT is about to be removed, so whatever it left in memory is now up to the
@@ -2078,6 +2279,10 @@ pass_dse::execute (function *fun)
 
   calculate_dominance_info (CDI_DOMINATORS);
 
+  dse_exposures = new hash_map<tree, dse_local_exposure>;
+  dse_exposures_scanned = false;
+  bitmap_obstack_initialize (&dse_exposure_obstack);
+
   /* Dead store elimination is fundamentally a reverse program order walk.  */
   int *rpo = XNEWVEC (int, n_basic_blocks_for_fn (fun) - NUM_FIXED_BLOCKS);
   auto_bitmap exit_bbs;
@@ -2166,6 +2371,12 @@ pass_dse::execute (function *fun)
   BITMAP_FREE (need_eh_cleanup);
   BITMAP_FREE (need_ab_cleanup);
   BITMAP_FREE (dse_exit_vops);
+
+  for (auto i = dse_exposures->begin (); i != dse_exposures->end (); ++i)
+    (*i).second.sites.release ();
+  delete dse_exposures;
+  dse_exposures = NULL;
+  bitmap_obstack_release (&dse_exposure_obstack);
 
   if (released_def)
     free_numbers_of_iterations_estimates (fun);
