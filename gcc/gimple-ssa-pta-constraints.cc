@@ -55,6 +55,12 @@ using namespace pointer_analysis;
 /* Map from trees to variable infos.  */
 static hash_map<tree, varinfo_t> *vi_for_tree;
 
+/* Map from the decl of an interposable function we have a body for to its
+   function info.  A reference to the symbol can run another definition, so
+   it must not find the function info and gets a plain variable from
+   vi_for_tree instead, just like an external function does.  */
+static hash_map<tree, varinfo_t> *interposable_fn_info;
+
 /* A map mapping call statements to per-stmt variables for uses
    and clobbers specific to the call.  */
 static hash_map<gimple *, varinfo_t> *call_stmt_vars;
@@ -193,6 +199,32 @@ get_vi_for_tree (tree t)
     }
 
   return *slot;
+}
+
+/* Return true if a reference to NODE can run something other than the body NODE
+   resolves to.  A noipa symbol always reports itself as interposable to keep
+   IPA passes from using its body, even if nothing can replace it.  Calls to it
+   still get wired to its body here, so only actual replaceability counts for
+   noipa.  */
+
+static bool
+reference_can_be_interposed_p (cgraph_node *node)
+{
+  enum availability avail;
+  node->function_symbol (&avail);
+  return (avail <= AVAIL_INTERPOSABLE
+	  && (!node->noipa_on_alias_chain_p ()
+	      || !node->binds_to_current_def_p ()));
+}
+
+/* Return the function info for the body of FNDECL.  Unlike a reference to the
+   symbol, the body itself is always what the function info describes.  */
+
+static varinfo_t
+get_vi_for_fn_body (tree fndecl)
+{
+  varinfo_t *slot = interposable_fn_info->get (fndecl);
+  return slot ? *slot : get_vi_for_tree (fndecl);
 }
 
 /* Get a scalar constraint expression for a new temporary variable.  */
@@ -2017,7 +2049,7 @@ find_func_aliases_for_builtin_call (struct function *fn, gcall *t)
 	     and otherwise are just all nonlocal variables.  */
 	  if (in_ipa_mode)
 	    {
-	      fi = lookup_vi_for_tree (fn->decl);
+	      fi = get_vi_for_fn_body (fn->decl);
 	      rhs = get_function_part_constraint (fi, ~0);
 	      rhs.type = SCALAR;
 	    }
@@ -2041,7 +2073,7 @@ find_func_aliases_for_builtin_call (struct function *fn, gcall *t)
 	{
 	  fi = NULL;
 	  if (!in_ipa_mode
-	      || !(fi = get_vi_for_tree (fn->decl)))
+	      || !(fi = get_vi_for_fn_body (fn->decl)))
 	    make_constraint_from (get_varinfo (escaped_id), anything_id);
 	  else if (in_ipa_mode
 		   && fi != NULL)
@@ -2384,7 +2416,7 @@ find_func_aliases (struct function *fn, gimple *origt)
 	  struct constraint_expr *rhsp;
 	  unsigned i;
 
-	  fi = lookup_vi_for_tree (fn->decl);
+	  fi = get_vi_for_fn_body (fn->decl);
 	  lhs = get_function_part_constraint (fi, fi_result);
 	  get_constraint_for_rhs (retval, &rhsc);
 	  FOR_EACH_VEC_ELT (rhsc, i, rhsp)
@@ -2525,7 +2557,7 @@ find_func_clobbers (struct function *fn, gimple *origt)
     return;
 
   /* We'd better have function information for the current function.  */
-  fi = lookup_vi_for_tree (fn->decl);
+  fi = get_vi_for_fn_body (fn->decl);
   gcc_assert (fi != NULL);
 
   /* Account for stores in assignments and calls.  */
@@ -3156,7 +3188,10 @@ create_function_info_for (tree decl, const char *name, bool add_id,
   vi->may_have_pointers = false;
   if (is_varargs)
     vi->fullsize = ~0;
-  insert_vi_for_tree (vi->decl, vi);
+  if (reference_can_be_interposed_p (cgraph_node::get (decl)))
+    interposable_fn_info->put (decl, vi);
+  else
+    insert_vi_for_tree (vi->decl, vi);
 
   prev_vi = vi;
 
@@ -3272,7 +3307,7 @@ create_function_info_for (tree decl, const char *name, bool add_id,
       && !MAIN_NAME_P (DECL_NAME (decl)))
     {
       varinfo_t fi, rvi;
-      fi = lookup_vi_for_tree (decl);
+      fi = get_vi_for_fn_body (decl);
       rvi = first_vi_for_offset (fi, fi_result);
       if (rvi && rvi->offset == fi_result)
 	make_copy_constraint (get_varinfo (escaped_id), rvi->id);
@@ -3556,6 +3591,15 @@ create_variable_info_for_1 (tree decl, const char *name, bool add_id,
   return vi;
 }
 
+/* Return true if NODE can be referenced in ways we don't see.  Worker for
+   call_for_symbol_and_aliases.  */
+
+static bool
+has_implicit_refs (varpool_node *node, void *data ATTRIBUTE_UNUSED)
+{
+  return !node->all_refs_explicit_p ();
+}
+
 static unsigned int
 create_variable_info_for (tree decl, const char *name, bool add_id)
 {
@@ -3567,7 +3611,8 @@ create_variable_info_for (tree decl, const char *name, bool add_id)
       && (node = cgraph_node::get (decl))
       && node->ifunc_resolver)
     {
-      varinfo_t fi = get_vi_for_tree (node->get_alias_target ()->decl);
+      varinfo_t fi
+	= get_vi_for_fn_body (node->ultimate_alias_target ()->decl);
       constraint_expr rhs
 	= get_function_part_constraint (fi, fi_result);
       fi = new_var_info (NULL_TREE, "ifuncres", true);
@@ -3599,7 +3644,13 @@ create_variable_info_for (tree decl, const char *name, bool add_id)
   insert_vi_for_tree (decl, vi);
 
   if (!VAR_P (decl))
-    return id;
+    {
+      /* A call through a pointer to an external function reads its result from
+	 this variable, and that function can return anything nonlocal.  */
+      if (in_ipa_mode && TREE_CODE (decl) == FUNCTION_DECL)
+	make_copy_constraint (vi, nonlocal_id);
+      return id;
+    }
 
   /* Create initial constraints for globals.  */
   for (; vi; vi = vi_next (vi))
@@ -3633,8 +3684,14 @@ create_variable_info_for (tree decl, const char *name, bool add_id)
 	{
 	  varpool_node *vnode = varpool_node::get (decl);
 
+	  /* An externally visible alias lets other units get at a variable
+	     that isn't externally visible itself.  */
+	  bool escaped_p = (!vnode
+			    || vnode->call_for_symbol_and_aliases
+				 (has_implicit_refs, NULL, true));
+
 	  /* For escaped variables initialize them from nonlocal.  */
-	  if (!vnode || !vnode->all_refs_explicit_p ())
+	  if (escaped_p)
 	    make_copy_constraint (vi, nonlocal_id);
 
 	  /* While we can in theory walk references for the varpool
@@ -3653,7 +3710,7 @@ create_variable_info_for (tree decl, const char *name, bool add_id)
 		process_constraint (new_constraint (lhs, *rhsp));
 	      /* If this is a variable that escapes from the unit
 		 the initializer escapes as well.  */
-	      if (!vnode || !vnode->all_refs_explicit_p ())
+	      if (escaped_p)
 		{
 		  lhs.var = escaped_id;
 		  lhs.offset = 0;
@@ -3937,7 +3994,12 @@ associate_varinfo_to_alias (struct cgraph_node *node, void *data)
 	   && ! node->inlined_to))
       && node->analyzed
       && !node->ifunc_on_alias_chain_p ())
-    insert_vi_for_tree (node->decl, (varinfo_t)data);
+    {
+      /* A call through an interposable symbol can run something else, so it
+	 must get a plain variable like a call to an external function.  */
+      if (!reference_can_be_interposed_p (node))
+	insert_vi_for_tree (node->decl, (varinfo_t)data);
+    }
   return false;
 }
 
@@ -4146,6 +4208,7 @@ void
 init_constraint_builder (void)
 {
   vi_for_tree = new hash_map<tree, varinfo_t>;
+  interposable_fn_info = new hash_map<tree, varinfo_t>;
   call_stmt_vars = new hash_map<gimple *, varinfo_t>;
   gcc_obstack_init (&fake_var_decl_obstack);
 
@@ -4158,6 +4221,7 @@ void
 delete_constraint_builder (void)
 {
   delete vi_for_tree;
+  delete interposable_fn_info;
   delete call_stmt_vars;
   constraint_pool.release ();
   obstack_free (&fake_var_decl_obstack, NULL);
