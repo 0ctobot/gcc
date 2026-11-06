@@ -3267,6 +3267,42 @@ read_profile (void)
     }
 }
 
+/* Return true if the arguments and the value of the indirect call STMT can
+   be passed to and taken from FNDECL.  A stale or mismatched profile can name
+   any function as the target, and making a speculative call to one that takes
+   different kinds of arguments, then inlining it, can fail to compile (e.g. an
+   asm operand that has to be a constant) even though the call never runs.  */
+
+static bool
+afdo_target_compatible_p (gcall *stmt, tree fndecl)
+{
+  tree fntype = TREE_TYPE (fndecl);
+  tree lhs = gimple_call_lhs (stmt);
+  if (lhs
+      && (VOID_TYPE_P (TREE_TYPE (fntype))
+	  || TYPE_MODE (TREE_TYPE (lhs)) != TYPE_MODE (TREE_TYPE (fntype))))
+    return false;
+
+  if (!prototype_p (fntype))
+    return true;
+  unsigned i = 0;
+  tree t;
+  for (t = TYPE_ARG_TYPES (fntype); t && !VOID_TYPE_P (TREE_VALUE (t));
+       t = TREE_CHAIN (t), i++)
+    {
+      if (i >= gimple_call_num_args (stmt))
+	return false;
+      tree parm = TREE_VALUE (t);
+      tree arg = TREE_TYPE (gimple_call_arg (stmt, i));
+      if (POINTER_TYPE_P (parm) != POINTER_TYPE_P (arg)
+	  || INTEGRAL_TYPE_P (parm) != INTEGRAL_TYPE_P (arg)
+	  || TYPE_MODE (parm) != TYPE_MODE (arg))
+	return false;
+    }
+  /* Extra arguments are only fine for a variadic function.  */
+  return !t || i == gimple_call_num_args (stmt);
+}
+
 /* From AutoFDO profiles, find values inside STMT for that we want to measure
    histograms for indirect-call optimization.
 
@@ -3324,6 +3360,13 @@ afdo_indirect_call (gcall *stmt, const icall_target_map &map,
       if (dump_file)
 	fprintf (dump_file, "Failed to find cgraph node for %s\n",
 		 afdo_string_table->get_symbol_name (max_iter->first));
+      return false;
+    }
+  if (!afdo_target_compatible_p (stmt, direct_call->decl))
+    {
+      if (dump_file)
+	fprintf (dump_file, "Target %s doesn't match the call's arguments\n",
+		 direct_call->dump_name ());
       return false;
     }
 
