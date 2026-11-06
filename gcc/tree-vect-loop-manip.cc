@@ -2924,6 +2924,26 @@ vect_build_loop_niters (loop_vec_info loop_vinfo, bool *new_var_p)
     }
 }
 
+/* Return true if values up to BOUND are known to be representable in TYPE, the
+   type of a loop's iteration count.  The count can be as narrow as 8 bits, in
+   which case a VF of 256 doesn't fit in it.  */
+
+static bool
+vect_iter_bound_fits_type_p (tree type, poly_int64 bound)
+{
+  if (TYPE_PRECISION (type) >= HOST_BITS_PER_WIDE_INT)
+    return true;
+
+  HOST_WIDE_INT max = tree_to_shwi (TYPE_MAX_VALUE (type));
+  if (bound.is_constant ())
+    return known_le (bound, max);
+
+  /* We don't know a variable VF, but it's at most 1 << 16 lanes.  A bound made
+     up of the VF and a prolog of up to VF - 1 iterations is below 1 << 17 once
+     the constant part has been accounted for.  */
+  return TYPE_PRECISION (type) > 17 && bound.coeffs[0] <= max;
+}
+
 /* Calculate the number of iterations above which vectorized loop will be
    preferred than scalar loop.  NITERS_PROLOG is the number of iterations
    of prolog loop.  If it's integer const, the integer number is also passed
@@ -3048,7 +3068,14 @@ vect_gen_vector_loop_niters (loop_vec_info loop_vinfo, tree niters,
 	 (niters - vf) / vf + 1 by using the fact that we know ratio
 	 will be at least one.  */
       tree var_vf = build_int_cst (type, const_vf);
-      if (niters_no_overflow)
+      /* A VF that doesn't fit in the type can't be divided by.  The largest
+	 such VF that we vectorize with is one more than the largest value of
+	 the type, and vect_do_peeling only enters the vector loop with at least
+	 VF iterations.  That's then exactly VF iterations, which is one vector
+	 iteration.  */
+      if (!vect_iter_bound_fits_type_p (type, const_vf))
+	niters_vector = build_one_cst (type);
+      else if (niters_no_overflow)
 	niters_vector = fold_build2 (TRUNC_DIV_EXPR, type, ni_minus_gap,
 				     var_vf);
       else
@@ -3737,13 +3764,31 @@ vect_do_peeling (loop_vec_info loop_vinfo, tree niters, tree nitersm1,
 	 won't be vectorized.  */
       if (skip_vector)
 	{
+	  /* The iterations needed to enter the vector loop can be more than the
+	     type of the iteration count can hold, such as a prolog of up to 255
+	     iterations and an epilog of up to 255 iterations with an 8-bit count
+	     and a VF of 256.  A wrapped sum would send too few iterations to the
+	     vector loop, so do the comparison in a wider type for that case.  */
+	  tree guard_niters_prolog = niters_prolog;
+	  tree guard_nitersm1 = nitersm1;
+	  poly_int64 guard_bound = bound_prolog + bound_epilog;
+	  if (check_profitability)
+	    guard_bound = upper_bound (guard_bound, (int) th - 1);
+	  if (!vect_iter_bound_fits_type_p (type, guard_bound))
+	    {
+	      guard_niters_prolog = fold_convert (sizetype, niters_prolog);
+	      guard_nitersm1 = fold_convert (sizetype, nitersm1);
+	    }
+
 	  /* Additional epilogue iteration is peeled if gap exists.  */
-	  tree t = vect_gen_scalar_loop_niters (niters_prolog, prolog_peeling,
+	  tree t = vect_gen_scalar_loop_niters (guard_niters_prolog,
+						prolog_peeling,
 						bound_prolog, bound_epilog,
 						th, &bound_scalar,
 						check_profitability);
 	  /* Build guard against NITERSM1 since NITERS may overflow.  */
-	  guard_cond = fold_build2 (LT_EXPR, boolean_type_node, nitersm1, t);
+	  guard_cond = fold_build2 (LT_EXPR, boolean_type_node, guard_nitersm1,
+				    t);
 	  guard_bb = anchor;
 	  guard_to = split_edge (loop_preheader_edge (epilog));
 	  guard_e = slpeel_add_loop_guard (guard_bb, guard_cond,
