@@ -1687,9 +1687,10 @@ propagate_pure_const (void)
 		}
 	      else
 		{
-		  /* The resolver's flags don't describe a call through an
-		     ifunc symbol since the call runs something else.  */
-		  tree y_decl = (e->callee->ifunc_on_alias_chain_p ()
+		  /* The body's flags don't describe a call through an
+		     interposable symbol (ifunc symbols included) since the
+		     call can run something else.  */
+		  tree y_decl = (avail == AVAIL_INTERPOSABLE
 				 ? e->callee->decl : y->decl);
 
 		  if (builtin_safe_for_const_function_p (&edge_looping, y_decl))
@@ -2058,8 +2059,14 @@ propagate_malloc (void)
 	  malloc_state_e new_state = l->malloc_state;
 	  for (unsigned j = 0; j < callees.length (); j++)
 	    {
-	      cgraph_node *callee = callees[j];
-	      if (!funct_state_summaries->exists (node))
+	      /* The body's state doesn't describe a call through an
+		 interposable symbol (ifunc symbols included) since the call
+		 can run something else.  Other aliases run the body, and
+		 their own state is never computed.  */
+	      enum availability avail;
+	      cgraph_node *callee = callees[j]->function_symbol (&avail, node);
+	      if (avail == AVAIL_INTERPOSABLE
+		  || !funct_state_summaries->exists (callee))
 		{
 		  new_state = STATE_MALLOC_BOTTOM;
 		  break;
