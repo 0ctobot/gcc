@@ -426,9 +426,16 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
    tree bit_and_cst = uniform_integer_cst_p (@2);
    tree mult_cst = uniform_integer_cst_p (@3);
   }
-  /* Make sure we're working with vectors and uniform vector constants.  */
+  /* Make sure we're working with vectors and uniform vector constants, and
+     that the shift count describes a packed element we can represent.  No
+     vector element is narrower than a byte, since an integer type of fewer
+     bits still occupies QImode and would double the size of the comparison
+     vector.  The computations below also need CMP_BITS_I to be nonzero and
+     smaller than HOST_BITS_PER_WIDE_INT.  */
   (if (VECTOR_TYPE_P (type)
        && tree_fits_uhwi_p (rshift_cst)
+       && IN_RANGE (tree_to_uhwi (rshift_cst), BITS_PER_UNIT - 1,
+		    HOST_BITS_PER_WIDE_INT - 2)
        && tree_fits_uhwi_p (mult_cst)
        && tree_fits_uhwi_p (bit_and_cst))
    /* Compute what constants would be needed for this to represent a packed
@@ -451,7 +458,6 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
        target_bit_and_i = (target_bit_and_i << cmp_bits_i) | 1U;
     }
     (if ((exact_log2 (cmp_bits_i)) >= 0
-	 && cmp_bits_i < HOST_BITS_PER_WIDE_INT
 	 && multiple_p (vec_bits, cmp_bits_i)
 	 && vec_elem_bits <= HOST_BITS_PER_WIDE_INT
 	 && target_mult_i == mult_i
