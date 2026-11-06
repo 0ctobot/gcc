@@ -5813,6 +5813,10 @@ expand_bitquery (internal_fn fn, gcall *stmt)
   if (TREE_CODE (arg) == INTEGER_CST)
     {
       tree ret;
+      /* fold_const_call refuses a constant with TREE_OVERFLOW set, but the
+	 value is still perfectly good for computing the result here.  */
+      if (TREE_OVERFLOW (arg))
+	arg = drop_tree_overflow (arg);
       /* A second argument of IFN_CLZ or IFN_CTZ is the result for zero.  */
       if ((fn == IFN_CLZ || fn == IFN_CTZ) && gimple_call_num_args (stmt) == 2)
 	ret = fold_const_call (as_combined_fn (fn), TREE_TYPE (lhs), arg,

@@ -2471,6 +2471,10 @@ optimize_ops_list (enum tree_code opcode,
 	      ops->pop ();
 	      ops->pop ();
 
+	      /* Merging the constants of a type that wraps can set
+		 TREE_OVERFLOW, which has no place in the IL.  */
+	      if (TREE_OVERFLOW_P (folded))
+		folded = drop_tree_overflow (folded);
 	      add_to_ops_vec (ops, folded);
 	      reassociate_stats.constants_eliminated++;
 
