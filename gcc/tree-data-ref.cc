@@ -3353,6 +3353,180 @@ access_fn_components_comparable_p (tree ref_a, tree ref_b)
 			     TREE_TYPE (TREE_OPERAND (ref_b, 0)));
 }
 
+/* Work out what a step of STEP in the access function of a dimension says about
+   the distance between the objects of size SIZE that the dimension selects.
+   SCALE is the size of a unit of STEP, or null if STEP is in bytes.  Set
+   *ALIGNED_P if the step in bytes is a multiple of a power of 2 no smaller than
+   SIZE and set *MULTIPLE_P if it's a multiple of SIZE that can't wrap.
+
+   Addresses are modular, which is why these are separate conditions.  The first
+   one holds for any number of steps, since the reachable offsets are then all
+   multiples of that power of 2 even after wrapping.  The second one only rules
+   out partial overlap for as long as the offset doesn't wrap, which we take to
+   be 1 << 16 steps (the same limit on the number of lanes that
+   vect_lane_collision_indicator assumes).  It's what describes an ordinary walk
+   over an array of 24-byte structures.  */
+
+static void
+dr_classify_stride (tree step, tree scale, tree size,
+		    bool *aligned_p, bool *multiple_p)
+{
+  const unsigned int lanes_log2 = 16;
+  const unsigned int precision = TYPE_PRECISION (sizetype);
+
+  /* Moving by a single element of an array is never a partial overlap.  */
+  *multiple_p = scale && (integer_onep (step) || integer_minus_onep (step));
+  *aligned_p = false;
+  if ((scale && TREE_CODE (scale) != INTEGER_CST)
+      || !size
+      || !tree_fits_uhwi_p (size)
+      || integer_zerop (size))
+    return;
+
+  unsigned int size_bits = ceil_log2 (tree_to_uhwi (size));
+  wide_int scale_val = (scale
+			? wi::to_wide (fold_convert (sizetype, scale))
+			: wi::one (precision));
+  wide_int size_val = wi::to_wide (fold_convert (sizetype, size));
+
+  if (TREE_CODE (step) == INTEGER_CST)
+    {
+      wide_int stride = wi::to_wide (fold_convert (sizetype, step)) * scale_val;
+      if (wi::eq_p (stride, 0))
+	{
+	  *aligned_p = *multiple_p = true;
+	  return;
+	}
+      *aligned_p = (unsigned int) wi::ctz (stride) >= size_bits;
+      wide_int mag = wi::abs (stride);
+      *multiple_p |= (wi::multiple_of_p (mag, size_val, UNSIGNED)
+		      && (wi::min_precision (mag, UNSIGNED) + lanes_log2 + 2
+			  <= precision));
+      return;
+    }
+
+  /* The scale is known, so its low zero bits just add to those of the step.  */
+  *aligned_p = tree_ctz (step) + wi::ctz (scale_val) >= size_bits;
+
+  if (!flag_wrapv_pointer)
+    {
+      /* An array index scaled by the size of its element can't wrap, and
+	 neither can a pointer step formed by multiplying.  */
+      *multiple_p = (scale
+		     || multiple_of_p (sizetype, step, size, true));
+      return;
+    }
+
+  /* Addresses are allowed to wrap, but the step is often a narrow variable
+     scaled by a constant, which bounds it well below the point of wrapping.  */
+  tree value = step;
+  STRIP_NOPS (value);
+  if (TREE_CODE (value) == MULT_EXPR
+      && TREE_CODE (TREE_OPERAND (value, 1)) == INTEGER_CST)
+    {
+      scale_val *= wi::to_wide (fold_convert (sizetype,
+					      TREE_OPERAND (value, 1)));
+      value = TREE_OPERAND (value, 0);
+    }
+  unsigned int value_bits = TYPE_PRECISION (TREE_TYPE (value));
+  if (CONVERT_EXPR_P (value)
+      && INTEGRAL_TYPE_P (TREE_TYPE (TREE_OPERAND (value, 0))))
+    value_bits = MIN (value_bits,
+		      TYPE_PRECISION (TREE_TYPE (TREE_OPERAND (value, 0))));
+  wide_int mag = wi::abs (scale_val);
+  *multiple_p = (wi::multiple_of_p (mag, size_val, UNSIGNED)
+		 && (value_bits + wi::min_precision (mag, UNSIGNED) + lanes_log2
+		     < precision));
+}
+
+/* Return true if the objects that the access functions in ACCESS_FNS select at
+   each dimension from FIRST outwards are either the same or fully disjoint, for
+   the reference REF.  UNCONSTRAINED_BASE says whether the last dimension is the
+   evolution of the pointer in BASE_OBJECT.  */
+
+static bool
+dr_outer_objects_disjoint_p (tree ref, const vec<tree> &access_fns,
+			     unsigned int first, bool unconstrained_base,
+			     tree base_object)
+{
+  /* Walk the references in the order that dr_analyze_indices created the
+     dimensions, in which REALPART_EXPR and IMAGPART_EXPR have one too.  */
+  for (unsigned int i = 0; i < access_fns.length (); ++i)
+    {
+      tree scale = NULL_TREE, size = NULL_TREE;
+      bool strided = true;
+      if (unconstrained_base && i + 1 == access_fns.length ())
+	size = TYPE_SIZE_UNIT (TREE_TYPE (base_object));
+      else if (TREE_CODE (ref) == ARRAY_REF)
+	scale = size = array_ref_element_size (ref);
+      else
+	strided = false;
+      if (handled_component_p (ref))
+	ref = TREE_OPERAND (ref, 0);
+      if (i < first || !strided)
+	continue;
+
+      tree fn = access_fns[i];
+      if (chrec_contains_undetermined (fn))
+	return false;
+      bool all_aligned = true, all_multiple = true;
+      for (; TREE_CODE (fn) == POLYNOMIAL_CHREC; fn = CHREC_LEFT (fn))
+	{
+	  tree step = CHREC_RIGHT (fn);
+	  if (tree_contains_chrecs (step, NULL))
+	    return false;
+	  bool aligned, multiple;
+	  dr_classify_stride (step, scale, size, &aligned, &multiple);
+	  all_aligned &= aligned;
+	  all_multiple &= multiple;
+	}
+      if (tree_contains_chrecs (fn, NULL)
+	  || !(all_aligned || all_multiple))
+	return false;
+    }
+  return true;
+}
+
+/* An access function describes which subobject of an enclosing object gets
+   used, and differing values for a dimension are taken as proof of independence
+   provided that the enclosing objects either coincide or are fully disjoint.
+   Return true if that holds for A and B, which share LENGTH dimensions starting
+   at START_A in A and START_B in B.
+
+   That proof is only needed for what's outside of the innermost dimension whose
+   access functions differ.  It doesn't follow from the types when strict
+   aliasing isn't in effect, since a stride smaller than the object then just
+   makes the objects of different iterations overlap, or when pointers can wrap,
+   since a stride of sizeof (struct) * K can wrap around to any smaller
+   value.  */
+
+static bool
+dr_access_fns_separate_p (struct data_reference *a, struct data_reference *b,
+			  struct indices *indices_a, struct indices *indices_b,
+			  unsigned int start_a, unsigned int start_b,
+			  unsigned int length)
+{
+  if (flag_strict_aliasing && !flag_wrapv_pointer)
+    return true;
+
+  unsigned int i;
+  for (i = 0; i < length; ++i)
+    if (!eq_evolutions_p (indices_a->access_fns[start_a + i],
+			  indices_b->access_fns[start_b + i]))
+      break;
+  if (i == length)
+    return true;
+
+  return (dr_outer_objects_disjoint_p (DR_REF (a), indices_a->access_fns,
+				       start_a + i + 1,
+				       indices_a->unconstrained_base,
+				       indices_a->base_object)
+	  && dr_outer_objects_disjoint_p (DR_REF (b), indices_b->access_fns,
+					  start_b + i + 1,
+					  indices_b->unconstrained_base,
+					  indices_b->base_object));
+}
+
 /* Initialize a data dependence relation RES in LOOP_NEST.  USE_ALT_INDICES
    is true when the main indices of A and B were not comparable so we try again
    with alternate indices computed on an indirect reference.  */
@@ -3609,6 +3783,15 @@ initialize_data_dependence_relation (struct data_dependence_relation *res,
     }
   else
     full_seq = struct_seq;
+
+  /* Stop relying on the access functions if the enclosing objects could
+     partially overlap, so that the dependence comes from the addresses.  */
+  if (same_base_p
+      && !use_alt_indices
+      && !dr_access_fns_separate_p (a, b, indices_a, indices_b,
+				    full_seq.start_a, full_seq.start_b,
+				    full_seq.length))
+    full_seq.length = 0;
 
   /* Punt if we didn't find a suitable sequence.  */
   if (full_seq.length == 0)
