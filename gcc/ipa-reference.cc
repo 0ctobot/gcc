@@ -708,9 +708,10 @@ get_read_write_all_from_node (struct cgraph_node *node,
       if (avail <= AVAIL_INTERPOSABLE
 	  || (callee->analyzed && !opt_for_fn (callee->decl,
 					       flag_ipa_reference)))
-	/* The resolver's flags don't describe a call through an ifunc symbol
-	   since the call runs something else.  */
-	read_write_all_from_decl (e->callee->ifunc_on_alias_chain_p ()
+	/* The body's flags don't describe a call through an interposable
+	   symbol (ifunc symbols included) since the call can run something
+	   else.  */
+	read_write_all_from_decl (avail == AVAIL_INTERPOSABLE
 				  ? e->callee : callee, read_all, write_all);
     }
 
