@@ -2787,12 +2787,10 @@ ipa_compute_jump_functions_for_bb (struct ipa_func_body_info *fbi, basic_block b
 /* If REF is a memory access that loads a function pointer (but not a method
    pointer) from a RECORD_TYPE, return true and store the type of the RECORD to
    *REC_TYPE and the byte offset of the field to *FLD_OFFSET.  Otherwise return
-   false.  OHS es the "other hand side" which is used to check type
-   compatibility with field in question, when possible.  */
+   false.  */
 
 static bool
-is_func_ptr_from_record (tree ref, tree *rec_type, unsigned *fld_offset,
-			 tree ohs)
+is_func_ptr_from_record (tree ref, tree *rec_type, unsigned *fld_offset)
 {
   if (!POINTER_TYPE_P (TREE_TYPE (ref))
       || TREE_CODE (TREE_TYPE (TREE_TYPE (ref))) != FUNCTION_TYPE)
@@ -2801,15 +2799,6 @@ is_func_ptr_from_record (tree ref, tree *rec_type, unsigned *fld_offset,
   if (TREE_CODE (ref) == COMPONENT_REF
       && TREE_CODE (TREE_TYPE (TREE_OPERAND (ref, 0))) == RECORD_TYPE)
     {
-      gcc_assert (POINTER_TYPE_P (TREE_TYPE (ohs)));
-      ohs = TREE_TYPE (TREE_TYPE (ohs));
-      tree ftype = TREE_TYPE (TREE_OPERAND (ref, 1));
-      if (!POINTER_TYPE_P (ftype))
-	return false;
-      ftype = TREE_TYPE (ftype);
-      if (!types_compatible_p (ohs, ftype))
-	return false;
-
       tree tree_off = bit_position (TREE_OPERAND (ref, 1));
       if (!tree_fits_shwi_p (tree_off))
 	return false;
@@ -2836,6 +2825,34 @@ is_func_ptr_from_record (tree ref, tree *rec_type, unsigned *fld_offset,
       *fld_offset = unit_offset;
       return true;
     }
+  return false;
+}
+
+/* Return true if function type FNTYPE is the type that the function pointer
+   FLD_OFFSET bytes into record REC_TYPE points to.
+
+   A store of a function and a call through a loaded pointer can be in different
+   translation units, and the call statement's type isn't available when the
+   speculative call is generated.  Requiring each of them to match the field
+   makes the target's signature match the call's without needing to compare the
+   two.  A type without a prototype doesn't say how many arguments there are, so
+   it can't match.  */
+
+static bool
+fntype_matches_record_field_p (tree fntype, tree rec_type, unsigned fld_offset)
+{
+  if (!prototype_p (fntype))
+    return false;
+
+  for (tree fld = TYPE_FIELDS (rec_type); fld; fld = DECL_CHAIN (fld))
+    if (TREE_CODE (fld) == FIELD_DECL
+	&& POINTER_TYPE_P (TREE_TYPE (fld))
+	&& TREE_CODE (TREE_TYPE (TREE_TYPE (fld))) == FUNCTION_TYPE
+	&& tree_fits_shwi_p (bit_position (fld))
+	&& (int_bit_position (fld)
+	    == (HOST_WIDE_INT) fld_offset * BITS_PER_UNIT))
+      return (prototype_p (TREE_TYPE (TREE_TYPE (fld)))
+	      && types_compatible_p (fntype, TREE_TYPE (TREE_TYPE (fld))));
   return false;
 }
 
@@ -3017,8 +3034,9 @@ ipa_analyze_indirect_call_uses (struct ipa_func_body_info *fbi, gcall *call,
 	as_a <cgraph_simple_indirect_info *> (cs->indirect_info);
       tree rectype;
       unsigned fldoff;
-      if (is_func_ptr_from_record (gimple_assign_rhs1 (def), &rectype, &fldoff,
-				   target))
+      if (is_func_ptr_from_record (gimple_assign_rhs1 (def), &rectype, &fldoff)
+	  && fntype_matches_record_field_p (gimple_call_fntype (call), rectype,
+					    fldoff))
 	{
 	  sii->fnptr_loaded_from_record = 1;
 	  sii->fld_offset = fldoff;
@@ -3299,6 +3317,10 @@ note_fnptr_in_record (tree rec_type, unsigned fld_offset, tree fn)
 {
   gcc_assert (TREE_CODE (fn) == FUNCTION_DECL);
   gcc_assert (TREE_CODE (rec_type) == RECORD_TYPE);
+  /* Storing a function with a different signature through a cast leaves the
+     field without a target that can be called directly.  */
+  if (!fntype_matches_record_field_p (TREE_TYPE (fn), rec_type, fld_offset))
+    fn = NULL_TREE;
   if (!noted_fnptrs_in_records)
     noted_fnptrs_in_records = hash_table<noted_fnptr_hasher>::create_ggc (37);
 
@@ -3411,7 +3433,7 @@ ipa_analyze_stmt_uses (struct ipa_func_body_info *fbi, gimple *stmt)
       tree rec_type;
       unsigned fld_offset;
       if (is_func_ptr_from_record (gimple_assign_lhs (stmt), &rec_type,
-				   &fld_offset, gimple_assign_rhs1 (stmt)))
+				   &fld_offset))
 	note_fnptr_in_record (rec_type, fld_offset,
 			      TREE_OPERAND (gimple_assign_rhs1 (stmt), 0));
     }
