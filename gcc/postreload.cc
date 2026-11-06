@@ -2021,6 +2021,26 @@ move2add_use_add3_insn (scalar_int_mode mode, rtx reg, rtx sym, rtx off,
   return changed;
 }
 
+/* Record the stores that INSN performs other than SET, which is INSN's single
+   set.  This is for the paths in reload_cse_move2add that handle SET themselves
+   and bypass reload_cse_move2add_invalidate.  Calling that here isn't an option
+   because it would also record SET, while these paths still need the value that
+   SET's destination held before INSN.  A PARALLEL can have other stores next to
+   its single set, such as a CLOBBER of a scratch register.  */
+
+static void
+move2add_note_other_stores (rtx_insn *insn, const_rtx set)
+{
+  rtx pat = PATTERN (insn);
+
+  if (GET_CODE (pat) != PARALLEL)
+    return;
+
+  for (int i = 0; i < XVECLEN (pat, 0); i++)
+    if (XVECEXP (pat, 0, i) != set)
+      note_pattern_stores (XVECEXP (pat, 0, i), move2add_note_store, insn);
+}
+
 /* Perform any invalidations necessary for INSN.  */
 
 static void
@@ -2163,6 +2183,7 @@ reload_cse_move2add (rtx_insn *first)
 		  && reg_base_reg[regno] < 0
 		  && reg_symbol_ref[regno] == NULL_RTX)
 		{
+		  move2add_note_other_stores (insn, set);
 		  changed |= move2add_use_add2_insn (mode, reg, NULL_RTX,
 						     src, insn);
 		  continue;
@@ -2234,6 +2255,10 @@ reload_cse_move2add (rtx_insn *first)
 			}
 		      if (success)
 			delete_insn (insn);
+		      else
+			/* Only NEXT gets invalidated below, so INSN's other
+			   stores need to be recorded here.  */
+			move2add_note_other_stores (insn, single_set (insn));
 		      changed |= success;
 		      insn = next;
 		      /* Make sure to perform any invalidations related to
@@ -2278,6 +2303,8 @@ reload_cse_move2add (rtx_insn *first)
 		  sym = XEXP (XEXP (src, 0), 0);
 		  off = XEXP (XEXP (src, 0), 1);
 		}
+
+	      move2add_note_other_stores (insn, set);
 
 	      /* If the reg already contains the value which is sum of
 		 sym and some constant value, we can use an add2 insn.  */
