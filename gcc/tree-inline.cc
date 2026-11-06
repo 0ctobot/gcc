@@ -3531,7 +3531,12 @@ force_value_to_type (tree type, tree value)
 {
   /* If we can match up types by promotion/demotion do so.  */
   if (fold_convertible_p (type, value))
-    return fold_convert (type, value);
+    {
+      /* A narrowing conversion to a signed type can set TREE_OVERFLOW, which
+	 has no place in the IL.  */
+      tree res = fold_convert (type, value);
+      return TREE_OVERFLOW_P (res) ? drop_tree_overflow (res) : res;
+    }
 
   /* ???  For valid programs we should not end up here.
      Still if we end up with truly mismatched types here, fall back

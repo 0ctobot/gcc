@@ -200,7 +200,7 @@ tree
 canonicalize_constructor_val (tree cval, tree from_decl)
 {
   if (CONSTANT_CLASS_P (cval))
-    return cval;
+    return TREE_OVERFLOW (cval) ? drop_tree_overflow (cval) : cval;
 
   tree orig_cval = cval;
   STRIP_NOPS (cval);
