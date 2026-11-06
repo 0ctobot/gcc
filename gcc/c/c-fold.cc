@@ -129,6 +129,31 @@ c_fully_fold (tree expr, bool in_init, bool *maybe_const, bool lval)
   return ret;
 }
 
+/* Return EXPR with its operands replaced by the folded operands OP0, OP1 and
+   OP2, of which OP1 and OP2 are NULL_TREE if EXPR doesn't have them.  This is
+   for an expression that isn't folded because it isn't an integer constant
+   expression.  Its original operands cannot stay since they can contain a
+   nested C_MAYBE_CONST_EXPR, which the gimplifier cannot handle.  Copying EXPR
+   rather than building a new node preserves its flags.  */
+
+static tree
+replace_folded_operands (tree expr, tree op0, tree op1 = NULL_TREE,
+			 tree op2 = NULL_TREE)
+{
+  if (op0 == TREE_OPERAND (expr, 0)
+      && (!op1 || op1 == TREE_OPERAND (expr, 1))
+      && (!op2 || op2 == TREE_OPERAND (expr, 2)))
+    return expr;
+
+  tree ret = copy_node (expr);
+  TREE_OPERAND (ret, 0) = op0;
+  if (op1)
+    TREE_OPERAND (ret, 1) = op1;
+  if (op2)
+    TREE_OPERAND (ret, 2) = op2;
+  return ret;
+}
+
 /* Internal helper for c_fully_fold.  EXPR and IN_INIT are as for
    c_fully_fold.  *MAYBE_CONST_OPERANDS is cleared because of operands
    not permitted, while *MAYBE_CONST_ITSELF is cleared because of
@@ -137,7 +162,8 @@ c_fully_fold (tree expr, bool in_init, bool *maybe_const, bool lval)
    *MAYBE_CONST_ITSELF is carried from only evaluated
    subexpressions).  FOR_INT_CONST indicates if EXPR is an expression
    with integer constant operands, and if any of the operands doesn't
-   get folded to an integer constant, don't fold the expression itself.
+   get folded to an integer constant, don't fold the expression itself
+   and only replace its operands with the folded ones.
    LVAL indicates folding of lvalue, where we can't replace it with
    an rvalue.  */
 
@@ -365,7 +391,10 @@ c_fully_fold_internal (tree expr, bool in_init, bool *maybe_const_operands,
 
       if (for_int_const && (TREE_CODE (op0) != INTEGER_CST
 			    || TREE_CODE (op1) != INTEGER_CST))
-	goto out;
+	{
+	  ret = replace_folded_operands (expr, op0, op1);
+	  goto out;
+	}
 
       if (TREE_CODE_CLASS (code) == tcc_comparison
 	  && TREE_CODE (TREE_TYPE (op0)) == NULLPTR_TYPE
@@ -505,7 +534,10 @@ c_fully_fold_internal (tree expr, bool in_init, bool *maybe_const_operands,
       STRIP_TYPE_NOPS (op0);
 
       if (for_int_const && TREE_CODE (op0) != INTEGER_CST)
-	goto out;
+	{
+	  ret = replace_folded_operands (expr, op0);
+	  goto out;
+	}
 
       /* ??? Cope with user tricks that amount to offsetof.  The middle-end is
 	 not prepared to deal with them if they occur in initializers.  */
@@ -568,7 +600,10 @@ c_fully_fold_internal (tree expr, bool in_init, bool *maybe_const_operands,
 	  && (TREE_CODE (op0) != INTEGER_CST
 	      /* Require OP1 be an INTEGER_CST only if it's evaluated.  */
 	      || (!unused_p && TREE_CODE (op1) != INTEGER_CST)))
-	goto out;
+	{
+	  ret = replace_folded_operands (expr, op0, op1);
+	  goto out;
+	}
 
       if (op0 != orig_op0 || op1 != orig_op1 || in_init)
 	ret = in_init
@@ -619,7 +654,10 @@ c_fully_fold_internal (tree expr, bool in_init, bool *maybe_const_operands,
 	      || (op0 == truthvalue_true_node
 		  ? TREE_CODE (op1) != INTEGER_CST
 		  : TREE_CODE (op2) != INTEGER_CST)))
-	goto out;
+	{
+	  ret = replace_folded_operands (expr, op0, op1, op2);
+	  goto out;
+	}
 
       if (op0 != orig_op0 || op1 != orig_op1 || op2 != orig_op2)
 	ret = fold_build3_loc (loc, code, TREE_TYPE (expr), op0, op1, op2);
