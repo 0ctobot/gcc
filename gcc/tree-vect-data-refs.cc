@@ -58,6 +58,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "internal-fn.h"
 #include "gimple-fold.h"
 #include "optabs-query.h"
+#include "tree-ssa-dse.h"
 
 /* Return true if load- or store-lanes optab OPTAB is implemented for
    COUNT vectors of type VECTYPE.  NAME is the name of OPTAB.
@@ -1114,6 +1115,14 @@ vect_slp_analyze_store_dependences (vec_info *vinfo, slp_tree node)
 	   gsi_stmt (gsi) != last_access_info->stmt; gsi_next (&gsi))
 	{
 	  gimple *stmt = gsi_stmt (gsi);
+
+	  /* Memory visible outside of the function has to hold the store
+	     when the function never gets past STMT, whatever STMT does to
+	     memory.  */
+	  if (stmt_may_end_function_p (cfun, stmt)
+	      && ref_may_alias_global_p (DR_REF (dr_a), true))
+	    return false;
+
 	  if (! gimple_vuse (stmt))
 	    continue;
 
