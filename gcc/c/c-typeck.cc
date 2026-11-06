@@ -11489,6 +11489,13 @@ pop_init_level (location_t loc, int implicit,
     {
       if (constructor_erroneous)
 	ret.value = error_mark_node;
+      /* A union level that still holds a whole initializer in its null-index
+	 element only saw initializers for empty members, which left the value
+	 intact.  Pass the value out since a null index can't reach gimple.  */
+      else if (TREE_CODE (constructor_type) == UNION_TYPE
+	       && vec_safe_length (constructor_elements) == 1
+	       && !(*constructor_elements)[0].index)
+	ret.value = (*constructor_elements)[0].value;
       else
 	{
 	  ret.value = build_constructor (constructor_type,
@@ -12706,6 +12713,21 @@ output_init_element (location_t loc, tree value, tree origtype,
 			  "initialized field overwritten");
 	}
       elt->value = value;
+      return;
+    }
+  else if (TREE_CODE (constructor_type) == UNION_TYPE
+	   && !vec_safe_is_empty (constructor_elements)
+	   && !constructor_elements->last ().index
+	   && field
+	   && COMPLETE_TYPE_P (TREE_TYPE (field))
+	   && integer_zerop (TYPE_SIZE (TREE_TYPE (field))))
+    {
+      /* An empty member holds no bytes, so initializing it overrides nothing
+	 in a whole initializer still waiting for a member to replace it.  Only
+	 its side effects need to be kept.  */
+      tree &whole = constructor_elements->last ().value;
+      if (TREE_SIDE_EFFECTS (value))
+	whole = build2 (COMPOUND_EXPR, TREE_TYPE (whole), value, whole);
       return;
     }
   else if (TREE_CODE (constructor_type) == UNION_TYPE
