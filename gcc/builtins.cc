@@ -220,6 +220,37 @@ called_as_built_in (tree node)
   return is_builtin_name (name);
 }
 
+/* Return true if DECL is the decl builtin_decl_explicit returns for its
+   function code.  The middle end emits its own calls to this decl, so it must
+   keep describing the real library function.  */
+
+bool
+explicit_builtin_decl_p (const_tree decl)
+{
+  return (fndecl_built_in_p (decl, BUILT_IN_NORMAL)
+	  && decl == builtin_decl_explicit (DECL_FUNCTION_CODE (decl)));
+}
+
+/* Return true if a call to builtin FNDECL through function type FNTYPE can't
+   return even though the builtin itself does.  The noreturn can come from a
+   redeclaration, from a cast of the function's address, or from IPA finding
+   that a definition in this translation unit never returns.
+
+   Folding or expanding such a call as the builtin replaces it with code that
+   carries on past the call, but nothing follows a noreturn call in the CFG.
+   The call has to be treated as a call to an ordinary function instead.  */
+
+bool
+noreturn_call_of_returning_builtin_p (const_tree fndecl, const_tree fntype)
+{
+  if (DECL_BUILT_IN_CLASS (fndecl) != BUILT_IN_NORMAL)
+    return false;
+  if (!TREE_THIS_VOLATILE (fndecl) && !TREE_THIS_VOLATILE (fntype))
+    return false;
+  tree decl = builtin_decl_explicit (DECL_FUNCTION_CODE (fndecl));
+  return decl && !TREE_THIS_VOLATILE (decl);
+}
+
 /* Compute values M and N such that M divides (address of EXP - N) and such
    that N < M.  If these numbers can be determined, store M in alignp and N in
    *BITPOSP and return true.  Otherwise return false and store BITS_PER_UNIT to
@@ -7876,6 +7907,10 @@ expand_builtin (tree exp, rtx target, rtx subtarget, machine_mode mode,
   if (DECL_BUILT_IN_CLASS (fndecl) == BUILT_IN_MD)
     return targetm.expand_builtin (exp, target, subtarget, mode, ignore);
 
+  tree callee_type = TREE_TYPE (TREE_TYPE (CALL_EXPR_FN (exp)));
+  if (noreturn_call_of_returning_builtin_p (fndecl, callee_type))
+    return expand_call (exp, target, ignore);
+
   /* When ASan is enabled, we don't want to expand some memory/string
      builtins and rely on libsanitizer's hooks.  This allows us to avoid
      redundant checks and be sure, that possible overflow will be detected
@@ -11271,7 +11306,9 @@ fold_call_expr (location_t loc, tree exp, bool ignore)
       /* If CALL_EXPR_VA_ARG_PACK is set, the arguments aren't finalized
 	 yet.  Defer folding until we see all the arguments
 	 (after inlining).  */
-      && !CALL_EXPR_VA_ARG_PACK (exp))
+      && !CALL_EXPR_VA_ARG_PACK (exp)
+      && !noreturn_call_of_returning_builtin_p
+	    (fndecl, TREE_TYPE (TREE_TYPE (CALL_EXPR_FN (exp)))))
     {
       int nargs = call_expr_nargs (exp);
 

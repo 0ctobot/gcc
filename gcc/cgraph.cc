@@ -36,6 +36,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "alloc-pool.h"
 #include "gimple-ssa.h"
 #include "cgraph.h"
+#include "builtins.h"
 #include "lto-streamer.h"
 #include "fold-const.h"
 #include "varasm.h"
@@ -3170,7 +3171,11 @@ cgraph_node::add_detected_attribute (const char *attr)
 static void
 set_noreturn_flag_1 (cgraph_node *node, bool noreturn_p, bool *changed)
 {
-  if (noreturn_p && !TREE_THIS_VOLATILE (node->decl))
+  /* A definition of __builtin_foo can't change the decl the middle end uses
+     for its own calls to the library function.  */
+  if (noreturn_p
+      && !TREE_THIS_VOLATILE (node->decl)
+      && !explicit_builtin_decl_p (node->decl))
     {
       TREE_THIS_VOLATILE (node->decl) = true;
       *changed = true;
