@@ -3036,6 +3036,20 @@ record_targets_from_bases (tree otr_type,
     }
 }
 
+/* NODE is about to become an inline clone, which can't be the target of an
+   indirect call.  Flush the cache if it holds NODE.  The removal hook above
+   doesn't cover this since the node stays in the symbol table.  A non-virtual
+   node reaches the cache when a virtual method is an ICF alias of it, and
+   once that alias is gone nothing stops the inliner from reusing the node.  */
+
+void
+polymorphic_call_target_inlined (cgraph_node *node)
+{
+  if (cached_polymorphic_call_targets
+      && cached_polymorphic_call_targets->contains (node))
+    free_polymorphic_call_targets_hash ();
+}
+
 /* When virtual table is removed, we may need to flush the cache.  */
 
 static void

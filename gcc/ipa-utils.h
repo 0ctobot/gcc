@@ -72,6 +72,7 @@ typedef odr_type_d *odr_type;
 extern bool thunk_expansion;
 void build_type_inheritance_graph (void);
 void rebuild_type_inheritance_graph (void);
+void polymorphic_call_target_inlined (cgraph_node *);
 void update_type_inheritance_graph (void);
 vec <cgraph_node *>
 possible_polymorphic_call_targets (tree, HOST_WIDE_INT,
