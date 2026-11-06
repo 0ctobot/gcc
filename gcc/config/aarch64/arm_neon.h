@@ -11435,6 +11435,11 @@ vmlaq_f64 (float64x2_t __a, float64x2_t __b, float64x2_t __c)
   return __builtin_aarch64_float_mlav2df (__a, __b, __c);
 }
 
+/* ACLE defines the signed integer arithmetic intrinsics to wrap on overflow,
+   but C operators on signed types have undefined overflow.  So the signed
+   intrinsics below do their arithmetic in the unsigned type of the same width
+   and cast the result back.  */
+
 /* vmla_lane  */
 
 __extension__ extern __inline float32x2_t
@@ -11450,7 +11455,9 @@ __attribute__ ((__always_inline__, __gnu_inline__, __artificial__))
 vmla_lane_s16 (int16x4_t __a, int16x4_t __b,
 		int16x4_t __c, const int __lane)
 {
-  return (__a + (__b * __aarch64_vget_lane_any (__c, __lane)));
+  return (int16x4_t) ((uint16x4_t) __a
+		      + ((uint16x4_t) __b
+			 * (uint16_t) __aarch64_vget_lane_any (__c, __lane)));
 }
 
 __extension__ extern __inline int32x2_t
@@ -11458,7 +11465,9 @@ __attribute__ ((__always_inline__, __gnu_inline__, __artificial__))
 vmla_lane_s32 (int32x2_t __a, int32x2_t __b,
 		int32x2_t __c, const int __lane)
 {
-  return (__a + (__b * __aarch64_vget_lane_any (__c, __lane)));
+  return (int32x2_t) ((uint32x2_t) __a
+		      + ((uint32x2_t) __b
+			 * (uint32_t) __aarch64_vget_lane_any (__c, __lane)));
 }
 
 __extension__ extern __inline uint16x4_t
@@ -11492,7 +11501,9 @@ __attribute__ ((__always_inline__, __gnu_inline__, __artificial__))
 vmla_laneq_s16 (int16x4_t __a, int16x4_t __b,
 		int16x8_t __c, const int __lane)
 {
-  return (__a + (__b * __aarch64_vget_lane_any (__c, __lane)));
+  return (int16x4_t) ((uint16x4_t) __a
+		      + ((uint16x4_t) __b
+			 * (uint16_t) __aarch64_vget_lane_any (__c, __lane)));
 }
 
 __extension__ extern __inline int32x2_t
@@ -11500,7 +11511,9 @@ __attribute__ ((__always_inline__, __gnu_inline__, __artificial__))
 vmla_laneq_s32 (int32x2_t __a, int32x2_t __b,
 		int32x4_t __c, const int __lane)
 {
-  return (__a + (__b * __aarch64_vget_lane_any (__c, __lane)));
+  return (int32x2_t) ((uint32x2_t) __a
+		      + ((uint32x2_t) __b
+			 * (uint32_t) __aarch64_vget_lane_any (__c, __lane)));
 }
 
 __extension__ extern __inline uint16x4_t
@@ -11534,7 +11547,9 @@ __attribute__ ((__always_inline__, __gnu_inline__, __artificial__))
 vmlaq_lane_s16 (int16x8_t __a, int16x8_t __b,
 		int16x4_t __c, const int __lane)
 {
-  return (__a + (__b * __aarch64_vget_lane_any (__c, __lane)));
+  return (int16x8_t) ((uint16x8_t) __a
+		      + ((uint16x8_t) __b
+			 * (uint16_t) __aarch64_vget_lane_any (__c, __lane)));
 }
 
 __extension__ extern __inline int32x4_t
@@ -11542,7 +11557,9 @@ __attribute__ ((__always_inline__, __gnu_inline__, __artificial__))
 vmlaq_lane_s32 (int32x4_t __a, int32x4_t __b,
 		int32x2_t __c, const int __lane)
 {
-  return (__a + (__b * __aarch64_vget_lane_any (__c, __lane)));
+  return (int32x4_t) ((uint32x4_t) __a
+		      + ((uint32x4_t) __b
+			 * (uint32_t) __aarch64_vget_lane_any (__c, __lane)));
 }
 
 __extension__ extern __inline uint16x8_t
@@ -11576,7 +11593,9 @@ __attribute__ ((__always_inline__, __gnu_inline__, __artificial__))
 vmlaq_laneq_s16 (int16x8_t __a, int16x8_t __b,
 		int16x8_t __c, const int __lane)
 {
-  return (__a + (__b * __aarch64_vget_lane_any (__c, __lane)));
+  return (int16x8_t) ((uint16x8_t) __a
+		      + ((uint16x8_t) __b
+			 * (uint16_t) __aarch64_vget_lane_any (__c, __lane)));
 }
 
 __extension__ extern __inline int32x4_t
@@ -11584,7 +11603,9 @@ __attribute__ ((__always_inline__, __gnu_inline__, __artificial__))
 vmlaq_laneq_s32 (int32x4_t __a, int32x4_t __b,
 		int32x4_t __c, const int __lane)
 {
-  return (__a + (__b * __aarch64_vget_lane_any (__c, __lane)));
+  return (int32x4_t) ((uint32x4_t) __a
+		      + ((uint32x4_t) __b
+			 * (uint32_t) __aarch64_vget_lane_any (__c, __lane)));
 }
 
 __extension__ extern __inline uint16x8_t
@@ -11648,7 +11669,9 @@ __attribute__ ((__always_inline__, __gnu_inline__, __artificial__))
 vmls_lane_s16 (int16x4_t __a, int16x4_t __b,
 		int16x4_t __c, const int __lane)
 {
-  return (__a - (__b * __aarch64_vget_lane_any (__c, __lane)));
+  return (int16x4_t) ((uint16x4_t) __a
+		      - ((uint16x4_t) __b
+			 * (uint16_t) __aarch64_vget_lane_any (__c, __lane)));
 }
 
 __extension__ extern __inline int32x2_t
@@ -11656,7 +11679,9 @@ __attribute__ ((__always_inline__, __gnu_inline__, __artificial__))
 vmls_lane_s32 (int32x2_t __a, int32x2_t __b,
 		int32x2_t __c, const int __lane)
 {
-  return (__a - (__b * __aarch64_vget_lane_any (__c, __lane)));
+  return (int32x2_t) ((uint32x2_t) __a
+		      - ((uint32x2_t) __b
+			 * (uint32_t) __aarch64_vget_lane_any (__c, __lane)));
 }
 
 __extension__ extern __inline uint16x4_t
@@ -11690,7 +11715,9 @@ __attribute__ ((__always_inline__, __gnu_inline__, __artificial__))
 vmls_laneq_s16 (int16x4_t __a, int16x4_t __b,
 		int16x8_t __c, const int __lane)
 {
-  return (__a - (__b * __aarch64_vget_lane_any (__c, __lane)));
+  return (int16x4_t) ((uint16x4_t) __a
+		      - ((uint16x4_t) __b
+			 * (uint16_t) __aarch64_vget_lane_any (__c, __lane)));
 }
 
 __extension__ extern __inline int32x2_t
@@ -11698,7 +11725,9 @@ __attribute__ ((__always_inline__, __gnu_inline__, __artificial__))
 vmls_laneq_s32 (int32x2_t __a, int32x2_t __b,
 		int32x4_t __c, const int __lane)
 {
-  return (__a - (__b * __aarch64_vget_lane_any (__c, __lane)));
+  return (int32x2_t) ((uint32x2_t) __a
+		      - ((uint32x2_t) __b
+			 * (uint32_t) __aarch64_vget_lane_any (__c, __lane)));
 }
 
 __extension__ extern __inline uint16x4_t
@@ -11732,7 +11761,9 @@ __attribute__ ((__always_inline__, __gnu_inline__, __artificial__))
 vmlsq_lane_s16 (int16x8_t __a, int16x8_t __b,
 		int16x4_t __c, const int __lane)
 {
-  return (__a - (__b * __aarch64_vget_lane_any (__c, __lane)));
+  return (int16x8_t) ((uint16x8_t) __a
+		      - ((uint16x8_t) __b
+			 * (uint16_t) __aarch64_vget_lane_any (__c, __lane)));
 }
 
 __extension__ extern __inline int32x4_t
@@ -11740,7 +11771,9 @@ __attribute__ ((__always_inline__, __gnu_inline__, __artificial__))
 vmlsq_lane_s32 (int32x4_t __a, int32x4_t __b,
 		int32x2_t __c, const int __lane)
 {
-  return (__a - (__b * __aarch64_vget_lane_any (__c, __lane)));
+  return (int32x4_t) ((uint32x4_t) __a
+		      - ((uint32x4_t) __b
+			 * (uint32_t) __aarch64_vget_lane_any (__c, __lane)));
 }
 
 __extension__ extern __inline uint16x8_t
@@ -11774,7 +11807,9 @@ __attribute__ ((__always_inline__, __gnu_inline__, __artificial__))
 vmlsq_laneq_s16 (int16x8_t __a, int16x8_t __b,
 		int16x8_t __c, const int __lane)
 {
-  return (__a - (__b * __aarch64_vget_lane_any (__c, __lane)));
+  return (int16x8_t) ((uint16x8_t) __a
+		      - ((uint16x8_t) __b
+			 * (uint16_t) __aarch64_vget_lane_any (__c, __lane)));
 }
 
 __extension__ extern __inline int32x4_t
@@ -11782,7 +11817,9 @@ __attribute__ ((__always_inline__, __gnu_inline__, __artificial__))
 vmlsq_laneq_s32 (int32x4_t __a, int32x4_t __b,
 		int32x4_t __c, const int __lane)
 {
-  return (__a - (__b * __aarch64_vget_lane_any (__c, __lane)));
+  return (int32x4_t) ((uint32x4_t) __a
+		      - ((uint32x4_t) __b
+			 * (uint32_t) __aarch64_vget_lane_any (__c, __lane)));
 }
 __extension__ extern __inline uint16x8_t
 __attribute__ ((__always_inline__, __gnu_inline__, __artificial__))
@@ -16975,7 +17012,7 @@ __extension__ extern __inline int64_t
 __attribute__ ((__always_inline__, __gnu_inline__, __artificial__))
 vsubd_s64 (int64_t __a, int64_t __b)
 {
-  return __a - __b;
+  return (int64_t) ((uint64_t) __a - (uint64_t) __b);
 }
 
 __extension__ extern __inline uint64_t
