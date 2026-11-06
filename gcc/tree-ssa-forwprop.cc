@@ -2597,6 +2597,14 @@ simplify_builtin_call (gimple_stmt_iterator *gsi_p, tree callee2, bool full_walk
 		}
 	    }
 
+	  /* The folds below rewrite USE_STMT into a statement that cannot
+	     throw.  If it could throw (e.g., a trapping addition under
+	     -ftrapv and -fnon-call-exceptions), then its EH edge or region
+	     would be left behind describing a statement that no longer needs
+	     it.  */
+	  if (stmt_could_throw_p (cfun, use_stmt))
+	    break;
+
 	  bool ok = false;
 	  tree oarg = NULL_TREE;
 	  enum tree_code ccode = ERROR_MARK;
