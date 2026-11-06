@@ -13012,7 +13012,7 @@ expand_expr_real_1 (tree exp, rtx target, machine_mode tmode,
 		  /* Nor can the insn generator.  */
 		  rtx_insn *insn = GEN_FCN (icode) (reg, op0);
 		  emit_insn (insn);
-		  return reg;
+		  return EXTEND_BITINT (reg);
 		}
 	      else if (STRICT_ALIGNMENT)
 		{
@@ -13046,7 +13046,10 @@ expand_expr_real_1 (tree exp, rtx target, machine_mode tmode,
 	  op0 = adjust_address (op0, mode, 0);
 	}
 
-      return op0;
+      /* The operand's upper bits can be anything, even when its mode is the
+	 same, so they have to go for a _BitInt whose precision is narrower
+	 than its mode.  */
+      return EXTEND_BITINT (op0);
 
     case MODIFY_EXPR:
       {
