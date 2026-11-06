@@ -2,11 +2,13 @@
 /* { dg-options "-O2" } */
 
 /* A pointer stepped below a member of an object of unknown size by an offset
-   that's only known at run time may still be well inside the enclosing
-   object, so its maximum size may be larger than what's left, but never
-   smaller.  The same goes for a pointer stepped again from there, in either
-   direction: a second step back must not wrap the size around to a tiny one.
-   The minimum stays at most what's left.  */
+   that's only known at run time may still be well inside the enclosing object,
+   so its maximum size may be larger than what's left, but never smaller.  The
+   same goes for a pointer that more steps in either direction leave below the
+   member: a second step back must not wrap the size around to a tiny one.  A
+   pointer stepped below or past the end of the member and then back into it is
+   in the member again, which gives it exactly what's left of the member.  The
+   minimum stays at most what's left.  */
 
 typedef __SIZE_TYPE__ size_t;
 
@@ -93,13 +95,15 @@ main (void)
   /* Two steps back.  */
   check (p, -16, -8);
   check (p, -1, -1);
-  /* Back, then forward.  */
+  /* Back, then forward, but still below the member.  */
   check (p, -16, 4);
-  check (p, -16, 20);
+  /* Forward past the end of the member, then back below it.  */
+  check (p, 24, -30);
   /* Back, forward, then back again.  */
   check3 (p, -16, 4, -8);
-  /* Steps that stay in the member keep its exact size.  */
-  if (d1 (p, 2, -1) != 19)
+  /* Steps that stay in the member keep its exact size, and so do steps below
+     it or past its end and back into it.  */
+  if (d1 (p, 2, -1) != 19 || d1 (p, 24, -10) != 6 || d1 (p, -16, 20) != 16)
     __builtin_abort ();
   return 0;
 }
