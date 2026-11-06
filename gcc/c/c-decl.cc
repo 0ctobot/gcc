@@ -5771,6 +5771,12 @@ c_decl_attributes (tree *node, tree attributes, int flags)
 void
 add_size_expr (tree expr)
 {
+  /* There's no function to evaluate the size in at file scope.  Don't add it as
+     a statement either, since add_stmt would start a statement list that makes
+     it look like we're inside of a function from now on.  */
+  if (current_scope == file_scope)
+    return;
+
   expr = fold_convert (void_type_node, expr);
   if (current_scope->parm_flag)
     {
