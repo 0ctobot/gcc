@@ -2414,14 +2414,18 @@ gimplify_decl_expr (tree *stmt_p, gimple_seq *seq_p)
 		{
 		  gimplify_ctxp->reinit_decl = decl;
 		  /* The gimplifier stores the parts of an aggregate one by one
-		     and may clear it first, so build it elsewhere if a call
-		     can abandon the initialization.  */
-		  tree ctor = init;
-		  if (TREE_CODE (ctor) == COMPOUND_LITERAL_EXPR)
-		    ctor = DECL_INITIAL (COMPOUND_LITERAL_EXPR_DECL (ctor));
-		  if (ctor
-		      && TREE_CODE (ctor) == CONSTRUCTOR
-		      && TREE_SIDE_EFFECTS (ctor)
+		     and may clear it first, and gimplify_modify_expr_rhs pushes
+		     the store down into the arms of a conditional or the right
+		     operand of a comma, so build the value elsewhere if anything
+		     in the initializer can abandon it.  A call alone only has
+		     to stay out of the return slot of DECL.  A compound literal
+		     always claims side effects, so ask its initializer.  */
+		  tree val = init;
+		  if (TREE_CODE (val) == COMPOUND_LITERAL_EXPR)
+		    val = DECL_INITIAL (COMPOUND_LITERAL_EXPR_DECL (val));
+		  if (val
+		      && TREE_SIDE_EFFECTS (val)
+		      && TREE_CODE (val) != CALL_EXPR
 		      && AGGREGATE_TYPE_P (TREE_TYPE (decl))
 		      && TREE_CODE (DECL_SIZE_UNIT (decl)) == INTEGER_CST)
 		    {

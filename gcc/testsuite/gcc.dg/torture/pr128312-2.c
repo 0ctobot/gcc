@@ -168,6 +168,30 @@ again:;
 }
 
 __attribute__ ((noipa)) void
+cond (long x)
+{
+  volatile int n = 0;
+  if (setjmp (env))
+    abort ();
+again:;
+  struct P v = x ? (struct P) { f (), x } : (struct P) { .l = f () };
+  check (&v, x);
+  AGAIN (v);
+}
+
+__attribute__ ((noipa)) void
+comma (long x)
+{
+  volatile int n = 0;
+  if (setjmp (env))
+    abort ();
+again:;
+  struct P v = (f (), (struct P) { f (), x });
+  check (&v, x);
+  AGAIN (v);
+}
+
+__attribute__ ((noipa)) void
 builtin (long x)
 {
   volatile int n = 0;
@@ -202,7 +226,7 @@ typedef void (*test_fn) (long);
 
 test_fn tests[] = {
   label, no_label, receiver, receiver_below, array, member_array, literal,
-  constant, aligned, builtin, nested
+  constant, aligned, cond, comma, builtin, nested
 };
 
 int

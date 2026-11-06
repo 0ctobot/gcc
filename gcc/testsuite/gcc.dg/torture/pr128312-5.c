@@ -69,6 +69,10 @@ RUN (t_nrv, v.b, struct S v = mknrv (gp, n + 1))
 RUN (t_lit, v.b, struct S v = (struct S) { .a = n + 1, .b = rd () })
 RUN (t_lit_member, v.s.b + v.t * 10,
      struct T v = { .s = (struct S) { .a = n + 1, .b = rd () }, .t = rd () })
+RUN (t_cond, v.b,
+     struct S v = (yes () ? (struct S) { .a = n + 1, .b = rd () }
+		   : (struct S) { .a = 0 }))
+RUN (t_comma, v.b, struct S v = (yes (), (struct S) { .a = n + 1, .b = rd () }))
 
 /* C doesn't sequence these stores against the call, but building the value in
    a temporary is the same rule for all side-effecting aggregates.  */
@@ -83,6 +87,8 @@ main (void)
       || t_nrv () != 1
       || t_lit () != 1
       || t_lit_member () != 11
+      || t_cond () != 1
+      || t_comma () != 1
       || t_brace () != 1
       || t_brace_stmt () != 1
       || t_array () != 1)
