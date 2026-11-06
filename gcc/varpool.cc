@@ -817,12 +817,16 @@ varpool_node::create_alias (tree alias, tree decl)
   alias_node->alias_target = decl;
   if (lookup_attribute ("weakref", DECL_ATTRIBUTES (alias)) != NULL)
     alias_node->weakref = alias_node->transparent_alias = true;
-  /* A pointer taken from ALIAS points to DECL, even though only ALIAS gets
-     marked as addressable when that happens. Without this, a static DECL looks
-     like something no pointer can reach, so a store through such a pointer
-     wouldn't be seen to change it. ipa_discover_variables clears this once it
-     knows every reference to DECL and its aliases and none take an address.  */
+  /* DECL and all of its aliases name one variable, but only the name a pointer
+     was taken from gets marked as addressable when that happens.  The alias
+     oracle checks the flag on the name a direct access uses, so without this a
+     static name looks like something no pointer can reach, and a store through
+     a pointer taken from another name wouldn't be seen to change it.  Mark both
+     names here since a chain of aliases passes through here for each link.
+     ipa_discover_variable_flags clears the flag on all of them once it knows
+     that no reference to DECL or any of its aliases takes an address.  */
   TREE_ADDRESSABLE (decl) = 1;
+  TREE_ADDRESSABLE (alias) = 1;
   return alias_node;
 }
 
