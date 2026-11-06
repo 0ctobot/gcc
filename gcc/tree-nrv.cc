@@ -27,6 +27,8 @@ along with GCC; see the file COPYING3.  If not see
 #include "ssa.h"
 #include "tree-pretty-print.h"
 #include "gimple-iterator.h"
+#include "tree-cfg.h"
+#include "tree-eh.h"
 #include "gimple-walk.h"
 #include "internal-fn.h"
 
@@ -303,7 +305,8 @@ make_pass_nrv (gcc::context *ctxt)
    optimization, where DEST is expected to be the LHS of a modify
    expression where the RHS is a function returning an aggregate.
 
-   DEST is available if it is not clobbered or used by the call.  */
+   DEST is available if it is not clobbered or used by the call, and if the
+   call cannot leave a partial result in DEST for this function to see.  */
 
 static bool
 dest_safe_for_nrv_p (gcall *call)
@@ -316,6 +319,14 @@ dest_safe_for_nrv_p (gcall *call)
 
   if (TREE_CODE (dest) == SSA_NAME)
     return true;
+
+  /* The callee can store into the return slot before it finishes, most
+     obviously when it uses the NRV.  If the call then throws to a handler in
+     this function or does a longjmp to a setjmp in this function, the
+     assignment never happened and DEST must still hold its old value.  */
+  if (stmt_can_throw_internal (cfun, call)
+      || stmt_can_make_abnormal_goto (call))
+    return false;
 
   if (call_may_clobber_ref_p (call, dest, false)
       || ref_maybe_used_by_stmt_p (call, dest, false))
