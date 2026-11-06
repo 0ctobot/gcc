@@ -8022,7 +8022,7 @@ pro_epilogue_adjust_stack (rtx dest, rtx src, rtx offset,
    Return: the regno of chosen register.  */
 
 static unsigned int
-find_drap_reg (void)
+preferred_drap_reg (void)
 {
   tree decl = cfun->decl;
 
@@ -8030,10 +8030,17 @@ find_drap_reg (void)
      registers.  */
   if (TARGET_64BIT)
     {
-      /* In preserve_none functions, any register can be used for DRAP,
-	 except AX, R12–R15, DI, SI (argument registers), SP, and BP.  */
-      if (cfun->machine->call_saved_registers == TYPE_PRESERVE_NONE)
-	return R11_REG;
+      /* Preserve_none functions take arguments in R12-R15, DI and SI, and
+	 functions without callee-saved registers can tail call them.  BX
+	 carries neither an argument nor the static chain on 64-bit, and the
+	 prologue doesn't use it as a scratch register the way it uses R11.
+	 drap_reg_usable_p() still checks the register picked here, since
+	 options like -fcall-used-REG can make it unsafe.  */
+      if (cfun->machine->call_saved_registers == TYPE_PRESERVE_NONE
+	  || (cfun->machine->call_saved_registers
+	      == TYPE_NO_CALLEE_SAVED_REGISTERS
+	      && crtl->tail_call_emit))
+	return BX_REG;
 
       /* Use R13 for nested function or function need static chain.
 	 Since function with tail call may use any caller-saved
@@ -8070,6 +8077,197 @@ find_drap_reg (void)
 	}
       return DI_REG;
     }
+}
+
+/* Return true if REGNO is live on the way out of the function.  Expansion
+   marks the return value and the values restored by __builtin_return() with a
+   USE before the return, and a sibcall lists its argument registers, its
+   static chain and AL in CALL_INSN_FUNCTION_USAGE.  */
+
+static bool
+reg_live_at_exit_p (unsigned int regno)
+{
+  for (rtx_insn *insn = get_insns (); insn; insn = NEXT_INSN (insn))
+    {
+      if (NONJUMP_INSN_P (insn) && GET_CODE (PATTERN (insn)) == USE)
+	{
+	  rtx x = XEXP (PATTERN (insn), 0);
+	  if (REG_P (x) && refers_to_regno_p (regno, x))
+	    return true;
+	}
+      else if (CALL_P (insn) && SIBLING_CALL_P (insn))
+	for (rtx link = CALL_INSN_FUNCTION_USAGE (insn); link;
+	     link = XEXP (link, 1))
+	  {
+	    rtx x = XEXP (link, 0);
+	    if (GET_CODE (x) == USE
+		&& REG_P (XEXP (x, 0))
+		&& refers_to_regno_p (regno, XEXP (x, 0)))
+	      return true;
+	  }
+    }
+
+  return false;
+}
+
+/* Return true if REGNO can hold the dynamic realign argument pointer without
+   disturbing anything else.  The prologue overwrites the register on function
+   entry and only saves its incoming value when the function has to preserve
+   it.  The epilogue reloads the register from the stack on the way out, so it
+   also can't hold anything a return or a sibcall needs.  */
+
+static bool
+drap_reg_usable_p (unsigned int regno)
+{
+  if (fixed_regs[regno] || reg_live_at_exit_p (regno))
+    return false;
+
+  /* Nothing is passed in BX, but it can hold the GOT pointer under PIC on
+     ia32.  */
+  if (regno == BX_REG && !TARGET_64BIT && flag_pic)
+    return false;
+
+  /* EH returns adjust the stack through CX and pass data in AX and DX.  */
+  if ((regno == AX_REG || regno == CX_REG || regno == DX_REG)
+      && crtl->calls_eh_return)
+    return false;
+
+  /* The prologue passes the allocation size to the stack probe worker in AX,
+     and the base address to the out-of-line ms2sysv save stub too.  */
+  if (regno == AX_REG
+      && (ix86_target_stack_probe () || cfun->machine->call_ms2sysv))
+    return false;
+
+  /* Functions without caller-saved registers have to preserve every register,
+     but the ones that can hold a return value stay call-used, and the prologue
+     doesn't save the incoming value of a call-used register.  */
+  if (cfun->machine->call_saved_registers == TYPE_NO_CALLER_SAVED_REGISTERS
+      && call_used_or_fixed_reg_p (regno))
+    return false;
+
+  /* The static chain register is live until the body copies it out, and
+     regparm(3) nested functions push it again after the DRAP register is
+     loaded.  */
+  if (DECL_STATIC_CHAIN (cfun->decl)
+      && regno == REGNO (ix86_static_chain (cfun->decl, false)))
+    return false;
+
+  /* An indirect sibcall can hold its target in any register of CLOBBERED_REGS
+     across the epilogue.  The register operands of a sibcall are already
+     covered by reg_live_at_exit_p().  */
+  if (crtl->tail_call_emit
+      && TEST_HARD_REG_BIT (reg_class_contents[CLOBBERED_REGS], regno))
+    return false;
+
+  /* With -fsplit-stack, varargs functions get a pointer to their stack
+     arguments from the split-stack prologue in its scratch register, and the
+     body only copies it out after the normal prologue has run.  */
+  if (cfun->machine->split_stack_varargs_pointer
+      && regno == split_stack_prologue_scratch_regno ())
+    return false;
+
+  if (!TARGET_64BIT)
+    {
+      /* AX, CX and DX are the only candidates that can carry an argument.  */
+      if (regno != AX_REG && regno != CX_REG && regno != DX_REG)
+	return true;
+
+      /* Fastcall and thiscall functions pass arguments in CX and then DX, and
+	 everything else passes them in AX, DX and then CX.  Varargs functions
+	 don't pass anything in registers.  __builtin_apply_args() saves all
+	 three registers, but only the ones carrying an argument hold a value
+	 that means anything.  */
+      tree type = TREE_TYPE (cfun->decl);
+      int used = 0;
+      if (!cfun->stdarg)
+	used = (ix86_function_regparm (type, cfun->decl)
+		- crtl->args.info.nregs);
+      if (regno == DX_REG)
+	return used < 2;
+      bool cx_first = (ix86_get_callcvt (type)
+		       & (IX86_CALLCVT_FASTCALL | IX86_CALLCVT_THISCALL)) != 0;
+      if (regno == AX_REG)
+	return cx_first || used == 0;
+      return cx_first ? used == 0 : used < 3;
+    }
+
+  /* The prologue can use R11 as a scratch register before the argument pointer
+     is copied out of the DRAP register.  Stack adjustments need it once they
+     no longer fit in an immediate, and the allocation includes the outgoing
+     argument area, so stay well clear of that size to leave room for the
+     spill slots that aren't known yet.  */
+  if (regno == R11_REG
+      && (flag_stack_clash_protection
+	  || flag_stack_check
+	  || ix86_cmodel == CM_LARGE_PIC
+	  || maybe_gt (get_frame_size () + crtl->outgoing_args_size,
+		       INT_MAX / 2)))
+    return false;
+
+  /* MS ABI functions pass their arguments in the MS ABI registers even when
+     they are also preserve_none.  Varargs functions and __builtin_apply_args()
+     read every argument register after the prologue, not only the ones that
+     have named arguments.  */
+  bool all_args_live = cfun->stdarg || apply_args_value;
+  /* The SysV varargs prologue code reads the number of vector registers used
+     from AL, and __builtin_apply_args() saves AX along with the arguments.  */
+  if (regno == AX_REG && all_args_live)
+    return false;
+  const int *parm_regs = x86_64_int_parameter_registers;
+  int nregs = X86_64_REGPARM_MAX;
+  if (ix86_cfun_abi () == MS_ABI)
+    {
+      parm_regs = x86_64_ms_abi_int_parameter_registers;
+      nregs = X86_64_MS_REGPARM_MAX;
+    }
+  else if (cfun->machine->call_saved_registers == TYPE_PRESERVE_NONE)
+    parm_regs = x86_64_preserve_none_int_parameter_registers;
+  if (!all_args_live)
+    nregs = MIN (nregs, crtl->args.info.regno);
+  for (int i = 0; i < nregs; i++)
+    if (parm_regs[i] == (int) regno)
+      return false;
+
+  return true;
+}
+
+/* Return the register to use as the dynamic realign argument pointer.  The
+   preferred register isn't always usable: a global register variable or
+   -ffixed-REG can make it fixed, and -fcall-used-REG can make it call-used.
+   Check it like any other candidate, and when it fails, try the rest in order,
+   starting with the ones the function has to preserve anyway.  The APX
+   registers and AX are only tried after those, so they don't change the choice
+   for a function that any of the older candidates already worked for.  */
+
+static unsigned int
+find_drap_reg (void)
+{
+  unsigned int regno = preferred_drap_reg ();
+  if (drap_reg_usable_p (regno))
+    return regno;
+
+  if (TARGET_64BIT)
+    {
+      for (unsigned int r : { R13_REG, R12_REG, R14_REG, R15_REG, BX_REG,
+			      DI_REG, SI_REG, R10_REG, R9_REG, R8_REG, CX_REG,
+			      DX_REG, R11_REG })
+	if (drap_reg_usable_p (r))
+	  return r;
+      for (unsigned int r = FIRST_REX2_INT_REG; r <= LAST_REX2_INT_REG; r++)
+	if (drap_reg_usable_p (r))
+	  return r;
+    }
+  else
+    for (unsigned int r : { DI_REG, SI_REG, BX_REG, CX_REG, DX_REG })
+      if (drap_reg_usable_p (r))
+	return r;
+
+  if (drap_reg_usable_p (AX_REG))
+    return AX_REG;
+
+  sorry ("no register is available for the dynamic stack realignment "
+	 "argument pointer");
+  return regno;
 }
 
 /* Return minimum incoming stack alignment.  */
