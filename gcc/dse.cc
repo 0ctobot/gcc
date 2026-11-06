@@ -595,6 +595,20 @@ static bool stores_off_frame_dead_at_return;
 static int globally_deleted;
 static int locally_deleted;
 
+/* The MEMs written by the stores that we deleted, for
+   remove_mem_equal_notes.  */
+static vec<rtx> deleted_store_mems;
+
+/* Remember the memory written by INSN_INFO, which is about to be
+   deleted.  */
+
+static void
+record_deleted_stores (insn_info_t insn_info)
+{
+  for (store_info *s = insn_info->store_rec; s; s = s->next)
+    deleted_store_mems.safe_push (s->mem);
+}
+
 static bitmap all_blocks;
 
 /* Locations that are killed by calls in the global phase.  */
@@ -910,6 +924,7 @@ delete_dead_store_insn (insn_info_t insn_info)
     fprintf (dump_file, "Locally deleting insn %d\n",
 	     INSN_UID (insn_info->insn));
 
+  record_deleted_stores (insn_info);
   free_store_info (insn_info);
   read_info = insn_info->read_rec;
 
@@ -3573,6 +3588,7 @@ dse_step5 (void)
 		  if (dbg_cnt (dse)
 		      && check_for_inc_dec_1 (insn_info))
 		    {
+		      record_deleted_stores (insn_info);
 		      delete_insn (insn_info->insn);
 		      insn_info->insn = NULL;
 		      globally_deleted++;
@@ -3697,6 +3713,63 @@ dse_step7 (void)
 }
 
 
+/* Return true if MEM might read memory written by one of the stores that
+   we deleted.  */
+
+static bool
+mem_may_hold_deleted_store_p (const_rtx mem)
+{
+  unsigned int i;
+  rtx store_mem;
+
+  FOR_EACH_VEC_ELT (deleted_store_mems, i, store_mem)
+    if (may_alias_p (store_mem, mem))
+      return true;
+  return false;
+}
+
+/* Remove the REG_EQUAL notes that read memory written by a deleted store.
+   Notes don't count as reads when we decide that a store is dead, so deleting
+   a store can leave a note claiming that a register equals a MEM which no
+   longer holds that value.  Passes that run later, such as late-combine,
+   trust the note and can use it to fold the register to a wrong value.
+
+   A note and a deleted store are usually at different points in the
+   function, so we can't compare their addresses as if they were computed
+   from the same register values.  Use may_alias_p, which doesn't depend on
+   where the two references are, and keep the notes that can't read any of
+   the deleted stores.  */
+
+static void
+remove_mem_equal_notes (void)
+{
+  basic_block bb;
+  rtx_insn *insn;
+
+  FOR_EACH_BB_FN (bb, cfun)
+    FOR_BB_INSNS (bb, insn)
+      {
+	if (!INSN_P (insn))
+	  continue;
+
+	rtx note = find_reg_note (insn, REG_EQUAL, NULL_RTX);
+	if (!note)
+	  continue;
+
+	subrtx_iterator::array_type array;
+	FOR_EACH_SUBRTX (iter, array, XEXP (note, 0), NONCONST)
+	  if (MEM_P (*iter)
+	      && !MEM_READONLY_P (*iter)
+	      && mem_may_hold_deleted_store_p (*iter))
+	    {
+	      remove_note (insn, note);
+	      break;
+	    }
+      }
+
+  deleted_store_mems.release ();
+}
+
 /* -------------------------------------------------------------------------
    DSE
    ------------------------------------------------------------------------- */
@@ -3738,6 +3811,11 @@ rest_of_handle_dse (void)
     }
 
   dse_step6 ();
+
+  /* This has to come before dse_step7 since may_alias_p uses the base values
+     that end_alias_analysis frees.  */
+  if (locally_deleted || globally_deleted)
+    remove_mem_equal_notes ();
   dse_step7 ();
 
   if (dump_file)
