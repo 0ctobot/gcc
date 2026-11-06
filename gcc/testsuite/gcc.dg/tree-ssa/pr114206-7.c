@@ -6,12 +6,14 @@
    call can see.  Getting past the branch still tells which way it went, which
    can confirm a guess of the address, so the calls only get a constant.  */
 /* { dg-do compile } */
-/* { dg-options "-O2 -fdump-tree-tailc-details" } */
+/* { dg-options "-O2 -fdump-tree-tailr1-details -fdump-tree-tailc-details" } */
 
 struct key { long a; long b; };
 struct dev { long a; long b; struct dev *next; };
+struct pack { long v[4]; };
 
 extern long val;
+extern long sink;
 extern struct dev global_dev;
 extern long kept (struct dev *);
 extern long kept_too (struct dev *);
@@ -23,6 +25,13 @@ helper (struct key *k, long i)
 {
   k->b = i;
   return val != k->a;
+}
+
+__attribute__ ((noinline, noclone)) int
+check (struct pack *p, long i)
+{
+  sink = i;
+  return p->v[1] < 0;
 }
 
 /* Only one arm of the outer branch calls the helper.  */
@@ -105,5 +114,34 @@ retry (struct dev *dev)
   return refused (&global_dev);
 }
 
+/* The parameter forwarded to the next activation only goes to the check, but
+   getting past the check can confirm a guess of its address, so neither
+   recursion can become a loop.  */
+long
+recurse_arm (struct pack p, long n, int flag)
+{
+  if (flag)
+    {
+      if (check (&p, n))
+	return -1;
+      sink++;
+    }
+  if (!n)
+    return p.v[0];
+  return recurse_arm (p, n - 1, flag);
+}
+
+long
+recurse_loop (struct pack p, long n)
+{
+  for (long i = 0; i < 3; i++)
+    if (check (&p, i))
+      return -1;
+  if (!n)
+    return p.v[0];
+  return recurse_loop (p, n - 1);
+}
+
+/* { dg-final { scan-tree-dump-not "Eliminated tail recursion" "tailr1" } } */
 /* { dg-final { scan-tree-dump-times "Found tail call \[^\n\]*kept" 6 "tailc" } } */
 /* { dg-final { scan-tree-dump-not "Found tail call \[^\n\]*refused" "tailc" } } */
