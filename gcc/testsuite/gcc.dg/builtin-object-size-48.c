@@ -130,6 +130,47 @@ load_step20 (size_t *pi)
   return __builtin_object_size (q, 1);
 }
 
+/* A full-width index, then a second, variable step, and the same with each of
+   the computed offsets above.  */
+
+struct two { char name[8]; char next[8]; } g;
+
+size_t __attribute__ ((noipa))
+size_var (size_t i, size_t j, int c)
+{
+  char *p = g.name + i;
+  if (c)
+    p = p + j;
+  return __builtin_object_size (p, 1);
+}
+
+size_t __attribute__ ((noipa))
+mask_var (int i, int j, int c)
+{
+  char *p = g.name + (i & 7);
+  if (c)
+    p = p + (j & 7);
+  return __builtin_object_size (p, 1);
+}
+
+size_t __attribute__ ((noipa))
+plus_var (size_t i, size_t j, int c)
+{
+  char *p = g.name + (i + 1);
+  if (c)
+    p = p + (j + 1);
+  return __builtin_object_size (p, 1);
+}
+
+size_t __attribute__ ((noipa))
+load_var (size_t *pi, size_t *pj, int c)
+{
+  char *p = g.name + *pi;
+  if (c)
+    p = p + *pj;
+  return __builtin_object_size (p, 1);
+}
+
 size_t __attribute__ ((noipa))
 sstep4 (int i)
 {
@@ -191,6 +232,14 @@ main (void)
   if (load_step4 (&n) != sizeof (e.name) - 4)
     FAIL ();
   if (load_step20 (&n) != 0)
+    FAIL ();
+  if (size_var (1, 1, 1) != sizeof (g.name))
+    FAIL ();
+  if (mask_var (1, 1, 1) != sizeof (g.name))
+    FAIL ();
+  if (plus_var (1, 1, 1) != sizeof (g.name))
+    FAIL ();
+  if (load_var (&n, &n, 1) != sizeof (g.name))
     FAIL ();
 
   if (sstep4 (-4) < sizeof (e.name))

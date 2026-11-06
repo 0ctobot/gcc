@@ -23,11 +23,17 @@ struct pkt tbl[5];
 #define FORWARD(name, args, ...) \
   NOIPA name args { __VA_ARGS__; check_member (p); }
 
+FORWARD (zext_u32, (int x), char *p = L + (unsigned) x + 1)
+FORWARD (zext_u16, (short s), char *p = L + (unsigned short) s + 1)
+FORWARD (zext_sub_plus, (unsigned a, unsigned b), char *p = L + (a - b) + 1)
 FORWARD (zext_sub_alone, (unsigned a, unsigned b), char *p = L + (a - b))
 
 int
 main (void)
 {
+  zext_u32 (1);
+  zext_u16 (1);
+  zext_sub_plus (3, 1);
   zext_sub_alone (3, 1);
   return 0;
 }
