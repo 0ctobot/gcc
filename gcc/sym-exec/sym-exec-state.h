@@ -24,8 +24,6 @@ along with GCC; see the file COPYING3.  If not see
 #ifndef SYM_EXEC_STATE_H
 #define SYM_EXEC_STATE_H
 
-#define MAX_VALUE_SIZE 64
-
 #include "sym-exec-expr-is-a-helper.h"
 
 /* Struct used for representing values.  */
@@ -341,8 +339,9 @@ class state {
   /* Prints added conditions.  */
   void print_conditions ();
 
-  /* Returns the number represented by the value.  */
-  static unsigned HOST_WIDE_INT
+  /* Returns the number represented by the value, which has as many bits as the
+     value does, or zero if any of its bits isn't constant.  */
+  static wide_int
   make_number (const value *var);
 
   /* Checks if all bits of the given value have constant bit type.  */
