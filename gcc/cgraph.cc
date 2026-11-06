@@ -1127,6 +1127,7 @@ symbol_table::create_edge (cgraph_node *caller, cgraph_node *callee,
 				      caller->decl);
   else
     edge->in_polymorphic_cdtor = caller->thunk;
+  edge->inlined_return_callee_uncaptured = false;
 
   if (callee && symtab->state != LTO_STREAMING
       && edge->callee->comdat_local_p ())

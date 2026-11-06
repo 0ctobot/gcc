@@ -2212,6 +2212,11 @@ public:
   /* Set to true when caller is a constructor or destructor of polymorphic
      type.  */
   unsigned in_polymorphic_cdtor : 1;
+  /* Set when this edge was inlined and the call's result reached the caller's
+     return value without being captured.  This preserves the
+     is_return_callee_uncaptured flag of the edge's ipa_call_summary, which
+     inlining frees, for the malloc propagation that runs after inlining.  */
+  unsigned inlined_return_callee_uncaptured : 1;
 
   /* Return true if call must bind to current definition.  */
   bool binds_to_current_def_p ();
