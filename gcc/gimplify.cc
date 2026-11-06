@@ -8055,15 +8055,22 @@ gimplify_save_expr (tree *expr_p, gimple_seq *pre_p, gimple_seq *post_p)
 	{
 	  /* An __auto_type initializer is saved so that a later statement can
 	     read it, so it must outlive the statement.  */
-	  if (tmp_type_needs_alloca_p (TREE_TYPE (val)))
+	  bool long_lived = tmp_type_needs_alloca_p (TREE_TYPE (val));
+	  if (long_lived)
 	    gimplify_ctxp->stmt_alloca_long = true;
 
-	  /* The temporary may not be an SSA name as later abnormal and EH
-	     control flow may invalidate use/def domination.  When in SSA
-	     form then assume there are no such issues and SAVE_EXPRs only
-	     appear via GENERIC foldings.  */
-	  val = get_initialized_tmp_var (val, pre_p, post_p,
-					 gimple_in_ssa_p (cfun));
+	  /* The slot of a TARGET_EXPR can hold the value for those reads, so
+	     don't take up more stack with a copy of it.  */
+	  if (long_lived && TREE_CODE (val) == TARGET_EXPR)
+	    ret = gimplify_expr (&val, pre_p, post_p, is_gimple_lvalue,
+				 fb_lvalue);
+	  else
+	    /* The temporary may not be an SSA name as later abnormal and EH
+	       control flow may invalidate use/def domination.  When in SSA
+	       form then assume there are no such issues and SAVE_EXPRs only
+	       appear via GENERIC foldings.  */
+	    val = get_initialized_tmp_var (val, pre_p, post_p,
+					   gimple_in_ssa_p (cfun));
 	}
 
       TREE_OPERAND (*expr_p, 0) = val;

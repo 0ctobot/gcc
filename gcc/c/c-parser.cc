@@ -2967,7 +2967,23 @@ c_parser_declaration_or_fndef (c_parser *parser, bool fndef_ok,
 		  tree init_type = TREE_TYPE (init.value);
 		  bool vm_type = c_type_variably_modified_p (init_type);
 		  if (vm_type)
-		    init.value = save_expr (init.value);
+		    {
+		      init.value = save_expr (init.value);
+		      /* save_expr leaves a TARGET_EXPR alone since it only runs
+			 once, but a variable-sized one needs the SAVE_EXPR
+			 anyway.  It tells the gimplifier that the declaration
+			 reads the temporary after the statement evaluating it
+			 ends, so the temporary's stack space can't be reclaimed
+			 at the end of that statement.  */
+		      if (TREE_CODE (init.value) == TARGET_EXPR
+			  && TYPE_SIZE (init_type)
+			  && !TREE_CONSTANT (TYPE_SIZE (init_type)))
+			{
+			  init.value = build1_loc (init_loc, SAVE_EXPR,
+						   init_type, init.value);
+			  TREE_SIDE_EFFECTS (init.value) = 1;
+			}
+		    }
 		  finish_init ();
 		  specs->typespec_kind = ctsk_typeof;
 		  specs->locations[cdw_typedef] = init_loc;
