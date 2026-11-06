@@ -56,7 +56,9 @@ public:
 			   may_be_zero == false), more precisely the number
 			   of executions of the latch of the loop.  */
   widest_int max;	/* The upper bound on the number of iterations of
-			   the loop.  If niter is constant, then these values
+			   the loop.  Unless may_be_zero holds, this also
+			   bounds niter when another exit can end the loop
+			   sooner.  If niter is constant, then these values
 			   must agree.  */
 
   /* The simplified shape of the exit condition.  This information is used by
