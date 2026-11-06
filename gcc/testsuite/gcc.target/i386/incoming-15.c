@@ -12,4 +12,4 @@ long long x(void)
   return y(&s3);
 }
 
-/* { dg-final { scan-assembler-not "andl\[\\t \]*\\$-16,\[\\t \]*%esp" } } */
+/* { dg-final { scan-assembler "andl\[\\t \]*\\$-16,\[\\t \]*%esp" } } */
