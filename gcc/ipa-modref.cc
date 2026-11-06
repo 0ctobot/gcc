@@ -3136,7 +3136,8 @@ analyze_function (bool ipa)
   /* Compute no-LTO summaries when local optimization is going to happen.  */
   bool nolto = (!ipa || ((!flag_lto || flag_fat_lto_objects) && !in_lto_p)
 		|| (in_lto_p && !flag_wpa
-		    && flag_incremental_link != INCREMENTAL_LINK_LTO));
+		    && (flag_incremental_link != INCREMENTAL_LINK_LTO
+			|| flag_fat_lto_objects)));
   /* Compute LTO when LTO streaming is going to happen.  */
   bool lto = ipa && ((flag_lto && !in_lto_p)
 		     || flag_wpa
@@ -4012,8 +4013,8 @@ modref_read (void)
       if (flag_wpa || flag_incremental_link == INCREMENTAL_LINK_LTO)
 	summaries_lto = modref_summaries_lto::create_ggc (symtab);
       if (!flag_wpa
-	  || (flag_incremental_link == INCREMENTAL_LINK_LTO
-	      && flag_fat_lto_objects))
+	  && (flag_incremental_link != INCREMENTAL_LINK_LTO
+	      || flag_fat_lto_objects))
 	summaries = modref_summaries::create_ggc (symtab);
       if (!fnspec_summaries)
 	fnspec_summaries = new fnspec_summaries_t (symtab);
