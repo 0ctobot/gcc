@@ -167,6 +167,11 @@ along with GCC; see the file COPYING3.  If not see
    been folded.  */
 #define SAVE_EXPR_FOLDED_P(EXP)	TREE_LANG_FLAG_1 (SAVE_EXPR_CHECK (EXP))
 
+/* For a reference, nonzero if the initializer code built it to read one part
+   of a whole initializer that a later designator partly overrides.  */
+#define INIT_SPLIT_REF_P(EXP) \
+  TREE_LANG_FLAG_2 (TREE_CHECK3 (EXP, COMPONENT_REF, ARRAY_REF, BIT_FIELD_REF))
+
 /* Whether a type has boolean semantics: either a boolean type or an
    enumeration type with a boolean type as its underlying type.  */
 #define C_BOOLEAN_TYPE_P(TYPE)						\
