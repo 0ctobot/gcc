@@ -1130,8 +1130,8 @@ debug_aff (aff_tree *val)
 }
 
 /* Computes address of the reference REF in ADDR.  The size of the accessed
-   location is stored to SIZE.  Returns the ultimate containing object to
-   which REF refers.  */
+   location is stored to SIZE, or -1 if the location is variably sized.
+   Returns the ultimate containing object to which REF refers.  */
 
 tree
 get_inner_reference_aff (tree ref, aff_tree *addr, poly_widest_int *size)
@@ -1159,13 +1159,19 @@ get_inner_reference_aff (tree ref, aff_tree *addr, poly_widest_int *size)
   aff_combination_const (&tmp, sizetype, bytepos);
   aff_combination_add (addr, &tmp);
 
-  *size = bits_to_bytes_round_up (bitpos + bitsize) - bytepos;
+  /* get_inner_reference returns -1 for a variably sized reference, which the
+     rounding below would turn into an empty access.  */
+  if (known_size_p (bitsize))
+    *size = bits_to_bytes_round_up (bitpos + bitsize) - bytepos;
+  else
+    *size = -1;
 
   return base;
 }
 
 /* Returns true if a region of size SIZE1 at position 0 and a region of
-   size SIZE2 at position DIFF cannot overlap.  */
+   size SIZE2 at position DIFF cannot overlap.  A size of -1 means the region
+   has an unknown size, in which case it can extend arbitrarily far.  */
 
 bool
 aff_comb_cannot_overlap_p (aff_tree *diff, const poly_widest_int &size1,
@@ -1182,11 +1188,11 @@ aff_comb_cannot_overlap_p (aff_tree *diff, const poly_widest_int &size1,
     {
       /* The second object is before the first one, we succeed if the last
 	 element of the second object is before the start of the first one.  */
-      return known_le (diff->offset + size2, 0);
+      return known_size_p (size2) && known_le (diff->offset + size2, 0);
     }
   else
     {
       /* We succeed if the second object starts after the first one ends.  */
-      return known_le (size1, diff->offset);
+      return known_size_p (size1) && known_le (size1, diff->offset);
     }
 }
