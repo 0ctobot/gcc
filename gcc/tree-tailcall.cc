@@ -40,6 +40,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "except.h"
 #include "tree-eh.h"
 #include "dbgcnt.h"
+#include "cfganal.h"
 #include "cfgloop.h"
 #include "intl.h"
 #include "common/common-target.h"
@@ -657,6 +658,444 @@ empty_eh_cleanup (basic_block bb, int *eh_has_tsan_func_exit, int cnt)
 static live_vars_map *live_vars;
 static vec<bitmap_head> live_vars_vec;
 
+/* DECL_UIDs of the local variables whose address gets used as something other
+   than a pointer.  Computed lazily, but just once for the function.  */
+static bitmap exposed_vars;
+
+/* DECL_UIDs of the variables whose address went into a call whose result is
+   followed rather than making them exposed, and SSA_NAME_VERSIONs of those
+   results.  Computed along with EXPOSED_VARS.  */
+static bitmap revealed_vars;
+static bitmap revealed_results;
+
+/* SSA_NAME_VERSIONs of the names that may depend on one of REVEALED_RESULTS in
+   a way that REVEALED_NAMES_CALL can tell, or that any call can if
+   REVEALED_NAMES_ANY_CALL is set.  Computed by compute_revealed_names, along
+   with the dominance frontiers it needs, which are kept for the function.  */
+static bitmap revealed_names;
+static gcall *revealed_names_call;
+static bool revealed_names_any_call;
+static unsigned int revealed_names_runs;
+static bitmap_head *revealed_frontiers;
+
+/* If the pointer VAL may point to any of VARS, move those variables out of VARS
+   and into EXPOSED_VARS.  VAL is left alone if it isn't a pointer.  */
+
+static void
+mark_exposed_vars (tree val, vec<tree> &vars)
+{
+  if ((TREE_CODE (val) != SSA_NAME && TREE_CODE (val) != ADDR_EXPR)
+      || !POINTER_TYPE_P (TREE_TYPE (val)))
+    return;
+
+  for (unsigned int i = 0; i < vars.length ();)
+    if (ptr_deref_may_alias_decl_p (val, vars[i]))
+      {
+	bitmap_set_bit (exposed_vars, DECL_UID (vars[i]));
+	vars.unordered_remove (i);
+      }
+    else
+      i++;
+}
+
+/* If the pointer VAL may point to any of VARS, add those variables to
+   REVEALED_VARS and the call result LHS to REVEALED_NAMES.  */
+
+static void
+mark_revealed_vars (tree val, tree lhs, const vec<tree> &vars)
+{
+  if ((TREE_CODE (val) != SSA_NAME && TREE_CODE (val) != ADDR_EXPR)
+      || !POINTER_TYPE_P (TREE_TYPE (val)))
+    return;
+
+  for (tree var : vars)
+    if (ptr_deref_may_alias_decl_p (val, var))
+      {
+	bitmap_set_bit (revealed_vars, DECL_UID (var));
+	bitmap_set_bit (revealed_results, SSA_NAME_VERSION (lhs));
+      }
+}
+
+/* Return the DECL_PT_UID of the only variable that the pointer VAL can point
+   into, or 0 if there isn't one.  */
+
+static unsigned int
+only_pointee_uid (tree val)
+{
+  unsigned int uid;
+  if (TREE_CODE (val) == ADDR_EXPR)
+    {
+      tree base = get_base_address (TREE_OPERAND (val, 0));
+      return base && DECL_P (base) ? DECL_PT_UID (base) : 0;
+    }
+
+  const pt_solution *pt;
+  if (TREE_CODE (val) == SSA_NAME
+      && POINTER_TYPE_P (TREE_TYPE (val))
+      && (pt = ssa_name_pt_solution (val))
+      && pt_solution_singleton_or_null_p (pt, &uid))
+    return uid;
+
+  return 0;
+}
+
+/* Return true if comparing or subtracting A and B gives a result that depends
+   on where a variable they may point to is located.  A null check doesn't,
+   since the address of a variable is never null.  Neither does using two
+   pointers into the same variable, since then only their offsets matter.  */
+
+static bool
+pointer_pair_exposes_address_p (tree a, tree b)
+{
+  if (integer_zerop (a) || integer_zerop (b))
+    return false;
+
+  unsigned int uid = only_pointee_uid (a);
+  return !uid || uid != only_pointee_uid (b);
+}
+
+/* Mark the variables whose address may reach a non-pointer value through the
+   assignment STMT.  */
+
+static void
+mark_assign_exposed_vars (gassign *stmt, vec<tree> &vars)
+{
+  enum tree_code code = gimple_assign_rhs_code (stmt);
+  tree lhs = gimple_assign_lhs (stmt);
+
+  /* Points-to analysis follows an address from one pointer to another.  */
+  if (TREE_CODE (lhs) == SSA_NAME
+      && POINTER_TYPE_P (TREE_TYPE (lhs))
+      && (code == SSA_NAME
+	  || code == ADDR_EXPR
+	  || code == POINTER_PLUS_EXPR
+	  || code == COND_EXPR
+	  || CONVERT_EXPR_CODE_P (code)))
+    return;
+
+  if ((TREE_CODE_CLASS (code) == tcc_comparison || code == POINTER_DIFF_EXPR)
+      && !pointer_pair_exposes_address_p (gimple_assign_rhs1 (stmt),
+					  gimple_assign_rhs2 (stmt)))
+    return;
+
+  /* Everything else gives the address to a non-pointer, including a store,
+     since memory can be read back as anything.  */
+  for (unsigned int i = 1; i < gimple_num_ops (stmt); i++)
+    {
+      tree op = gimple_op (stmt, i);
+      if (!op)
+	continue;
+
+      if (TREE_CODE (op) == CONSTRUCTOR)
+	{
+	  unsigned int j;
+	  tree val;
+	  FOR_EACH_CONSTRUCTOR_VALUE (CONSTRUCTOR_ELTS (op), j, val)
+	    mark_exposed_vars (val, vars);
+	  continue;
+	}
+
+      /* See through a register reinterpreted as another type or broken into
+	 pieces.  A memory reference only reads through the address.  */
+      while (handled_component_p (op))
+	op = TREE_OPERAND (op, 0);
+      mark_exposed_vars (op, vars);
+    }
+}
+
+/* Return true if NAME can only decide branches or become the return value of
+   this function.  */
+
+static bool
+only_branched_on_or_returned_p (tree name, bitmap visited)
+{
+  if (!bitmap_set_bit (visited, SSA_NAME_VERSION (name)))
+    return true;
+
+  use_operand_p use_p;
+  imm_use_iterator iter;
+  FOR_EACH_IMM_USE_FAST (use_p, iter, name)
+    {
+      gimple *use_stmt = USE_STMT (use_p);
+      if (is_gimple_debug (use_stmt)
+	  || gimple_code (use_stmt) == GIMPLE_COND
+	  || gimple_code (use_stmt) == GIMPLE_RETURN)
+	continue;
+
+      gphi *phi = dyn_cast <gphi *> (use_stmt);
+      if (!phi || !only_branched_on_or_returned_p (gimple_phi_result (phi),
+						   visited))
+	return false;
+    }
+  return true;
+}
+
+/* Mark the variables whose address may reach a result of the call STMT.  A
+   call that keeps or stores the address makes it escape instead.
+
+   Only an unused argument can be ruled out from the callee's EAF flags.  They
+   say an argument isn't returned even if the result comes from a comparison or
+   a subtraction of pointers, since modref doesn't follow those.  That goes for
+   a pointer result as well, which points-to analysis then takes to be
+   unrelated to the variable.
+
+   A result that's a pointer or that's only branched on doesn't expose the
+   variable right away, since most such calls are a lookup or a check followed
+   by an early return, and refusing every tail call in their callers would be
+   costly.  It's followed through REVEALED_NAMES instead.  */
+
+static void
+mark_call_exposed_vars (gcall *stmt, vec<tree> &vars)
+{
+  tree lhs = gimple_call_lhs (stmt);
+  if (!lhs
+      || gimple_call_internal_p (stmt)
+      || (gimple_call_builtin_p (stmt, BUILT_IN_NORMAL)
+	  && (gimple_call_flags (stmt) & ECF_LEAF)))
+    return;
+
+  bool follow_p = false;
+  if (TREE_CODE (lhs) == SSA_NAME)
+    {
+      auto_bitmap visited;
+      follow_p = (POINTER_TYPE_P (TREE_TYPE (lhs))
+		  || only_branched_on_or_returned_p (lhs, visited));
+    }
+
+  auto mark_val = [&] (tree val)
+    {
+      if (follow_p)
+	mark_revealed_vars (val, lhs, vars);
+      else
+	mark_exposed_vars (val, vars);
+    };
+
+  for (unsigned int i = 0; i < gimple_call_num_args (stmt); i++)
+    if (!(gimple_call_arg_flags (stmt, i) & EAF_UNUSED))
+      mark_val (gimple_call_arg (stmt, i));
+
+  if (gimple_call_chain (stmt)
+      && !(gimple_call_static_chain_flags (stmt) & EAF_UNUSED))
+    mark_val (gimple_call_chain (stmt));
+}
+
+/* Add NAME to REVEALED_NAMES and, if it wasn't there yet, to WORKLIST.  */
+
+static void
+mark_revealed_name (tree name, vec<tree> &worklist)
+{
+  if (bitmap_set_bit (revealed_names, SSA_NAME_VERSION (name)))
+    worklist.safe_push (name);
+}
+
+/* Fill REVEALED_NAMES with REVEALED_RESULTS and every name that may depend on
+   one of them in a way the tail call CALL can tell, or any call if CALL is
+   NULL.
+
+   A statement using such a name passes that on to all of its definitions.
+   That includes its virtual definition, since a store can leave the value in
+   memory and everything after it can read that memory back.
+
+   A branch on such a name passes it on to the PHIs that can tell which way the
+   branch went, including the virtual ones.  Those are the PHIs in the iterated
+   dominance frontier of the branch's successors, the same blocks that would
+   need a PHI for a definition placed in either arm.  This covers the loop
+   header PHIs of a search loop that stops once the result says it found the
+   address, as well as a value picked by the result.
+
+   Only the blocks that can reach CALL matter, since a definition anywhere else
+   can only reach blocks that can't reach CALL either.  A branch with just one
+   successor among them went that way every time it ran on a path to CALL, so
+   nothing CALL gets depends on the outcome and the branch passes nothing on.
+   That's the case for an early return on the result, even one nested in an arm
+   or a loop, while a search loop reaches CALL both by stopping and by going
+   around again.  */
+
+static void
+propagate_revealed_names (gcall *call)
+{
+  auto_vec<tree> names;
+  unsigned int i;
+  bitmap_iterator bi;
+  EXECUTE_IF_SET_IN_BITMAP (revealed_results, 0, i, bi)
+    {
+      bitmap_set_bit (revealed_names, i);
+      names.safe_push (ssa_name (i));
+    }
+
+  basic_block bb;
+  if (!revealed_frontiers)
+    {
+      revealed_frontiers = XNEWVEC (bitmap_head,
+				    last_basic_block_for_fn (cfun));
+      FOR_EACH_BB_FN (bb, cfun)
+	bitmap_initialize (&revealed_frontiers[bb->index],
+			   &bitmap_default_obstack);
+      calculate_dominance_info (CDI_DOMINATORS);
+      compute_dominance_frontiers (revealed_frontiers);
+    }
+
+  /* REACHES holds the blocks that can reach CALL, the one holding it included,
+     and is left empty if CALL is NULL.  */
+  auto_sbitmap reaches (last_basic_block_for_fn (cfun));
+  bitmap_clear (reaches);
+  if (call)
+    {
+      auto_vec<basic_block> stack;
+      bitmap_set_bit (reaches, gimple_bb (call)->index);
+      stack.safe_push (gimple_bb (call));
+      while (!stack.is_empty ())
+	{
+	  edge e;
+	  edge_iterator ei;
+	  FOR_EACH_EDGE (e, ei, stack.pop ()->preds)
+	    if (bitmap_set_bit (reaches, e->src->index))
+	      stack.safe_push (e->src);
+	}
+    }
+  auto can_reach_call = [&] (basic_block bb)
+    {
+      return !call || bitmap_bit_p (reaches, bb->index);
+    };
+
+  /* BLOCKS holds the blocks whose frontier still needs a look.  Every block
+     goes through it once and has its PHIs marked once, which keeps this linear
+     unlike running compute_idf again for each newly found branch.  */
+  auto_vec<int> blocks;
+  auto_bitmap queued_blocks, phi_blocks;
+  while (!names.is_empty () || !blocks.is_empty ())
+    {
+      if (!blocks.is_empty ())
+	{
+	  EXECUTE_IF_SET_IN_BITMAP (&revealed_frontiers[blocks.pop ()], 0, i, bi)
+	    if (can_reach_call (BASIC_BLOCK_FOR_FN (cfun, i))
+		&& bitmap_set_bit (phi_blocks, i))
+	      {
+		for (gphi_iterator gsi
+		       = gsi_start_phis (BASIC_BLOCK_FOR_FN (cfun, i));
+		     !gsi_end_p (gsi); gsi_next (&gsi))
+		  mark_revealed_name (gimple_phi_result (gsi.phi ()), names);
+		if (bitmap_set_bit (queued_blocks, i))
+		  blocks.safe_push (i);
+	      }
+	  continue;
+	}
+
+      tree name = names.pop ();
+      use_operand_p use_p;
+      imm_use_iterator iter;
+      FOR_EACH_IMM_USE_FAST (use_p, iter, name)
+	{
+	  gimple *stmt = USE_STMT (use_p);
+	  if (is_gimple_debug (stmt) || !can_reach_call (gimple_bb (stmt)))
+	    continue;
+
+	  if (gphi *phi = dyn_cast <gphi *> (stmt))
+	    {
+	      mark_revealed_name (gimple_phi_result (phi), names);
+	      continue;
+	    }
+
+	  ssa_op_iter op_iter;
+	  tree def;
+	  FOR_EACH_SSA_TREE_OPERAND (def, stmt, op_iter, SSA_OP_ALL_DEFS)
+	    mark_revealed_name (def, names);
+
+	  if (stmt_ends_bb_p (stmt) && EDGE_COUNT (gimple_bb (stmt)->succs) > 1)
+	    {
+	      edge e;
+	      edge_iterator ei;
+	      unsigned int reaching = 0;
+	      FOR_EACH_EDGE (e, ei, gimple_bb (stmt)->succs)
+		if (e->dest != EXIT_BLOCK_PTR_FOR_FN (cfun)
+		    && can_reach_call (e->dest))
+		  reaching++;
+	      if (call && reaching < 2)
+		continue;
+	      FOR_EACH_EDGE (e, ei, gimple_bb (stmt)->succs)
+		if (e->dest != EXIT_BLOCK_PTR_FOR_FN (cfun)
+		    && can_reach_call (e->dest)
+		    && bitmap_set_bit (queued_blocks, e->dest->index))
+		  blocks.safe_push (e->dest->index);
+	    }
+	}
+    }
+}
+
+/* Make REVEALED_NAMES hold what the tail call CALL can tell from the results
+   in REVEALED_RESULTS.  Each run walks the part of the function that can reach
+   CALL, so once 32 calls had a run of their own, a single run that holds for
+   any call takes over to keep the cost bounded.  */
+
+static void
+compute_revealed_names (gcall *call)
+{
+  if (revealed_names_any_call || revealed_names_call == call)
+    return;
+  if (++revealed_names_runs > 32)
+    {
+      revealed_names_any_call = true;
+      call = NULL;
+    }
+  bitmap_clear (revealed_names);
+  revealed_names_call = call;
+  propagate_revealed_names (call);
+}
+
+/* Compute EXPOSED_VARS and REVEALED_RESULTS.  Points-to information only exists
+   for pointers, so it cannot say whether an integer holds the address of a
+   local variable, or a piece of the address.  But the address has to become a
+   non-pointer somewhere: it gets converted, used in arithmetic or a
+   comparison, stored in memory, or passed to a call that computes its result
+   from it.  A variable whose address never does any of that cannot influence
+   any non-pointer value computed by this function, whether through data or a
+   branch, and that holds regardless of how many steps a value takes on its way
+   to a tail call.
+
+   Asm operands aren't considered since points-to analysis already makes the
+   address of any such operand escape.  What a callee writes to memory after
+   only branching on the address isn't caught, since nothing tells it apart
+   from a callee that doesn't look at the address.  */
+
+static void
+compute_exposed_vars (void)
+{
+  exposed_vars = BITMAP_ALLOC (NULL);
+  revealed_vars = BITMAP_ALLOC (NULL);
+  revealed_results = BITMAP_ALLOC (NULL);
+  revealed_names = BITMAP_ALLOC (NULL);
+
+  auto_vec<tree> vars;
+  unsigned int idx;
+  tree var;
+  FOR_EACH_LOCAL_DECL (cfun, idx, var)
+    if (TREE_CODE (var) != PARM_DECL
+	&& auto_var_in_fn_p (var, cfun->decl)
+	&& may_be_aliased (var))
+      vars.safe_push (var);
+
+  basic_block bb;
+  FOR_EACH_BB_FN (bb, cfun)
+    for (gimple_stmt_iterator gsi = gsi_start_bb (bb);
+	 !gsi_end_p (gsi) && !vars.is_empty (); gsi_next (&gsi))
+      {
+	gimple *stmt = gsi_stmt (gsi);
+	if (gassign *assign = dyn_cast <gassign *> (stmt))
+	  mark_assign_exposed_vars (assign, vars);
+	else if (gcall *call = dyn_cast <gcall *> (stmt))
+	  mark_call_exposed_vars (call, vars);
+	else if (gcond *cond = dyn_cast <gcond *> (stmt))
+	  {
+	    tree lhs = gimple_cond_lhs (cond), rhs = gimple_cond_rhs (cond);
+	    if (pointer_pair_exposes_address_p (lhs, rhs))
+	      {
+		mark_exposed_vars (lhs, vars);
+		mark_exposed_vars (rhs, vars);
+	      }
+	  }
+      }
+}
+
 /* Return true if the tail call CALL may be able to see the address of the local
    variable VAR, even if it never accesses VAR through that address.  The call
    starts on top of the frame holding VAR once it's a tail call, or reuses that
@@ -667,32 +1106,76 @@ static vec<bitmap_head> live_vars_vec;
 static bool
 call_may_see_address_p (gcall *call, tree var)
 {
-  /* An escaped address can be read back from memory, which only a const call
-     cannot do.  */
-  if (!(gimple_call_flags (call) & ECF_CONST)
+  int flags = gimple_call_flags (call);
+  bool leaf_builtin = (gimple_call_builtin_p (call, BUILT_IN_NORMAL)
+		       && (flags & ECF_LEAF));
+
+  /* Any call can read an escaped address back from memory, except for a leaf
+     builtin, which doesn't run any code of ours.  */
+  if (!leaf_builtin
       && pt_solution_includes (&cfun->gimple_df->escaped, var))
     return true;
 
-  auto value_may_hold_address_p = [var] (tree val)
+  /* A leaf builtin also has no objects of its own that a caller could compare
+     against, so it doesn't matter if a non-pointer it's handed was computed
+     from the address.  Any other call can make use of such a value.  */
+  if (!leaf_builtin)
     {
-      if (CONSTANT_CLASS_P (val))
-	return false;
-      tree type = TREE_TYPE (val);
-      if (POINTER_TYPE_P (type))
-	return ptr_deref_may_alias_decl_p (val, var);
+      if (!exposed_vars)
+	compute_exposed_vars ();
+      if (bitmap_bit_p (exposed_vars, DECL_UID (var)))
+	return true;
+    }
 
-      /* Points-to information only exists for pointers, so assume any other
-	 value that's large enough can hide an address.  */
-      return (!tree_fits_uhwi_p (TYPE_SIZE (type))
-	      || tree_to_uhwi (TYPE_SIZE (type)) >= POINTER_SIZE);
+  auto pointer_may_hold_address_p = [var] (tree val)
+    {
+      return (POINTER_TYPE_P (TREE_TYPE (val))
+	      && !CONSTANT_CLASS_P (val)
+	      && ptr_deref_may_alias_decl_p (val, var));
     };
 
   for (unsigned int i = 0; i < gimple_call_num_args (call); i++)
-    if (value_may_hold_address_p (gimple_call_arg (call, i)))
+    if (pointer_may_hold_address_p (gimple_call_arg (call, i)))
       return true;
 
   return (gimple_call_chain (call)
-	  && value_may_hold_address_p (gimple_call_chain (call)));
+	  && pointer_may_hold_address_p (gimple_call_chain (call)));
+}
+
+/* Return true if the address of VAR, as learned from the result of an earlier
+   call, may reach the tail call CALL.  That takes an operand depending on such
+   a result that's as wide as a pointer, or memory depending on it that the
+   callee can read.  A value computed from what was available before the
+   earlier call, such as a parameter, isn't taken to carry the address unless
+   that result picked it, so tail calls following something like a failed
+   lookup stay.  This misses a lone guess of the address that the earlier call
+   merely confirmed, as well as a narrower piece of the address.  */
+
+static bool
+call_may_get_revealed_address_p (gcall *call, tree var)
+{
+  if (gimple_call_builtin_p (call, BUILT_IN_NORMAL)
+      && (gimple_call_flags (call) & ECF_LEAF))
+    return false;
+
+  if (!exposed_vars)
+    compute_exposed_vars ();
+  if (!bitmap_bit_p (revealed_vars, DECL_UID (var)))
+    return false;
+  compute_revealed_names (call);
+
+  ssa_op_iter iter;
+  tree use;
+  FOR_EACH_SSA_TREE_OPERAND (use, call, iter, SSA_OP_ALL_USES)
+    if (bitmap_bit_p (revealed_names, SSA_NAME_VERSION (use)))
+      {
+	tree size = TYPE_SIZE (TREE_TYPE (use));
+	if (virtual_operand_p (use)
+	    || !tree_fits_uhwi_p (size)
+	    || tree_to_uhwi (size) >= POINTER_SIZE)
+	  return true;
+      }
+  return false;
 }
 
 /* Finds tailcalls falling into basic block BB when coming from edge ESUCC (or
@@ -1187,12 +1670,18 @@ find_tail_calls (basic_block bb, edge esucc, struct tailcall **ret,
      is OK.)  */
   FOR_EACH_LOCAL_DECL (cfun, idx, var)
     {
+      /* A variable that's out of scope by the time of the call doesn't matter,
+	 and that's far cheaper to find out than anything else here.  */
       if (TREE_CODE (var) != PARM_DECL
 	  && auto_var_in_fn_p (var, cfun->decl)
 	  && may_be_aliased (var)
+	  && (!VAR_P (var)
+	      || bitmap_bit_p (local_live_vars,
+			       *live_vars->get (DECL_UID (var))))
 	  && (ref_maybe_used_by_stmt_p (call, var, false)
 	      || call_may_clobber_ref_p (call, var, false)
-	      || call_may_see_address_p (call, var)))
+	      || call_may_see_address_p (call, var)
+	      || call_may_get_revealed_address_p (call, var)))
 	{
 	  if (!VAR_P (var))
 	    {
@@ -1217,32 +1706,28 @@ find_tail_calls (basic_block bb, edge esucc, struct tailcall **ret,
 	    }
 	  else
 	    {
-	      unsigned int *v = live_vars->get (DECL_UID (var));
-	      if (bitmap_bit_p (local_live_vars, *v))
+	      if (diag_musttail && gimple_call_must_tail_p (call))
 		{
-		  if (diag_musttail && gimple_call_must_tail_p (call))
+		  auto opt = OPT_Wmaybe_musttail_local_addr;
+		  if (!warning_suppressed_p (call, opt))
 		    {
-		      auto opt = OPT_Wmaybe_musttail_local_addr;
-		      if (!warning_suppressed_p (call, opt))
-			{
-			  if (!DECL_ARTIFICIAL (var) && DECL_NAME (var))
-			    warning_at (gimple_location (call), opt,
-					"address of automatic variable %qD "
-					"can escape to %<musttail%> call",
-					var);
-			  else
-			    warning_at (gimple_location (call), opt,
-					"address of local variable can escape "
-					"to %<musttail%> call");
-			  suppress_warning (call, opt);
-			}
-		      continue;
+		      if (!DECL_ARTIFICIAL (var) && DECL_NAME (var))
+			warning_at (gimple_location (call), opt,
+				    "address of automatic variable %qD "
+				    "can escape to %<musttail%> call",
+				    var);
+		      else
+			warning_at (gimple_location (call), opt,
+				    "address of local variable can escape "
+				    "to %<musttail%> call");
+		      suppress_warning (call, opt);
 		    }
-		  BITMAP_FREE (local_live_vars);
-		  maybe_error_musttail (call, _("call invocation refers to "
-						"locals"), diag_musttail);
-		  return;
+		  continue;
 		}
+	      BITMAP_FREE (local_live_vars);
+	      maybe_error_musttail (call, _("call invocation refers to "
+					    "locals"), diag_musttail);
+	      return;
 	    }
 	}
     }
@@ -2136,6 +2621,21 @@ tree_optimize_tail_calls_1 (bool opt_tailcalls, bool only_musttail,
       delete live_vars;
       live_vars = NULL;
     }
+  BITMAP_FREE (exposed_vars);
+  BITMAP_FREE (revealed_vars);
+  BITMAP_FREE (revealed_results);
+  BITMAP_FREE (revealed_names);
+  if (revealed_frontiers)
+    {
+      basic_block bb;
+      FOR_EACH_BB_FN (bb, cfun)
+	bitmap_clear (&revealed_frontiers[bb->index]);
+      XDELETEVEC (revealed_frontiers);
+      revealed_frontiers = NULL;
+    }
+  revealed_names_call = NULL;
+  revealed_names_any_call = false;
+  revealed_names_runs = 0;
 
   if (cfun->has_musttail)
     {
