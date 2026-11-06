@@ -3697,6 +3697,39 @@ dse_step7 (void)
 }
 
 
+/* Remove every REG_EQUAL note that reads writable memory.  Notes don't count as
+   reads when we decide that a store is dead, so deleting a store can leave a
+   note claiming that a register equals a MEM which no longer holds that value.
+   Passes that run later, such as late-combine, trust the note and can use it to
+   fold the register to a wrong value.  We don't know which memory the deleted
+   stores covered by the time we get here, so drop all such notes.  */
+
+static void
+remove_mem_equal_notes (void)
+{
+  basic_block bb;
+  rtx_insn *insn;
+
+  FOR_EACH_BB_FN (bb, cfun)
+    FOR_BB_INSNS (bb, insn)
+      {
+	if (!INSN_P (insn))
+	  continue;
+
+	rtx note = find_reg_note (insn, REG_EQUAL, NULL_RTX);
+	if (!note)
+	  continue;
+
+	subrtx_iterator::array_type array;
+	FOR_EACH_SUBRTX (iter, array, XEXP (note, 0), NONCONST)
+	  if (MEM_P (*iter) && !MEM_READONLY_P (*iter))
+	    {
+	      remove_note (insn, note);
+	      break;
+	    }
+      }
+}
+
 /* -------------------------------------------------------------------------
    DSE
    ------------------------------------------------------------------------- */
@@ -3739,6 +3772,9 @@ rest_of_handle_dse (void)
 
   dse_step6 ();
   dse_step7 ();
+
+  if (locally_deleted || globally_deleted)
+    remove_mem_equal_notes ();
 
   if (dump_file)
     fprintf (dump_file, "dse: local deletions = %d, global deletions = %d\n",
