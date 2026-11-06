@@ -1645,6 +1645,8 @@ pair_fusion_bb_info::fuse_pair (bool load_p,
     PATTERN (first->rtl ()),
     PATTERN (second->rtl ())
   };
+  bool frame_related_p = (RTX_FRAME_RELATED_P (first->rtl ())
+			  || RTX_FRAME_RELATED_P (second->rtl ()));
 
   // Make copies of the patterns as we might need to refer to the original RTL
   // later, for example when updating debug uses (which is after we've updated
@@ -1924,6 +1926,12 @@ pair_fusion_bb_info::fuse_pair (bool load_p,
 			 "  stp: cannot re-purpose candidate stores\n");
 
 	      auto new_insn = crtl->ssa->create_insn (attempt, INSN, pair_pat);
+	      // create_insn makes an insn without notes, so attach the
+	      // combined notes here as set_pair_pat does for a reused insn.
+	      // The pair gets marked frame-related below if either access
+	      // was, and dwarf2cfi needs the CFI notes to describe it.
+	      validate_change (new_insn->rtl (), &REG_NOTES (new_insn->rtl ()),
+			       reg_notes, true);
 	      change = make_change (new_insn);
 	      change->move_range = move_range;
 	      change->new_uses = new_uses;
@@ -2033,6 +2041,12 @@ pair_fusion_bb_info::fuse_pair (bool load_p,
 
   for (auto uid : tombstone_uids)
     track_tombstone (uid);
+
+  // combine_reg_notes keeps the CFI notes of both accesses, but dwarf2cfi only
+  // looks at them if the insn holding them is marked as frame-related.  The
+  // pair can end up in either of the original insns or in a new one, so make
+  // sure the marking survives if just one of the accesses had it.
+  RTX_FRAME_RELATED_P (pair_change->insn ()->rtl ()) = frame_related_p;
 
   return true;
 }
