@@ -1475,7 +1475,7 @@ instrument_mem_ref (tree mem, tree base, gimple_stmt_iterator *iter,
 /* Perform the pointer instrumentation.  */
 
 static void
-instrument_null (gimple_stmt_iterator gsi, tree t, bool is_lhs)
+instrument_null (gimple_stmt_iterator *gsi, tree t, bool is_lhs)
 {
   /* Handle also e.g. &s->i.  */
   if (TREE_CODE (t) == ADDR_EXPR)
@@ -1484,7 +1484,7 @@ instrument_null (gimple_stmt_iterator gsi, tree t, bool is_lhs)
   if (base != NULL_TREE
       && TREE_CODE (base) == MEM_REF
       && TREE_CODE (TREE_OPERAND (base, 0)) == SSA_NAME)
-    instrument_mem_ref (t, base, &gsi, is_lhs);
+    instrument_mem_ref (t, base, gsi, is_lhs);
 }
 
 /* Instrument pointer arithmetics PTR p+ OFF.  */
@@ -2501,9 +2501,9 @@ pass_ubsan::execute (function *fun)
 	  if (sanitize_flags_p (SANITIZE_NULL | SANITIZE_ALIGNMENT, fun->decl))
 	    {
 	      if (gimple_store_p (stmt))
-		instrument_null (gsi, gimple_get_lhs (stmt), true);
+		instrument_null (&gsi, gimple_get_lhs (stmt), true);
 	      if (gimple_assign_single_p (stmt))
-		instrument_null (gsi, gimple_assign_rhs1 (stmt), false);
+		instrument_null (&gsi, gimple_assign_rhs1 (stmt), false);
 	      if (is_gimple_call (stmt))
 		{
 		  unsigned args_num = gimple_call_num_args (stmt);
@@ -2512,9 +2512,12 @@ pass_ubsan::execute (function *fun)
 		      tree arg = gimple_call_arg (stmt, i);
 		      if (is_gimple_reg (arg) || is_gimple_min_invariant (arg))
 			continue;
-		      instrument_null (gsi, arg, false);
+		      instrument_null (&gsi, arg, false);
 		    }
 		}
+	      /* Inserting before a returns_twice call splits the block and
+		 moves the call into the new one.  */
+	      bb = gsi_bb (gsi);
 	    }
 
 	  if (sanitize_flags_p (SANITIZE_BOOL | SANITIZE_ENUM, fun->decl)
@@ -2564,6 +2567,7 @@ pass_ubsan::execute (function *fun)
 		      instrument_object_size (&gsi, arg, false);
 		    }
 		}
+	      bb = gsi_bb (gsi);
 	    }
 
 	  if (sanitize_flags_p (SANITIZE_POINTER_OVERFLOW, fun->decl))
@@ -2590,6 +2594,7 @@ pass_ubsan::execute (function *fun)
 		      maybe_instrument_pointer_overflow (&gsi, arg);
 		    }
 		}
+	      bb = gsi_bb (gsi);
 	    }
 
 	  gsi_next (&gsi);
