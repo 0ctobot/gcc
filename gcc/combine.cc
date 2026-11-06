@@ -8772,12 +8772,17 @@ force_to_mode (rtx x, machine_mode mode, unsigned HOST_WIDE_INT mask,
 
   /* If this is a CALL or ASM_OPERANDS, don't do anything.  Some of the
      code below will do the wrong thing since the mode of such an
-     expression is VOIDmode.
-
-     Also do nothing if X is a CLOBBER; this can happen if X was
-     the return value from a call to gen_lowpart.  */
-  if (code == CALL || code == ASM_OPERANDS || code == CLOBBER)
+     expression is VOIDmode.  */
+  if (code == CALL || code == ASM_OPERANDS)
     return x;
+
+  /* X can be a CLOBBER if it was the return value from a call to gen_lowpart,
+     which is how a failed substitution gets reported.  Keep reporting that
+     failure, but in MODE since our callers build expressions in MODE around the
+     result, and simplify_subreg asserts on an operand in an unexpected
+     mode.  */
+  if (code == CLOBBER)
+    return GET_MODE (x) == mode ? x : gen_rtx_CLOBBER (mode, const0_rtx);
 
   /* We want to perform the operation in its present mode unless we know
      that the operation is valid in MODE, in which case we do the operation
@@ -11890,6 +11895,12 @@ gen_lowpart_for_combine (machine_mode omode, rtx x)
 
   if (omode == imode)
     return x;
+
+  /* X is already a failed substitution.  Don't wrap it in a SUBREG, since
+     force_to_mode can strip the SUBREG again and leave the CLOBBER in a mode
+     that doesn't match the expression around it.  */
+  if (GET_CODE (x) == CLOBBER)
+    goto fail;
 
   /* We can only support MODE being wider than a word if X is a
      constant integer or has a mode the same size.  */
