@@ -49,6 +49,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "dbgcnt.h"
 #include "insn-codes.h"
 #include "optabs-tree.h"
+#include "tree-ssa-dse.h"
 
 /* TODO:  Support for predicated code motion.  I.e.
 
@@ -3468,9 +3469,71 @@ find_refs_for_sm (class loop *loop, bitmap sm_executed, bitmap refs_to_sm)
     }
 }
 
+/* Return true if the function may never get to the exits of LOOP, where store
+   motion would put the stores that it delays.  A volatile access doesn't stop
+   the function on its own, it takes a loop that spins on it.  Thus it only
+   counts when a loop around it inside of LOOP isn't known to be finite.  */
+
+static bool
+function_may_stop_in_loop_p (class loop *loop)
+{
+  basic_block *body = get_loop_body (loop);
+  auto_vec<class loop *, 8> volatile_loops;
+  bool ret = false;
+  for (unsigned i = 0; i < loop->num_nodes && !ret; ++i)
+    for (gimple_stmt_iterator gsi = gsi_start_bb (body[i]);
+	 !gsi_end_p (gsi) && !ret; gsi_next (&gsi))
+      {
+	gimple *stmt = gsi_stmt (gsi);
+	if (!stmt_may_end_function_p (cfun, stmt))
+	  continue;
+	if (is_gimple_assign (stmt) && !stmt_can_throw_external (cfun, stmt))
+	  volatile_loops.safe_push (body[i]->loop_father);
+	else
+	  ret = true;
+      }
+  free (body);
+  if (ret || volatile_loops.is_empty ())
+    return ret;
+
+  /* finite_loop_p can only work out the bound of a loop under SCEV.  */
+  bool init_scev = !scev_initialized_p ();
+  if (init_scev)
+    scev_initialize ();
+  for (class loop *inner : volatile_loops)
+    for (class loop *l = inner; !ret; l = loop_outer (l))
+      {
+	ret = !finite_loop_p (l);
+	if (l == loop)
+	  break;
+      }
+  if (init_scev)
+    scev_finalize ();
+  return ret;
+}
+
+/* Drop the references that memory outside of the function can see from the
+   REFS_TO_SM of LOOP if the function may stop running inside of LOOP.  */
+
+static void
+keep_visible_stores_in_loop (class loop *loop, bitmap refs_to_sm)
+{
+  if (!function_may_stop_in_loop_p (loop))
+    return;
+
+  unsigned i;
+  bitmap_iterator bi;
+  auto_bitmap visible;
+  EXECUTE_IF_SET_IN_BITMAP (refs_to_sm, 0, i, bi)
+    if (ref_may_alias_global_p (&memory_accesses.refs_list[i]->mem, true))
+      bitmap_set_bit (visible, i);
+  bitmap_and_compl_into (refs_to_sm, visible);
+}
+
 /* Checks whether LOOP (with exits stored in EXITS array) is suitable
    for a store motion optimization (i.e. whether we can insert statement
-   on its exits).  */
+   on its exits).  Store motion would make the stores vanish from a loop that
+   has no exits.  */
 
 static bool
 loop_suitable_for_sm (class loop *loop ATTRIBUTE_UNUSED,
@@ -3478,6 +3541,9 @@ loop_suitable_for_sm (class loop *loop ATTRIBUTE_UNUSED,
 {
   unsigned i;
   edge ex;
+
+  if (exits.is_empty ())
+    return false;
 
   FOR_EACH_VEC_ELT (exits, i, ex)
     if (ex->flags & (EDGE_ABNORMAL | EDGE_EH))
@@ -3500,6 +3566,8 @@ store_motion_loop (class loop *loop, bitmap sm_executed)
   if (loop_suitable_for_sm (loop, exits))
     {
       find_refs_for_sm (loop, sm_executed, sm_in_loop);
+      if (!bitmap_empty_p (sm_in_loop))
+	keep_visible_stores_in_loop (loop, sm_in_loop);
       if (!bitmap_empty_p (sm_in_loop))
 	hoist_memory_references (loop, sm_in_loop, exits);
     }
