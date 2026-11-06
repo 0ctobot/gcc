@@ -2152,8 +2152,9 @@ execute_update_addresses_taken (void)
 			tree tem = make_ssa_name (TREE_TYPE (TREE_TYPE (var)));
 			gimple *pun
 			  = gimple_build_assign (tem,
-						 build1 (VIEW_CONVERT_EXPR,
-							 TREE_TYPE (tem), val));
+						 fold_build1 (VIEW_CONVERT_EXPR,
+							      TREE_TYPE (tem),
+							      val));
 			gsi_insert_before (&gsi, pun, GSI_SAME_STMT);
 			val = tem;
 		      }
@@ -2208,8 +2209,9 @@ execute_update_addresses_taken (void)
 			tree tem = make_ssa_name (temtype);
 			gimple *pun
 			  = gimple_build_assign (tem,
-						 build1 (VIEW_CONVERT_EXPR,
-							 TREE_TYPE (tem), val));
+						 fold_build1 (VIEW_CONVERT_EXPR,
+							      TREE_TYPE (tem),
+							      val));
 			gsi_insert_before (&gsi, pun, GSI_SAME_STMT);
 			val = tem;
 		      }
