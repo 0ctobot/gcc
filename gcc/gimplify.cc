@@ -6247,6 +6247,25 @@ gimplify_compound_literal_expr (tree *expr_p, gimple_seq *pre_p,
   return GS_OK;
 }
 
+/* Return the initializer of DECL, the object of a compound literal, if it can
+   stand in for the value of the literal.  A static literal that holds data for
+   a flexible array member is bigger than its type, and its value doesn't
+   include that data, so its initializer can't.  */
+
+static tree
+compound_literal_value_init (tree decl)
+{
+  tree type_size = TYPE_SIZE_UNIT (TREE_TYPE (decl));
+  tree decl_size = DECL_SIZE_UNIT (decl);
+  if (type_size
+      && decl_size
+      && TREE_CODE (type_size) == INTEGER_CST
+      && TREE_CODE (decl_size) == INTEGER_CST
+      && tree_int_cst_lt (type_size, decl_size))
+    return NULL_TREE;
+  return DECL_INITIAL (decl);
+}
+
 /* Optimize embedded COMPOUND_LITERAL_EXPRs within a CONSTRUCTOR,
    return a new CONSTRUCTOR if something changed.  */
 
@@ -6267,7 +6286,7 @@ optimize_compound_literals_in_ctor (tree orig_ctor)
 	{
 	  tree decl_s = COMPOUND_LITERAL_EXPR_DECL_EXPR (value);
 	  tree decl = DECL_EXPR_DECL (decl_s);
-	  tree init = DECL_INITIAL (decl);
+	  tree init = compound_literal_value_init (decl);
 
 	  if (!TREE_ADDRESSABLE (value)
 	      && !TREE_ADDRESSABLE (decl)
@@ -6804,14 +6823,19 @@ gimplify_modify_expr_rhs (tree *expr_p, tree *from_p, tree *to_p,
 	     field basis.  However, if the target is volatile and the type
 	     is aggregate and non-addressable, gimplify_init_constructor
 	     knows that it needs to ensure a single access to the target
-	     and it will return GS_OK only in this case.  */
+	     and it will return GS_OK only in this case.  The data of a
+	     flexible array member makes a variable bigger than its type, and
+	     the assignment must not store that data since it copies the size
+	     of the type alone.  */
 	  if (TREE_READONLY (*from_p)
 	      && DECL_INITIAL (*from_p)
 	      && TREE_CODE (DECL_INITIAL (*from_p)) == CONSTRUCTOR
 	      && !TREE_THIS_VOLATILE (*from_p)
 	      && (!TREE_THIS_VOLATILE (*to_p)
 		  || (AGGREGATE_TYPE_P (TREE_TYPE (*to_p))
-		      && !TREE_ADDRESSABLE (TREE_TYPE (*to_p)))))
+		      && !TREE_ADDRESSABLE (TREE_TYPE (*to_p))))
+	      && tree_int_cst_equal (DECL_SIZE_UNIT (*from_p),
+				     TYPE_SIZE_UNIT (TREE_TYPE (*from_p))))
 	    {
 	      tree old_from = *from_p;
 	      enum gimplify_status subret;
@@ -7073,7 +7097,7 @@ gimplify_modify_expr_rhs (tree *expr_p, tree *from_p, tree *to_p,
 	    tree complit = TREE_OPERAND (*expr_p, 1);
 	    tree decl_s = COMPOUND_LITERAL_EXPR_DECL_EXPR (complit);
 	    tree decl = DECL_EXPR_DECL (decl_s);
-	    tree init = DECL_INITIAL (decl);
+	    tree init = compound_literal_value_init (decl);
 
 	    /* struct T x = (struct T) { 0, 1, 2 } can be optimized
 	       into struct T x = { 0, 1, 2 } if the address of the

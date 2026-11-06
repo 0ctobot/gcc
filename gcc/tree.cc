@@ -13924,7 +13924,12 @@ component_ref_size (tree ref, special_array_member *sam /* = NULL */)
       if (init != error_mark_node)
 	{
 	  init = get_initializer_for (init, member);
-	  if (init)
+	  if (init && !COMPLETE_TYPE_P (TREE_TYPE (init)))
+	    /* The C front end leaves the array type of the data in a static
+	       compound literal incomplete, but the size of the literal includes
+	       the data.  */
+	    memsize = DECL_SIZE_UNIT (base);
+	  else if (init)
 	    {
 	      memsize = TYPE_SIZE_UNIT (TREE_TYPE (init));
 	      if (tree refsize = TYPE_SIZE_UNIT (argtype))
