@@ -700,6 +700,20 @@ tmp_type_needs_alloca_p (tree type)
 	  && max_int_size_in_bytes (type) < 0);
 }
 
+/* Allocate TMP, a temporary whose type has tmp_type_needs_alloca_p true, adding
+   the allocation to PRE_P.  The alloca_tmp_scope of the enclosing full
+   expression reclaims the space since, unlike a VLA, this doesn't need to
+   outlive the statement.  */
+
+static void
+gimplify_alloca_tmp_decl (tree tmp, gimple_seq *pre_p)
+{
+  bool old_stmt_alloca_long = gimplify_ctxp->stmt_alloca_long;
+  gimplify_vla_decl (tmp, pre_p);
+  gimplify_ctxp->stmt_alloca_long = old_stmt_alloca_long;
+  gimplify_ctxp->stmt_alloca_tmp = true;
+}
+
 /* Create a temporary of type TYPE, for which tmp_type_needs_alloca_p is true,
    naming it after PREFIX and adding its allocation to PRE_P.  The
    alloca_tmp_scope of the enclosing full expression reclaims the space.
@@ -717,11 +731,7 @@ create_alloca_tmp_var (tree type, const char *prefix, gimple_seq *pre_p)
   if (!TYPE_SIZES_GIMPLIFIED (type))
     gimplify_type_sizes (type, pre_p);
 
-  /* Unlike a VLA, this doesn't need to outlive the statement.  */
-  bool old_stmt_alloca_long = gimplify_ctxp->stmt_alloca_long;
-  gimplify_vla_decl (tmp, pre_p);
-  gimplify_ctxp->stmt_alloca_long = old_stmt_alloca_long;
-  gimplify_ctxp->stmt_alloca_tmp = true;
+  gimplify_alloca_tmp_decl (tmp, pre_p);
 
   /* The value expression is an INDIRECT_REF, which isn't valid in GIMPLE.  */
   tree ref = unshare_expr (DECL_VALUE_EXPR (tmp));
@@ -8032,15 +8042,22 @@ gimplify_save_expr (tree *expr_p, gimple_seq *pre_p, gimple_seq *post_p)
 	{
 	  /* An __auto_type initializer is saved so that a later statement can
 	     read it, so it must outlive the statement.  */
-	  if (tmp_type_needs_alloca_p (TREE_TYPE (val)))
+	  bool long_lived = tmp_type_needs_alloca_p (TREE_TYPE (val));
+	  if (long_lived)
 	    gimplify_ctxp->stmt_alloca_long = true;
 
-	  /* The temporary may not be an SSA name as later abnormal and EH
-	     control flow may invalidate use/def domination.  When in SSA
-	     form then assume there are no such issues and SAVE_EXPRs only
-	     appear via GENERIC foldings.  */
-	  val = get_initialized_tmp_var (val, pre_p, post_p,
-					 gimple_in_ssa_p (cfun));
+	  /* The slot of a TARGET_EXPR can hold the value for those reads, so
+	     don't take up more stack with a copy of it.  */
+	  if (long_lived && TREE_CODE (val) == TARGET_EXPR)
+	    ret = gimplify_expr (&val, pre_p, post_p, is_gimple_lvalue,
+				 fb_lvalue);
+	  else
+	    /* The temporary may not be an SSA name as later abnormal and EH
+	       control flow may invalidate use/def domination.  When in SSA
+	       form then assume there are no such issues and SAVE_EXPRs only
+	       appear via GENERIC foldings.  */
+	    val = get_initialized_tmp_var (val, pre_p, post_p,
+					   gimple_in_ssa_p (cfun));
 	}
 
       TREE_OPERAND (*expr_p, 0) = val;
@@ -8824,7 +8841,10 @@ gimplify_target_expr (tree *expr_p, gimple_seq *pre_p, gimple_seq *post_p)
 	    gimplify_type_sizes (TREE_TYPE (temp), &init_pre_p);
 	  /* FIXME: this is correct only when the size of the type does
 	     not depend on expressions evaluated in init.  */
-	  gimplify_vla_decl (temp, &init_pre_p);
+	  if (tmp_type_needs_alloca_p (TREE_TYPE (temp)))
+	    gimplify_alloca_tmp_decl (temp, &init_pre_p);
+	  else
+	    gimplify_vla_decl (temp, &init_pre_p);
 	  is_vla = true;
 	}
       else

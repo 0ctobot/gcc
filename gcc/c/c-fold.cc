@@ -725,8 +725,10 @@ c_fully_fold_internal (tree expr, bool in_init, bool *maybe_const_operands,
 	  TREE_OPERAND (expr, 0) = op0;
 	  SAVE_EXPR_FOLDED_P (expr) = true;
 	}
-      /* Return the SAVE_EXPR operand if it is invariant.  */
-      if (tree_invariant_p (op0))
+      /* Return the SAVE_EXPR operand if it is invariant.  A TARGET_EXPR only
+	 counts as invariant since it runs once, and the gimplifier needs to see
+	 the SAVE_EXPR around one to know that its value is read later.  */
+      if (tree_invariant_p (op0) && TREE_CODE (op0) != TARGET_EXPR)
 	ret = op0;
       goto out;
 
