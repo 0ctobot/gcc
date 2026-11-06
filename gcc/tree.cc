@@ -5040,8 +5040,8 @@ stabilize_reference_1 (tree e)
    Returns the stabilized reference.  This works by means of save_expr,
    so see the caveats in the comments about save_expr.
 
-   Also allows conversion expressions whose operands are references.
-   Any other kind of expression is returned unchanged.  */
+   Also allows conversions and complex part selections whose operands are
+   references.  Any other kind of expression is returned unchanged.  */
 
 tree
 stabilize_reference (tree ref)
@@ -5060,6 +5060,9 @@ stabilize_reference (tree ref)
     CASE_CONVERT:
     case FLOAT_EXPR:
     case FIX_TRUNC_EXPR:
+    case REALPART_EXPR:
+    case IMAGPART_EXPR:
+    case VIEW_CONVERT_EXPR:
       result = build_nt (code, stabilize_reference (TREE_OPERAND (ref, 0)));
       break;
 
