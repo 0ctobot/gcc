@@ -93,9 +93,17 @@ phi_group::is_modifier_p (gimple *s, const bitmap bm, tree *op)
   gimple_range_op_handler handler (s);
   if (handler)
     {
-      tree op1 = gimple_range_ssa_p (handler.operand1 ());
-      tree op2 = gimple_range_ssa_p (handler.operand2 ());
-      // Also disallow modifiers that have 2 ssa-names.
+      tree op1 = handler.operand1 ();
+      tree op2 = handler.operand2 ();
+      // Also disallow modifiers that have 2 ssa-names.  Check for them before
+      // gimple_range_ssa_p hides a name that occurs in an abnormal PHI, since
+      // fold_range still hands the iteration range to the first ssa-name in the
+      // statement when that name is a hidden one.
+      if (op1 && op2 && TREE_CODE (op1) == SSA_NAME
+	  && TREE_CODE (op2) == SSA_NAME)
+	return 0;
+      op1 = gimple_range_ssa_p (op1);
+      op2 = gimple_range_ssa_p (op2);
       if (op1 && !op2 && bitmap_bit_p (bm, SSA_NAME_VERSION (op1)))
 	{
 	  if (op)
