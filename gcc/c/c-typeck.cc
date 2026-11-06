@@ -129,6 +129,7 @@ static tree init_drop_copied_flexible_elts (tree);
 static void output_init_element (location_t, tree, tree, bool, tree, tree, bool,
 				 bool, struct obstack *);
 static void output_pending_init_elements (int, struct obstack *);
+static int init_field_decl_cmp (tree, tree);
 static bool set_designator (location_t, bool, struct obstack *);
 static void push_range_stack (tree, struct obstack *);
 static void add_pending_init (location_t, tree, tree, tree, bool,
@@ -11966,15 +11967,13 @@ add_pending_init (location_t loc, tree purpose, tree value, tree origtype,
     }
   else
     {
-      tree bitpos;
-
-      bitpos = bit_position (purpose);
       while (*q != NULL)
 	{
 	  p = *q;
-	  if (tree_int_cst_lt (bitpos, bit_position (p->purpose)))
+	  int cmp = init_field_decl_cmp (purpose, p->purpose);
+	  if (cmp < 0)
 	    q = &p->left;
-	  else if (p->purpose != purpose)
+	  else if (cmp > 0)
 	    q = &p->right;
 	  else
 	    {
@@ -12305,20 +12304,18 @@ find_init_member (tree field, struct obstack * braced_init_obstack)
     }
   else if (TREE_CODE (constructor_type) == RECORD_TYPE)
     {
-      tree bitpos = bit_position (field);
-
       if (constructor_incremental
 	  && (!constructor_unfilled_fields
-	      || tree_int_cst_lt (bitpos,
-				  bit_position (constructor_unfilled_fields))))
+	      || init_field_decl_cmp (field, constructor_unfilled_fields) < 0))
 	set_nonincremental_init (braced_init_obstack);
 
       p = constructor_pending_elts;
       while (p)
 	{
-	  if (field == p->purpose)
+	  int cmp = init_field_decl_cmp (field, p->purpose);
+	  if (cmp == 0)
 	    return p->value;
-	  else if (tree_int_cst_lt (bitpos, bit_position (p->purpose)))
+	  else if (cmp < 0)
 	    p = p->left;
 	  else
 	    p = p->right;
@@ -12603,18 +12600,9 @@ output_init_element (location_t loc, tree value, tree origtype,
 	 right away since it starts at the beginning of the union.  */
       if (constructor_incremental)
 	{
-	  if (!constructor_unfilled_fields)
+	  if (!constructor_unfilled_fields
+	      || init_field_decl_cmp (field, constructor_unfilled_fields) < 0)
 	    set_nonincremental_init (braced_init_obstack);
-	  else
-	    {
-	      tree bitpos, unfillpos;
-
-	      bitpos = bit_position (field);
-	      unfillpos = bit_position (constructor_unfilled_fields);
-
-	      if (tree_int_cst_lt (bitpos, unfillpos))
-		set_nonincremental_init (braced_init_obstack);
-	    }
 	}
 
       add_pending_init (loc, field, value, origtype, implicit,
