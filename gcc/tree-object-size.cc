@@ -883,12 +883,16 @@ addr_object_size (struct object_size_info *osi, const_tree ptr,
 	}
       /* A static maximum merged from several pointers may have a net offset
 	 that's negative for the pair even though it's valid for the pointer
-	 actually used, so stay at the merged size instead of returning 0.  */
+	 actually used, so stay at the merged size instead of returning 0.
+	 The same goes for a pointer with a variable offset: its static
+	 maximum presumes that offset is 0, so a negative constant applied on
+	 top of it says nothing about where the pointer really is.  */
       if (!size_unknown_p (sz, object_size_type))
 	{
 	  tree base = TREE_OPERAND (pt_var, 0);
 	  bool strict = ((object_size_type & (OST_DYNAMIC | OST_MINIMUM))
-			 || !object_size_merged_p (base));
+			 || (!object_size_merged_p (base)
+			     && !object_size_variable_offset_p (base)));
 	  sz = size_for_offset (sz, TREE_OPERAND (pt_var, 1),
 				wholesize_for_offset (base, wholesize,
 						      object_size_type),
