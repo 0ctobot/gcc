@@ -10532,7 +10532,13 @@ build_enumerator (location_t decl_loc, location_t loc,
 	    }
 	  else
 	    {
-	      value = default_conversion (value);
+	      /* C23 gives a constant that int can't represent the type of the
+		 expression that initializes it.  Integer promotion would
+		 replace an enumerated type with its underlying type.  */
+	      if (!flag_isoc23
+		  || TREE_CODE (TREE_TYPE (value)) != ENUMERAL_TYPE
+		  || int_fits_type_p (value, integer_type_node))
+		value = default_conversion (value);
 	      constant_expression_warning (value);
 	    }
 	}
@@ -10664,6 +10670,13 @@ build_enumerator (location_t decl_loc, location_t loc,
 			   PLUS_EXPR, tmp, integer_one_node, false);
     }
   the_enum->enum_overflow = tree_int_cst_lt (the_enum->enum_next_value, value);
+  if (!the_enum->enum_overflow
+      && !ENUM_FIXED_UNDERLYING_TYPE_P (the_enum->enum_type)
+      && TREE_CODE (TREE_TYPE (value)) == ENUMERAL_TYPE)
+    /* A constant derived by adding 1 has the type of the previous constant,
+       which the addition above replaced with the underlying type.  */
+    the_enum->enum_next_value = convert (TREE_TYPE (value),
+					 the_enum->enum_next_value);
   if (the_enum->enum_overflow
       && !ENUM_FIXED_UNDERLYING_TYPE_P (the_enum->enum_type))
     {
