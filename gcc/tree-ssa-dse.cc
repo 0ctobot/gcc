@@ -1583,7 +1583,7 @@ local_exposed_before_stmt_p (tree decl, gimple *stmt)
    that pointer, and without that exception no pair of stores could ever be
    merged.  */
 
-static bool
+bool
 fault_at_stmt_keeps_ref_live_p (gimple *stmt, ao_ref *ref)
 {
   if (gimple_clobber_p (stmt))

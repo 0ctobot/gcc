@@ -2551,9 +2551,13 @@ public:
   tree base_addr;
   auto_vec<store_immediate_info *> m_store_info;
   auto_vec<merged_store_group *> m_merged_store_groups;
+  /* How many stores at the start of M_STORE_INFO are followed by a statement
+     that may fault while they need to be visible.  Merging keeps their bytes
+     unless a later store overwrites them.  */
+  unsigned int m_fault_limit;
 
   imm_store_chain_info (imm_store_chain_info *&inspt, tree b_a)
-  : next (inspt), pnxp (&inspt), base_addr (b_a)
+  : next (inspt), pnxp (&inspt), base_addr (b_a), m_fault_limit (0)
   {
     inspt = this;
     if (next)
@@ -2667,7 +2671,8 @@ pass_store_merging::terminate_all_aliasing_chains (imm_store_chain_info
      the function stops running, whatever the statement does to memory.  */
   bool may_end_function = stmt_may_end_function_p (cfun, stmt);
 
-  /* If the statement doesn't touch memory it can't alias.  */
+  /* If the statement doesn't touch memory it can't alias, and it can't fault
+     either, since anything that faults has a virtual use.  */
   if (!may_end_function && !gimple_vuse (stmt))
     return false;
 
@@ -2699,6 +2704,9 @@ pass_store_merging::terminate_all_aliasing_chains (imm_store_chain_info
 	      ret |= terminate_and_process_chain (cur);
 	      break;
 	    }
+	  if (i >= cur->m_fault_limit
+	      && fault_at_stmt_keeps_ref_live_p (stmt, &lhs_ref))
+	    cur->m_fault_limit = i + 1;
 	}
     }
 
@@ -5267,6 +5275,28 @@ lp_nr_for_store (gimple *stmt)
   return lookup_stmt_eh_lp (stmt);
 }
 
+/* Return true if a store of BITSIZE bits at BITPOS overwrites a store of CHAIN
+   that has to be visible to a statement that may fault in between them.  Merging
+   the two would delete the earlier store, as opposed to merely delaying it.  */
+
+static bool
+store_overwrites_past_fault_p (imm_store_chain_info *chain,
+			       unsigned HOST_WIDE_INT bitsize,
+			       unsigned HOST_WIDE_INT bitpos)
+{
+  store_immediate_info *info;
+  unsigned int i;
+  FOR_EACH_VEC_ELT (chain->m_store_info, i, info)
+    {
+      if (i == chain->m_fault_limit)
+	break;
+      if (bitpos < info->bitpos + info->bitsize
+	  && info->bitpos < bitpos + bitsize)
+	return true;
+    }
+  return false;
+}
+
 /* Record the store STMT for store merging optimization if it can be
    optimized.  Return true if any changes were made.  */
 
@@ -5439,6 +5469,14 @@ pass_store_merging::process_store (gimple *stmt)
   bool ret = false;
   if (base_addr)
     chain_info = m_stores.get (base_addr);
+
+  if (chain_info
+      && store_overwrites_past_fault_p (*chain_info, const_bitsize,
+					const_bitpos))
+    {
+      ret |= terminate_and_process_chain (*chain_info);
+      chain_info = NULL;
+    }
 
   store_immediate_info *info;
   if (chain_info)
