@@ -2893,7 +2893,7 @@ cgraph_node::get_availability (symtab_node *ref)
      the inlinability hooks completely eliminated).  */
 
   else if (decl_replaceable_p (decl, semantic_interposition)
-	   && !DECL_EXTERNAL (decl))
+	   && (!DECL_EXTERNAL (decl) || in_other_partition))
     avail = AVAIL_INTERPOSABLE;
   else avail = AVAIL_AVAILABLE;
 
