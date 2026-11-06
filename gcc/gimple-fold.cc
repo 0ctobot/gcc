@@ -8187,6 +8187,13 @@ decode_field_reference (tree *pexp, HOST_WIDE_INT *pbitsize,
       || bs <= shiftrt
       || offset != 0
       || TREE_CODE (inner) == PLACEHOLDER_EXPR
+      /* The merged test reads INNER at the point of a condition rather than
+	 where the masks and shifts we looked through read it.  An abnormal
+	 name read there can overlap another version of its variable, and such
+	 versions must coalesce (PR126947).  A merged load doesn't have this
+	 problem, since it goes right before a load through the same base.  */
+      || (TREE_CODE (inner) == SSA_NAME
+	  && SSA_NAME_OCCURS_IN_ABNORMAL_PHI (inner))
       /* Reject out-of-bound accesses (PR79731, PR118514).  */
       || !access_in_bounds_of_type_p (TREE_TYPE (inner), bs, bp)
       || (INTEGRAL_TYPE_P (TREE_TYPE (inner))
