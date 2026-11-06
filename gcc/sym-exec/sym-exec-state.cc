@@ -546,7 +546,7 @@ state::do_binary_operation (tree arg1, tree arg2, tree dest,
   size_t dest_size = var_states.get (dest)->length ();
 
   value *arg1_val = var_states.get (arg1);
-  value arg1_const_val (dest_size, false);
+  value arg1_const_val (dest_size, TYPE_UNSIGNED (TREE_TYPE (arg1)));
   if (arg1_val == NULL && TREE_CODE (arg1) == INTEGER_CST)
     {
       arg1_const_val = create_val_for_const (arg1, dest_size);
@@ -554,7 +554,7 @@ state::do_binary_operation (tree arg1, tree arg2, tree dest,
     }
 
   value *arg2_val = var_states.get (arg2);
-  value arg2_const_val (dest_size, false);
+  value arg2_const_val (dest_size, TYPE_UNSIGNED (TREE_TYPE (arg2)));
   if (arg2_val == NULL && TREE_CODE (arg2) == INTEGER_CST)
     {
       arg2_const_val = create_val_for_const (arg2, dest_size);
@@ -1425,6 +1425,12 @@ state::add_not_equal_cond (value *arg1, value *arg2)
 bool
 state::check_const_value_is_greater_than (value *arg1, value *arg2)
 {
+  /* A set sign bit makes a signed value the smaller one.  */
+  if (!arg1->is_unsigned
+      && (as_a<bit *> (arg1->last ())->get_val ()
+	  != as_a<bit *> (arg2->last ())->get_val ()))
+    return as_a<bit *> (arg2->last ())->get_val ();
+
   for (int i = arg1->length () - 1; i >= 0; i--)
     {
       if (as_a<bit *> ((*arg1)[i])->get_val ()
@@ -1493,20 +1499,26 @@ bit_expression *
 state::construct_great_than_cond (value *arg1, value *arg2)
 {
   bit_expression *prev = nullptr;
-  int i = arg1->length () - 1;
-  for (; i >= 0; i--)
+  int top = arg1->length () - 1;
+  for (int i = top; i >= 0; i--)
     {
-      if (is_a<bit *> ((*arg1)[i]) && is_a<bit *> ((*arg2)[i]))
+      /* A set sign bit makes a signed value the smaller one, which reverses
+	 the comparison for that bit.  */
+      bool swap = i == top && !arg1->is_unsigned;
+      value *lhs = swap ? arg2 : arg1;
+      value *rhs = swap ? arg1 : arg2;
+
+      if (is_a<bit *> ((*lhs)[i]) && is_a<bit *> ((*rhs)[i]))
 	{
-	  if (as_a<bit *> ((*arg1)[i])->get_val ()
-	      > as_a<bit *> ((*arg2)[i])->get_val ())
+	  if (as_a<bit *> ((*lhs)[i])->get_val ()
+	      > as_a<bit *> ((*rhs)[i])->get_val ())
 	    {
 	      if (!prev)
 		last_cond_status = condition_status::CS_TRUE;
 	      return prev;
 	    }
-	  else if (as_a<bit *> ((*arg1)[i])->get_val ()
-		   < as_a<bit *> ((*arg2)[i])->get_val ())
+	  else if (as_a<bit *> ((*lhs)[i])->get_val ()
+		   < as_a<bit *> ((*rhs)[i])->get_val ())
 	    {
 	      if (prev)
 		{
@@ -1525,13 +1537,13 @@ state::construct_great_than_cond (value *arg1, value *arg2)
       else
 	{
 	  bit_condition *gt_cond
-	    = new bit_condition ((*arg1)[i]->copy (), (*arg2)[i]->copy (),
+	    = new bit_condition ((*lhs)[i]->copy (), (*rhs)[i]->copy (),
 				 GT_EXPR);
 	  bit_expression *expr = nullptr;
 	  if (i)
 	    {
 	      bit_condition *eq_cond
-		= new bit_condition ((*arg1)[i]->copy (), (*arg2)[i]->copy (),
+		= new bit_condition ((*lhs)[i]->copy (), (*rhs)[i]->copy (),
 				     EQ_EXPR);
 	      expr = new bit_or_expression (gt_cond, eq_cond);
 	    }
@@ -1555,6 +1567,12 @@ state::construct_great_than_cond (value *arg1, value *arg2)
 bool
 state::check_const_value_is_less_than (value *arg1, value *arg2)
 {
+  /* A set sign bit makes a signed value the smaller one.  */
+  if (!arg1->is_unsigned
+      && (as_a<bit *> (arg1->last ())->get_val ()
+	  != as_a<bit *> (arg2->last ())->get_val ()))
+    return as_a<bit *> (arg1->last ())->get_val ();
+
   for (int i = arg1->length () - 1; i >= 0; i--)
     {
       if (as_a<bit *> ((*arg1)[i])->get_val ()
@@ -1621,20 +1639,26 @@ bit_expression *
 state::construct_less_than_cond (value *arg1, value *arg2)
 {
   bit_expression *prev = nullptr;
-  int i = arg1->length () - 1;
-  for (; i >= 0; i--)
+  int top = arg1->length () - 1;
+  for (int i = top; i >= 0; i--)
     {
-      if (is_a<bit *> ((*arg1)[i]) && is_a<bit *> ((*arg2)[i]))
+      /* A set sign bit makes a signed value the smaller one, which reverses
+	 the comparison for that bit.  */
+      bool swap = i == top && !arg1->is_unsigned;
+      value *lhs = swap ? arg2 : arg1;
+      value *rhs = swap ? arg1 : arg2;
+
+      if (is_a<bit *> ((*lhs)[i]) && is_a<bit *> ((*rhs)[i]))
 	{
-	  if (as_a<bit *> ((*arg1)[i])->get_val ()
-	      < as_a<bit *> ((*arg2)[i])->get_val ())
+	  if (as_a<bit *> ((*lhs)[i])->get_val ()
+	      < as_a<bit *> ((*rhs)[i])->get_val ())
 	    {
 	      if (!prev)
 		last_cond_status = condition_status::CS_TRUE;
 	      return prev;
 	    }
-	  else if (as_a<bit *> ((*arg1)[i])->get_val ()
-		   > as_a<bit *> ((*arg2)[i])->get_val ())
+	  else if (as_a<bit *> ((*lhs)[i])->get_val ()
+		   > as_a<bit *> ((*rhs)[i])->get_val ())
 	    {
 	      if (prev)
 		{
@@ -1653,13 +1677,13 @@ state::construct_less_than_cond (value *arg1, value *arg2)
       else
 	{
 	  bit_condition *lt_cond
-	    = new bit_condition ((*arg1)[i]->copy (), (*arg2)[i]->copy (),
+	    = new bit_condition ((*lhs)[i]->copy (), (*rhs)[i]->copy (),
 				 LT_EXPR);
 	  bit_expression *expr = nullptr;
 	  if (i)
 	    {
 	      bit_condition *eq_cond
-		= new bit_condition ((*arg1)[i]->copy (), (*arg2)[i]->copy (),
+		= new bit_condition ((*lhs)[i]->copy (), (*rhs)[i]->copy (),
 				     EQ_EXPR);
 	      expr = new bit_or_expression (lt_cond, eq_cond);
 	    }
@@ -1848,7 +1872,7 @@ state::add_binary_cond (tree arg1, tree arg2, binary_cond_func cond_func)
   size_t size = var_states.get (arg1_is_declared ? arg1 : arg2)->length ();
 
   value *arg1_val = var_states.get (arg1);
-  value arg1_const_val (size, false);
+  value arg1_const_val (size, TYPE_UNSIGNED (TREE_TYPE (arg1)));
 
   if (arg1_val == NULL && TREE_CODE (arg1) == INTEGER_CST)
     {
@@ -1857,7 +1881,7 @@ state::add_binary_cond (tree arg1, tree arg2, binary_cond_func cond_func)
     }
 
   value *arg2_val = var_states.get (arg2);
-  value arg2_const_val (size, false);
+  value arg2_const_val (size, TYPE_UNSIGNED (TREE_TYPE (arg2)));
   if (arg2_val == NULL && TREE_CODE (arg2) == INTEGER_CST)
     {
       arg2_const_val = create_val_for_const (arg2, size);
