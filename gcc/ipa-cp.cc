@@ -4072,13 +4072,18 @@ value_topo_info<valtype>::propagate_effects ()
 	    if (src->val
 		&& cs_interesting_for_ipcp_p (src->cs))
 	      {
-		if (!processed_srcvals.add (src->val))
+		/* Only mark the source value as processed once its size has
+		   been accounted for.  Otherwise a later edge from the same
+		   value would add its time without any size, breaking the
+		   assumption of good_cloning_opportunity_p that a value with
+		   a time benefit has a nonzero size cost.  */
+		if (!processed_srcvals.contains (src->val))
 		  {
 		    HOST_WIDE_INT prop_size = size + src->val->prop_size_cost;
-		    if (prop_size < INT_MAX)
-		      src->val->prop_size_cost = prop_size;
-		    else
+		    if (prop_size >= INT_MAX)
 		      continue;
+		    src->val->prop_size_cost = prop_size;
+		    processed_srcvals.add (src->val);
 		  }
 
 		int special_factor = 1;
