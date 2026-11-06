@@ -7043,6 +7043,47 @@ stack_protect_prologue (void)
   emit_move_insn (x, y);
 }
 
+/* On targets that leave the padding bits of a _BitInt unspecified, each read
+   of a _BitInt parameter extends the value on the fly, while a read of a value
+   computed in this function assumes it has been extended already.  A PHI breaks
+   this since out-of-SSA copies its arguments raw or even gives them the PHI
+   result's register, so a parameter reaching a PHI hands its padding bits to
+   readers that won't extend them.  Extend such parameters in place on function
+   entry.  */
+
+static void
+expand_bitint_parms_used_by_phis (void)
+{
+  for (tree parm = DECL_ARGUMENTS (current_function_decl); parm;
+       parm = DECL_CHAIN (parm))
+    {
+      tree type = TREE_TYPE (parm);
+      if (TREE_CODE (type) != BITINT_TYPE
+	  || TYPE_MODE (type) == BLKmode
+	  || type_has_mode_precision_p (type))
+	continue;
+
+      struct bitint_info info;
+      if (!targetm.c.bitint_type_info (TYPE_PRECISION (type), &info)
+	  || info.extended)
+	continue;
+
+      tree def = ssa_default_def (cfun, parm);
+      if (!def || var_to_partition (SA.map, def) == NO_PARTITION)
+	continue;
+
+      use_operand_p use_p;
+      imm_use_iterator iter;
+      FOR_EACH_IMM_USE_FAST (use_p, iter, def)
+	if (gimple_code (USE_STMT (use_p)) == GIMPLE_PHI)
+	  {
+	    /* expand_assignment would elide this self assignment.  */
+	    store_expr (def, get_rtx_for_ssa_name (def), 0, false, false);
+	    break;
+	  }
+    }
+}
+
 /* Translate the intermediate representation contained in the CFG
    from GIMPLE trees to RTL.
 
@@ -7291,6 +7332,8 @@ pass_expand::execute (function *fun)
      call to __main (if any) so that the external decl is initialized.  */
   if (crtl->stack_protect_guard && targetm.stack_protect_runtime_enabled_p ())
     stack_protect_prologue ();
+
+  expand_bitint_parms_used_by_phis ();
 
   expand_phi_nodes (&SA);
 
