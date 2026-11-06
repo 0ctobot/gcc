@@ -2555,7 +2555,11 @@ scan_insn (bb_info_t bb_info, rtx_insn *insn, int max_active_local_stores)
 	  && fndecl_built_in_p (SYMBOL_REF_DECL (sym), BUILT_IN_MEMSET))
 	memset_call = SYMBOL_REF_DECL (sym);
 
-      if (const_call || memset_call)
+      /* A const call that loops forever or throws never gets to whatever
+	 follows it, so stores in front of it cannot be treated as dead.  */
+      if ((const_call || memset_call)
+	  && !RTL_LOOPING_CONST_OR_PURE_CALL_P (insn)
+	  && insn_nothrow_p (insn))
 	{
 	  insn_info_t i_ptr = active_local_stores;
 	  insn_info_t last = NULL;
@@ -2676,6 +2680,17 @@ scan_insn (bb_info_t bb_info, rtx_insn *insn, int max_active_local_stores)
       || (RTX_FRAME_RELATED_P (insn))
       || find_reg_note (insn, REG_FRAME_RELATED_EXPR, NULL_RTX))
     insn_info->cannot_delete = true;
+
+  /* The function may not get past an insn that throws or a volatile access.
+     Stores to memory visible outside of the function must be in place for
+     that.  This can't use add_non_frame_wild_read () since that drops the
+     reads already recorded for this insn, and a throwing load can be the only
+     read of a local variable.  */
+  if (!insn_nothrow_p (insn) || volatile_refs_p (PATTERN (insn)))
+    {
+      insn_info->non_frame_wild_read = true;
+      reset_active_stores ();
+    }
 
   body = PATTERN (insn);
   if (GET_CODE (body) == PARALLEL)
@@ -2831,7 +2846,12 @@ dse_step1 (void)
 		  /* Skip the clobbers.  */
 		  while (!store_info->is_set)
 		    store_info = store_info->next;
-		  if (store_info->group_id >= 0)
+		  /* A block without successors doesn't return from the
+		     function, so a local variable is still alive there and
+		     whoever got its address can read it.  */
+		  if (store_info->group_id >= 0
+		      && (EDGE_COUNT (bb->succs) != 0
+			  || !can_escape (MEM_EXPR (store_info->mem))))
 		    {
 		      group_info *group = rtx_group_vec[store_info->group_id];
 		      if (group->frame_related && !i_ptr->cannot_delete)
@@ -3320,8 +3340,11 @@ dse_step3 ()
     }
 
   /* For any block in an infinite loop, we must initialize the out set
-     to all ones.  This could be expensive, but almost never occurs in
-     practice. However, it is common in regression tests.  */
+     to all ones for the stores that nothing can see outside of the function.
+     The rest stay live since the function doesn't return from the loop and
+     other code can read them while it spins.  This could be expensive, but
+     almost never occurs in practice.  However, it is common in regression
+     tests.  */
   EXECUTE_IF_SET_IN_BITMAP (unreachable_blocks, 0, i, sbi)
     {
       if (bitmap_bit_p (all_blocks, i))
@@ -3334,7 +3357,9 @@ dse_step3 ()
 
 	      all_ones = BITMAP_ALLOC (&dse_bitmap_obstack);
 	      FOR_EACH_VEC_ELT (rtx_group_vec, j, group)
-		bitmap_ior_into (all_ones, group->group_kill);
+		if (group->frame_related)
+		  bitmap_ior_into (all_ones, group->group_kill);
+	      bitmap_and_compl_into (all_ones, kill_on_calls);
 	    }
 	  if (!bb_info->out)
 	    {
@@ -3375,6 +3400,10 @@ dse_confluence_0 (basic_block bb)
     {
       bb_info->out = BITMAP_ALLOC (&dse_bitmap_obstack);
       bitmap_copy (bb_info->out, bb_table[EXIT_BLOCK]->gen);
+      /* A block without successors doesn't return from the function, so a
+	 local variable is still alive there and whoever got its address can
+	 read it.  */
+      bitmap_and_compl_into (bb_info->out, kill_on_calls);
     }
 }
 
