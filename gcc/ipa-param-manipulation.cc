@@ -1611,9 +1611,31 @@ ipa_param_body_adjustments::common_initialization (tree old_fndecl,
 		    repl = av.value;
 		  else
 		    {
-		      repl = create_tmp_var (TREE_TYPE (av.value),
-					     "removed_ipa_cp");
-		      gimple *init_stmt = gimple_build_assign (repl, av.value);
+		      /* The constant's type comes from the caller's store, but
+			 the function can store to this part of the parameter
+			 through a different type and read it back through that
+			 type.  An integer type with less precision than its
+			 size, e.g., bool accessed as an unsigned char, wouldn't
+			 retain those bits, so use a type which covers them.  */
+		      tree value = av.value;
+		      tree type = TREE_TYPE (value);
+		      if (INTEGRAL_TYPE_P (type)
+			  && (TYPE_PRECISION (type)
+			      < tree_to_uhwi (TYPE_SIZE (type))))
+			{
+			  unsigned HOST_WIDE_INT bits
+			    = tree_to_uhwi (TYPE_SIZE (type));
+			  if (TREE_CODE (type) == BITINT_TYPE)
+			    {
+			      bits = MIN (bits, WIDE_INT_MAX_PRECISION - 1);
+			      type = build_bitint_type (bits, 1);
+			    }
+			  else
+			    type = build_nonstandard_integer_type (bits, 1);
+			  value = fold_convert (type, value);
+			}
+		      repl = create_tmp_var (type, "removed_ipa_cp");
+		      gimple *init_stmt = gimple_build_assign (repl, value);
 		      m_split_agg_csts_inits.safe_push (init_stmt);
 		    }
 		  register_replacement (m_oparms[parm_num], av.unit_offset,
