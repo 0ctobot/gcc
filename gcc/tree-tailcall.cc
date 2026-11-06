@@ -658,8 +658,9 @@ empty_eh_cleanup (basic_block bb, int *eh_has_tsan_func_exit, int cnt)
 static live_vars_map *live_vars;
 static vec<bitmap_head> live_vars_vec;
 
-/* DECL_UIDs of the local variables whose address gets used as something other
-   than a pointer.  Computed lazily, but just once for the function.  */
+/* DECL_UIDs of the local variables and parameters whose address gets used as
+   something other than a pointer.  Computed lazily, but just once for the
+   function.  */
 static bitmap exposed_vars;
 
 /* DECL_UIDs of the variables whose address went into a call whose result is
@@ -1073,6 +1074,9 @@ compute_exposed_vars (void)
 	&& auto_var_in_fn_p (var, cfun->decl)
 	&& may_be_aliased (var))
       vars.safe_push (var);
+  for (var = DECL_ARGUMENTS (cfun->decl); var; var = DECL_CHAIN (var))
+    if (may_be_aliased (var))
+      vars.safe_push (var);
 
   basic_block bb;
   FOR_EACH_BB_FN (bb, cfun)
@@ -1097,11 +1101,11 @@ compute_exposed_vars (void)
 }
 
 /* Return true if the tail call CALL may be able to see the address of the local
-   variable VAR, even if it never accesses VAR through that address.  The call
-   starts on top of the frame holding VAR once it's a tail call, or reuses that
-   frame in the case of tail recursion.  Either way, an object of the callee can
-   then share the address of VAR while VAR is still live, so comparing the two
-   addresses gives the wrong answer.  */
+   variable or parameter VAR, even if it never accesses VAR through that
+   address.  The call starts on top of the frame holding VAR once it's a tail
+   call, or reuses that frame in the case of tail recursion.  Either way, an
+   object of the callee can then share the address of VAR while VAR is still
+   live, so comparing the two addresses gives the wrong answer.  */
 
 static bool
 call_may_see_address_p (gcall *call, tree var)
@@ -1634,6 +1638,15 @@ find_tail_calls (basic_block bb, edge esucc, struct tailcall **ret,
 		     || may_be_aliased (param)))
 		break;
 	    }
+	  /* A parameter forwarded as itself doesn't get copied, so the next
+	     activation shares its storage instead of having a copy of its own.
+	     That can't be told apart unless the address of the parameter may
+	     reach that activation.  A musttail call asks for the frame to be
+	     reused regardless.  */
+	  else if (may_be_aliased (param)
+		   && !gimple_call_must_tail_p (call)
+		   && call_may_see_address_p (call, param))
+	    break;
 	}
       if (idx == gimple_call_num_args (call) && !param)
 	tail_recursion = true;
