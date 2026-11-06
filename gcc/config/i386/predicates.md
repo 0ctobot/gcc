@@ -691,6 +691,20 @@
   (and (match_code "set,parallel,unspec,unspec_volatile")
        (match_test "ix86_tls_address_pattern_p (op)")))
 
+;; Test for a symbol that TLS general dynamic and local dynamic call sequences
+;; can call directly.  These sequences stay direct even with
+;; -mforce-indirect-call and -mindirect-branch-register, since linker TLS
+;; relaxation only recognizes the exact sequence.
+(define_predicate "tls_call_address_operand"
+  (match_code "symbol_ref")
+{
+  if (ix86_cmodel == CM_LARGE || ix86_cmodel == CM_LARGE_PIC)
+    return false;
+  if (TARGET_DLLIMPORT_DECL_ATTRIBUTES && SYMBOL_REF_DLLIMPORT_P (op))
+    return false;
+  return true;
+})
+
 ;; Test for a pc-relative call operand
 (define_predicate "constant_call_address_operand"
   (match_code "symbol_ref")
