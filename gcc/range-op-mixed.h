@@ -563,8 +563,9 @@ public:
   void update_bitmask (irange &r, const irange &lh,
 		       const irange &) const final override;
 private:
-// VIEW_CONVERT_EXPR works much like a cast between integral values, so use
-// the cast operator.  Non-integrals are not handled as yet.
+// Unless the result has more precision than the operand, VIEW_CONVERT_EXPR
+// works much like a cast between integral values, so use the cast operator for
+// those cases.  Non-integrals are not handled as yet.
   operator_cast m_cast;
 };
 
