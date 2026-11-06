@@ -3286,6 +3286,19 @@ get_non_trapping (void)
   return nontrap;
 }
 
+/* Return true if the function may not get past something that follows STMT in
+   its basic block.  */
+
+static bool
+stmts_after_may_end_function_p (gimple *stmt)
+{
+  gimple_stmt_iterator gsi = gsi_for_stmt (stmt);
+  for (gsi_next (&gsi); !gsi_end_p (gsi); gsi_next (&gsi))
+    if (stmt_may_end_function_p (cfun, gsi_stmt (gsi)))
+      return true;
+  return false;
+}
+
 /* Do the main work of conditional store replacement.  We already know
    that the recognized pattern looks like so:
 
@@ -3325,6 +3338,13 @@ cond_store_replacement (basic_block middle_bb, basic_block join_bb, edge e0,
   if ((!REFERENCE_CLASS_P (lhs)
        && !DECL_P (lhs))
       || !is_gimple_reg_type (TREE_TYPE (lhs)))
+    return false;
+
+  /* The store ends up in the join block, which the function may never reach.
+     Memory visible outside of the function has to hold it before that.  */
+  if (!gimple_clobber_p (assign)
+      && ref_may_alias_global_p (lhs, true)
+      && stmts_after_may_end_function_p (assign))
     return false;
 
   /* Make sure all uses (except the rhs) in the single stmt are also available
@@ -3492,19 +3512,6 @@ cond_store_replacement (basic_block middle_bb, basic_block join_bb, edge e0,
   statistics_counter_event (cfun, "conditional store replacement", 1);
 
   return true;
-}
-
-/* Return true if the function may not get past something that follows STMT in
-   its basic block.  */
-
-static bool
-stmts_after_may_end_function_p (gimple *stmt)
-{
-  gimple_stmt_iterator gsi = gsi_for_stmt (stmt);
-  for (gsi_next (&gsi); !gsi_end_p (gsi); gsi_next (&gsi))
-    if (stmt_may_end_function_p (cfun, gsi_stmt (gsi)))
-      return true;
-  return false;
 }
 
 /* Do the main work of conditional store replacement.  */
@@ -3769,6 +3776,12 @@ cond_store_replacement_limited (basic_block middle_bb, basic_block join_bb,
   if ((!REFERENCE_CLASS_P (lhs)
        && !DECL_P (lhs))
       || !is_gimple_reg_type (TREE_TYPE (lhs)))
+    return false;
+
+  /* The store ends up in the join block, which the function may never reach.
+     Memory visible outside of the function has to hold it before that.  */
+  if (ref_may_alias_global_p (lhs, true)
+      && stmts_after_may_end_function_p (store_middle))
     return false;
 
   /* Three cases that can be handled:
