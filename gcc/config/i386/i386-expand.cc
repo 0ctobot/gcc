@@ -11551,10 +11551,14 @@ ix86_expand_call (rtx retval, rtx fnaddr, rtx callarg1,
     }
 
   /* PR100665: Hwasan may tag code pointer which is not supported by LAM,
-     mask off code pointers here.
+     mask off code pointers here.  Only do this for userspace HWASan: the mask
+     clears the tag bits, whereas with -fsanitize=kernel-hwaddress, function
+     pointers are kernel addresses in the upper half of the address space, where
+     those bits are set.  Clearing them would make the address non-canonical and
+     fault on every indirect call.
      TODO: also need to handle indirect jump.  */
   if (ix86_memtag_can_tag_addresses () && !fndecl
-      && sanitize_flags_p (SANITIZE_HWADDRESS))
+      && sanitize_flags_p (SANITIZE_USER_HWADDRESS))
     {
       rtx untagged_addr = ix86_memtag_untagged_pointer (XEXP (fnaddr, 0),
 							NULL_RTX);
