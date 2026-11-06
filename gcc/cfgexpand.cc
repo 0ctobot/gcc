@@ -2731,6 +2731,23 @@ expand_used_vars (bitmap forced_stack_vars)
 	  && frame_offset.is_constant (&prev_offset))
 	{
 	  HOST_WIDE_INT offset, sz, redzonesz;
+
+	  /* Each shadow byte describes one granule of memory found by shifting
+	     the address, so poisoning a frame is only correct when the frame
+	     base is aligned to a granule.  Variables in the frame can all have
+	     smaller alignment, so this has to be requested separately.  */
+	  unsigned int align = ASAN_SHADOW_GRANULARITY * BITS_PER_UNIT;
+	  if (SUPPORTS_STACK_ALIGNMENT
+	      && crtl->stack_alignment_estimated < align)
+	    {
+	      gcc_assert (!crtl->stack_realign_processed);
+	      crtl->stack_alignment_estimated = align;
+	    }
+	  if (crtl->stack_alignment_needed < align)
+	    crtl->stack_alignment_needed = align;
+	  if (crtl->max_used_stack_slot_alignment < align)
+	    crtl->max_used_stack_slot_alignment = align;
+
 	  redzonesz = ASAN_RED_ZONE_SIZE;
 	  sz = data.asan_vec[0] - prev_offset;
 	  data.asan_alignb = MAX (data.asan_alignb,
