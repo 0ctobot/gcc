@@ -2690,7 +2690,7 @@ c_parser_declaration_or_fndef (c_parser *parser, bool fndef_ok,
 	}
       /* We still have to evaluate size expressions.  */
       if (specs->expr)
-	add_stmt (fold_convert (void_type_node, specs->expr));
+	add_size_expr (specs->expr);
       c_parser_consume_token (parser);
       if (oacc_routine_data)
 	c_finish_oacc_routine (oacc_routine_data, NULL_TREE, false);
