@@ -40,6 +40,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "function-abi.h"
 #include "hash-map.h"
 #include "tree-pass.h"
+#include "alias.h"
 
 /* Forward declarations */
 static void set_of_1 (rtx, const_rtx, void *);
@@ -1636,10 +1637,14 @@ set_noop_p (const_rtx set)
   if (dst == pc_rtx && src == pc_rtx)
     return true;
 
+  /* We can only remove the store if the load aliases at least all accesses
+     the store does.  Otherwise, a later access may lose the dependence on an
+     earlier one that only the store's alias information carried.  */
   if (MEM_P (dst) && MEM_P (src))
     return (rtx_equal_p (dst, src)
 	    && !side_effects_p (dst)
-	    && !side_effects_p (src));
+	    && !side_effects_p (src)
+	    && mems_same_for_tbaa_p (src, dst));
 
   if (GET_CODE (dst) == ZERO_EXTRACT)
     return (rtx_equal_p (XEXP (dst, 0), src)
