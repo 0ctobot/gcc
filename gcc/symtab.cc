@@ -1976,6 +1976,21 @@ symtab_node::set_implicit_section (symtab_node *n,
   return false;
 }
 
+/* ALIAS is about to stop going through SKIPPED to reach its target, which takes
+   SKIPPED off the chain that noipa_on_alias_chain_p walks from ALIAS.  When
+   SKIPPED is noipa, ALIAS needs the attribute of its own for calls through
+   ALIAS to keep honoring it.  */
+
+static void
+inherit_noipa (symtab_node *alias, symtab_node *skipped)
+{
+  if (lookup_attribute ("noipa", DECL_ATTRIBUTES (skipped->decl))
+      && !lookup_attribute ("noipa", DECL_ATTRIBUTES (alias->decl)))
+    DECL_ATTRIBUTES (alias->decl)
+      = tree_cons (get_identifier ("noipa"), NULL_TREE,
+		   DECL_ATTRIBUTES (alias->decl));
+}
+
 /* Add reference recording that symtab node is alias of TARGET.
    The function can fail in the case of aliasing cycles; in this case
    it returns false.  */
@@ -2011,7 +2026,10 @@ symtab_node::resolve_alias (symtab_node *target, bool transparent)
   transparent_alias = transparent;
   if (transparent)
     while (target->transparent_alias && target->analyzed)
-      target = target->get_alias_target ();
+      {
+	inherit_noipa (this, target);
+	target = target->get_alias_target ();
+      }
   create_reference (target, IPA_REF_ALIAS, NULL);
 
   /* Add alias into the comdat group of its target unless it is already there.  */
@@ -2063,6 +2081,7 @@ symtab_node::resolve_alias (symtab_node *target, bool transparent)
 	       && !alias_alias->symver)
 	      || transparent))
 	{
+	  inherit_noipa (alias_alias, this);
 	  alias_alias->remove_all_references ();
 	  alias_alias->create_reference (target, IPA_REF_ALIAS, NULL);
 	}
