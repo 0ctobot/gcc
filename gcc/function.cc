@@ -2954,6 +2954,18 @@ assign_parm_adjust_stack_rtl (tree parm, struct assign_parm_data_one *data)
 	       || POINTER_TYPE_P (data->nominal_type)))
     stack_parm = NULL;
 
+  /* Once the parm stops living in its incoming slot, that slot and the parm's
+     home are two separate objects.  Only the home may use the parm as its
+     MEM_EXPR, since passes like pair fusion take two accesses with the same
+     MEM_EXPR base and adjacent offsets to be adjacent in memory.  Copy the MEM
+     first because DECL_INCOMING_RTL shares it and still describes the parm.  */
+  if (!stack_parm && MEM_P (data->entry_parm))
+    {
+      data->entry_parm = copy_rtx (data->entry_parm);
+      set_mem_expr (data->entry_parm, NULL_TREE);
+      clear_mem_offset (data->entry_parm);
+    }
+
   data->stack_parm = stack_parm;
 }
 
@@ -3454,6 +3466,12 @@ assign_parm_setup_reg (struct assign_parm_data_all *all, tree parm,
 				  GET_MODE_SIZE (TYPE_MODE (TREE_TYPE (parm))),
 				  align);
 	  set_mem_attributes (parmreg, parm, 1);
+
+	  /* RTL is the caller's copy of the parm, which is a separate object
+	     from this stack slot.  Only the stack slot may use the parm as its
+	     MEM_EXPR, for the reason given in assign_parm_adjust_stack_rtl.  */
+	  set_mem_expr (rtl, NULL_TREE);
+	  clear_mem_offset (rtl);
 	}
 
       /* We need to preserve an address based on VIRTUAL_STACK_VARS_REGNUM for
