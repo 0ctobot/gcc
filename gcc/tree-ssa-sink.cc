@@ -37,6 +37,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "tree-eh.h"
 #include "tree-ssa-live.h"
 #include "tree-dfa.h"
+#include "tree-ssa-dse.h"
 
 /* TODO:
    1. Sinking store only using scalar promotion (IE without moving the RHS):
@@ -276,6 +277,68 @@ select_best_block (basic_block early_bb,
   return best_bb;
 }
 
+/* Return true if sinking the store STMT into SINKBB lets the function stop
+   running before the store happens, which only matters for memory visible
+   outside of the function.  This looks at each path from STMT that doesn't go
+   through SINKBB and ends at a kill of the store.  The virtual use-def chain
+   doesn't show these since a function can stop in a statement that doesn't use
+   the stored memory, in an endless loop or in a GIMPLE_RESX, none of which is a
+   use of the store.  The fake edges to the exit block from
+   connect_infinite_loops_to_exit tell us about the endless loops.  */
+
+static bool
+sink_skips_function_end_p (gimple *stmt, basic_block sinkbb)
+{
+  if (gimple_clobber_p (stmt))
+    return false;
+
+  ao_ref ref;
+  ao_ref_init (&ref, gimple_get_lhs (stmt));
+  if (!ref_may_alias_global_p (&ref, true))
+    return false;
+
+  auto_bitmap visited;
+  auto_vec<basic_block, 8> worklist;
+  basic_block bb = gimple_bb (stmt);
+  gimple_stmt_iterator gsi = gsi_for_stmt (stmt);
+  gsi_next (&gsi);
+  while (1)
+    {
+      bool killed = false;
+      for (; !gsi_end_p (gsi) && !killed; gsi_next (&gsi))
+	{
+	  gimple *s = gsi_stmt (gsi);
+	  if (gimple_vdef (s) && stmt_kills_ref_p (s, &ref))
+	    killed = true;
+	  else if (stmt_may_end_function_p (cfun, s))
+	    return true;
+	}
+
+      if (!killed)
+	{
+	  if (bb_ends_function_p (bb))
+	    return true;
+
+	  edge e;
+	  edge_iterator ei;
+	  FOR_EACH_EDGE (e, ei, bb->succs)
+	    {
+	      if (e->dest == sinkbb)
+		continue;
+	      if (e->dest == EXIT_BLOCK_PTR_FOR_FN (cfun))
+		return true;
+	      if (bitmap_set_bit (visited, e->dest->index))
+		worklist.safe_push (e->dest);
+	    }
+	}
+
+      if (worklist.is_empty ())
+	return false;
+      bb = worklist.pop ();
+      gsi = gsi_start_bb (bb);
+    }
+}
+
 /* Given a statement (STMT) and the basic block it is currently in (FROMBB),
    determine the location to sink the statement to, if any.
    Returns true if there is such location; in that case, TOGSI points to the
@@ -484,6 +547,9 @@ statement_sink_location (gimple *stmt, basic_block frombb,
 	      || single_succ (sinkbb)->index != EXIT_BLOCK))
 	return false;
 
+      if (gimple_vdef (stmt) && sink_skips_function_end_p (stmt, sinkbb))
+	return false;
+
       *togsi = gsi_after_labels (sinkbb);
 
       return true;
@@ -505,7 +571,8 @@ statement_sink_location (gimple *stmt, basic_block frombb,
 	  && !dominated_by_p (CDI_POST_DOMINATORS, bestbb, sinkbb))
       /* Likewise avoid placing VDEFs into an irreducible region.  */
       || (gimple_vdef (stmt)
-	  && (bestbb->flags & BB_IRREDUCIBLE_LOOP)))
+	  && (bestbb->flags & BB_IRREDUCIBLE_LOOP))
+      || (gimple_vdef (stmt) && sink_skips_function_end_p (stmt, bestbb)))
     return false;
 
   *togsi = gsi_after_labels (bestbb);
@@ -572,6 +639,11 @@ sink_common_stores_to_bb (basic_block bb)
 		    break;
 		  }
 	      if (! all_uses_on_phi)
+		{
+		  first_store = NULL;
+		  break;
+		}
+	      if (sink_skips_function_end_p (def, bb))
 		{
 		  first_store = NULL;
 		  break;
