@@ -280,15 +280,11 @@ state::check_args_compatibility (tree arg1, tree arg2, tree dest)
 value
 state::create_val_for_const (tree var, size_t size)
 {
-  unsigned HOST_WIDE_INT val = TYPE_UNSIGNED (TREE_TYPE (var))
-			       ? tree_to_uhwi (var) : tree_to_shwi (var);
+  wide_int val = wi::to_wide (var, size);
   value result (size, TYPE_UNSIGNED (TREE_TYPE (var)));
 
   for (size_t i = 0; i < size; i++)
-    {
-      result.push (new bit (val & 1));
-      val >>= 1;
-    }
+    result.push (new bit (wi::extract_uhwi (val, i, 1)));
 
   return result;
 }
@@ -693,20 +689,21 @@ state::is_bit_vector (const value *var)
 }
 
 
-/* Returns the number represented by the value.  */
+/* Returns the number represented by the value, which has as many bits as the
+   value does, or zero if any of its bits isn't constant.  */
 
-unsigned HOST_WIDE_INT
+wide_int
 state::make_number (const value *var)
 {
-  unsigned HOST_WIDE_INT
-  number = 0;
-  int value_size = var->length ();
-  for (int i = value_size - 1; i >= 0; i--)
+  unsigned int size = var->length ();
+  wide_int number = wi::zero (size);
+  for (unsigned int i = 0; i < size; i++)
     {
-      if (is_a<bit *> ((*var)[i]))
-	number = (number << 1) | as_a<bit *> ((*var)[i])->get_val ();
-      else
-	return 0;
+      if (!is_a<bit *> ((*var)[i]))
+	return wi::zero (size);
+
+      if (as_a<bit *> ((*var)[i])->get_val ())
+	number = wi::set_bit (number, i);
     }
   return number;
 }
@@ -729,7 +726,7 @@ state::do_shift_left (value *arg1, value *arg2, tree dest)
 {
   if (is_bit_vector (arg2))
     {
-      size_t shift_value = make_number (arg2);
+      size_t shift_value = make_number (arg2).to_uhwi ();
       value *result = shift_left_by_const (arg1, shift_value);
       for (size_t i = 0; i < get_var_size (dest); i++)
 	{
@@ -751,7 +748,7 @@ state::do_shift_right (value *arg1, value *arg2, tree dest)
 {
   if (is_bit_vector (arg2))
     {
-      size_t shift_value = make_number (arg2);
+      size_t shift_value = make_number (arg2).to_uhwi ();
       value *result = shift_right_by_const (arg1, shift_value);
       for (size_t i = 0; i < get_var_size (dest); i++)
 	{
@@ -1846,22 +1843,24 @@ state::add_binary_cond (tree arg1, tree arg2, binary_cond_func cond_func)
   if (arg2_is_declared)
     declare_if_needed (arg1, var_states.get (arg2)->length ());
 
+  /* The condition helpers index both arguments up to the first one's length,
+     so a constant argument must be exactly as long as the declared one.  */
+  size_t size = var_states.get (arg1_is_declared ? arg1 : arg2)->length ();
+
   value *arg1_val = var_states.get (arg1);
-  value arg1_const_val (MAX_VALUE_SIZE, false);
+  value arg1_const_val (size, false);
 
   if (arg1_val == NULL && TREE_CODE (arg1) == INTEGER_CST)
     {
-      arg1_const_val = create_val_for_const (arg1,
-					     var_states.get (arg2)->length ());
+      arg1_const_val = create_val_for_const (arg1, size);
       arg1_val = &arg1_const_val;
     }
 
   value *arg2_val = var_states.get (arg2);
-  value arg2_const_val (MAX_VALUE_SIZE, false);
+  value arg2_const_val (size, false);
   if (arg2_val == NULL && TREE_CODE (arg2) == INTEGER_CST)
     {
-      arg2_const_val = create_val_for_const (arg2,
-					     var_states.get (arg1)->length ());
+      arg2_const_val = create_val_for_const (arg2, size);
       arg2_val = &arg2_const_val;
     }
 
