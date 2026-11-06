@@ -73,7 +73,7 @@ static void collect_object_sizes_for (struct object_size_info *, tree);
 static void expr_object_size (struct object_size_info *, tree, tree);
 static bool merge_object_sizes (struct object_size_info *, tree, tree);
 static bool plus_stmt_object_size (struct object_size_info *, tree, gimple *);
-static bool object_size_variable_offset_p (tree);
+static bool object_size_variable_offset_p (tree, bool = false);
 static bool cond_expr_object_size (struct object_size_info *, tree, gimple *);
 static void init_offset_limit (void);
 static void check_for_plus_in_loops (struct object_size_info *, tree);
@@ -2180,6 +2180,34 @@ plus_stmt_object_size (struct object_size_info *osi, tree var, gimple *stmt)
 		     && object_size_offset_folded_p (object_size_type, stmt,
 						     op0, op1));
 
+      /* The static maximum for a pointer stepped back in a loop or moved by a
+	 non-constant offset presumes the pointer never went below where it
+	 started, and a constant going forward from there isn't necessarily
+	 past the end of the subobject just because it's past the end of that
+	 maximum.  Saying 0 for it would abort on valid code, so handle it like
+	 a folded offset.  An offset that stays inside the maximum is left
+	 alone, which keeps the check on all the ordinary uses of such a
+	 pointer.  */
+      bool below = false;
+      if (maxsub
+	  && !folded
+	  && pos_offset
+	  && TREE_CODE (op0) == SSA_NAME
+	  && TREE_CODE (op1) == INTEGER_CST
+	  && !size_unknown_p (bytes, 0)
+	  && TREE_CODE (bytes) == INTEGER_CST
+	  && TREE_CODE (wholesize) == INTEGER_CST)
+	{
+	  tree top = size_binop (MAX_EXPR, wholesize, bytes);
+	  tree net = size_binop (MINUS_EXPR,
+				 size_binop (PLUS_EXPR, top,
+					     fold_convert (sizetype, op1)),
+				 bytes);
+	  below = (tree_int_cst_le (top, net)
+		   && object_size_variable_offset_p (op0, true));
+	}
+      folded |= below;
+
       tree offwhole = wholesize;
       if (!pos_offset && !size_unknown_p (bytes, 0))
 	offwhole = wholesize_for_offset (op0, wholesize, object_size_type);
@@ -2205,6 +2233,10 @@ plus_stmt_object_size (struct object_size_info *osi, tree var, gimple *stmt)
 	       && size_outside_subobject (object_size_type, op0, op1, folded,
 					  &bytes, &wholesize, &encoded))
 	;
+      /* The same offset on a pointer in a loop, where the size of the subobject
+	 is the best the fixed point can do.  */
+      else if (below && (in_loop || osi->pass > 0))
+	bytes = wholesize;
       /* In the static case, We want SIZE_FOR_OFFSET to go a bit easy on us if
 	 it sees a negative offset since BYTES could have been
 	 overestimated.  */
@@ -2841,10 +2873,11 @@ do_valueize (tree t)
 }
 
 /* Return true if PTR is computed with a non-constant offset anywhere in its
-   chain of definitions.  */
+   chain of definitions.  With NEGATIVE, a negative constant offset counts too,
+   which covers every step that could take PTR below where it started.  */
 
 static bool
-object_size_variable_offset_p (tree ptr)
+object_size_variable_offset_p (tree ptr, bool negative)
 {
   auto_bitmap visited;
   auto_vec<tree, 8> worklist;
@@ -2885,7 +2918,10 @@ object_size_variable_offset_p (tree ptr)
 	  switch (gimple_assign_rhs_code (stmt))
 	    {
 	    case POINTER_PLUS_EXPR:
-	      if (TREE_CODE (gimple_assign_rhs2 (stmt)) != INTEGER_CST)
+	      if (TREE_CODE (gimple_assign_rhs2 (stmt)) != INTEGER_CST
+		  || (negative
+		      && compare_tree_int (gimple_assign_rhs2 (stmt),
+					   offset_limit) > 0))
 		return true;
 	      worklist.safe_push (gimple_assign_rhs1 (stmt));
 	      break;
