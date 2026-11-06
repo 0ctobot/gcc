@@ -14262,7 +14262,10 @@ ix86_print_operand (FILE *file, rtx x, int code)
 	      if (!REG_P (x))
 		{
 		  putc ('[', file);
-		  ix86_print_operand (file, x, 0);
+		  /* Don't print a size for code running in 16-bit mode: the
+		     assembler takes DWORD PTR there to mean a far pointer, and
+		     encodes a far jump or call.  */
+		  ix86_print_operand (file, x, TARGET_16BIT ? 'X' : 0);
 		  putc (']', file);
 		  return;
 		}
@@ -24999,7 +25002,7 @@ x86_function_profiler (FILE *file, int labelno ATTRIBUTE_UNUSED)
       if (flag_plt)
 	x86_print_call_or_nop (file, mcount_name, label);
       else if (ASSEMBLER_DIALECT == ASM_INTEL)
-	fprintf (file, "%s\tcall\t[DWORD PTR %s@GOT[ebx]]\n",
+	fprintf (file, "%s\tcall\t[%s@GOT[ebx]]\n",
 		 label, mcount_name);
       else
 	fprintf (file, "%s\tcall\t*%s@GOT(%%ebx)\n",
