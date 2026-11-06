@@ -3476,15 +3476,28 @@ operator_cast::op1_range (irange &r, tree type,
   return true;
 }
 
-// VIEW_CONVERT_EXPR works like a cast between integral values.
-// If the number of bits are not the same, behaviour is undefined,
-// so cast behaviour still works.
+// VIEW_CONVERT_EXPR reinterprets the bits of its operand.  When the result
+// has no more precision than the operand, it keeps the operand's low bits just
+// like a cast.  A result with more precision, which is possible between types
+// of the same size such as _BitInt(3) and _BitInt(8), takes its low bits from
+// the operand and has undefined upper bits, as with a paradoxical SUBREG.  A
+// cast's sign or zero extension says nothing about those upper bits.  The
+// exception is a boolean operand, since it can only hold 0 or 1.
+
+static bool
+view_like_cast_p (tree lhs_type, tree op1_type)
+{
+  return (TYPE_PRECISION (lhs_type) <= TYPE_PRECISION (op1_type)
+	  || TREE_CODE (op1_type) == BOOLEAN_TYPE);
+}
 
 bool
 operator_view::fold_range (irange &r, tree type,
 			   const irange &op1, const irange &op2,
 			   relation_trio rel) const
 {
+  if (!op1.undefined_p () && !view_like_cast_p (type, op1.type ()))
+    return false;
   return m_cast.fold_range (r, type, op1, op2, rel);
 }
 
@@ -3493,6 +3506,8 @@ operator_view::fold_range (prange &r, tree type,
 			   const prange &op1, const prange &op2,
 			   relation_trio rel) const
 {
+  if (!op1.undefined_p () && !view_like_cast_p (type, op1.type ()))
+    return false;
   return m_cast.fold_range (r, type, op1, op2, rel);
 }
 bool
@@ -3500,6 +3515,8 @@ operator_view::fold_range (irange &r, tree type,
 			   const prange &op1, const irange &op2,
 			   relation_trio rel) const
 {
+  if (!op1.undefined_p () && !view_like_cast_p (type, op1.type ()))
+    return false;
   return m_cast.fold_range (r, type, op1, op2, rel);
 }
 
@@ -3508,6 +3525,8 @@ operator_view::fold_range (prange &r, tree type,
 			   const irange &op1, const prange &op2,
 			   relation_trio rel) const
 {
+  if (!op1.undefined_p () && !view_like_cast_p (type, op1.type ()))
+    return false;
   return m_cast.fold_range (r, type, op1, op2, rel);
 }
 
@@ -3516,6 +3535,8 @@ operator_view::op1_range (irange &r, tree type,
 			  const irange &lhs, const irange &op2,
 			  relation_trio rel) const
 {
+  if (!lhs.undefined_p () && !view_like_cast_p (lhs.type (), type))
+    return false;
   return m_cast.op1_range (r, type, lhs, op2, rel);
 }
 
@@ -3524,6 +3545,8 @@ operator_view::op1_range (prange &r, tree type,
 			  const prange &lhs, const prange &op2,
 			  relation_trio rel) const
 {
+  if (!lhs.undefined_p () && !view_like_cast_p (lhs.type (), type))
+    return false;
   return m_cast.op1_range (r, type, lhs, op2, rel);
 }
 
@@ -3532,6 +3555,8 @@ operator_view::op1_range (irange &r, tree type,
 			  const prange &lhs, const irange &op2,
 			  relation_trio rel) const
 {
+  if (!lhs.undefined_p () && !view_like_cast_p (lhs.type (), type))
+    return false;
   return m_cast.op1_range (r, type, lhs, op2, rel);
 }
 
@@ -3540,6 +3565,8 @@ operator_view::op1_range (prange &r, tree type,
 			  const irange &lhs, const prange &op2,
 			  relation_trio rel) const
 {
+  if (!lhs.undefined_p () && !view_like_cast_p (lhs.type (), type))
+    return false;
   return m_cast.op1_range (r, type, lhs, op2, rel);
 }
 
