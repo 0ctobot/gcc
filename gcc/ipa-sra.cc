@@ -1839,9 +1839,10 @@ scan_expr_access (tree expr, gimple *stmt, isra_scan_context ctx,
       || CONSTANT_CLASS_P (expr))
     return;
 
-  if (TREE_CODE (expr) == BIT_FIELD_REF
-      || TREE_CODE (expr) == IMAGPART_EXPR
-      || TREE_CODE (expr) == REALPART_EXPR)
+  bool partial_ref = (TREE_CODE (expr) == BIT_FIELD_REF
+		      || TREE_CODE (expr) == IMAGPART_EXPR
+		      || TREE_CODE (expr) == REALPART_EXPR);
+  if (partial_ref)
     expr = TREE_OPERAND (expr, 0);
 
   base = get_ref_base_and_extent (expr, &poffset, &psize, &pmax_size, &reverse);
@@ -1873,6 +1874,15 @@ scan_expr_access (tree expr, gimple *stmt, isra_scan_context ctx,
   if (storage_order_barrier_p (expr))
     {
       disqualify_split_candidate (desc, "Encountered a storage order barrier.");
+      return;
+    }
+
+  /* The replacement of the enclosing component is a gimple register, and a
+     register cannot be the base of a store that only defines a part of it.  */
+  if (partial_ref && ctx == ISRA_CTX_STORE)
+    {
+      disqualify_split_candidate (desc, "Encountered a store to a part of a "
+				  "register-type component.");
       return;
     }
 
