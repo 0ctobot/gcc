@@ -2081,7 +2081,20 @@ create_ifn_alias_checks (tree *cond_expr,
      (b) the accesses are well-ordered in both the original and new code
 	 (see the comment above the DR_ALIAS_* flags for details); and
      (c) the DR_STEPs describe all access pairs covered by ALIAS_PAIR.  */
-  if (alias_pair.flags & ~(DR_ALIAS_RAW | DR_ALIAS_WAR | DR_ALIAS_WAW))
+  if (alias_pair.flags & ~(DR_ALIAS_RAW | DR_ALIAS_WAR | DR_ALIAS_WAW
+			   | DR_ALIAS_SEG_MAY_WRAP))
+    return false;
+
+  /* These tests compare the addresses as plain unsigned numbers, so they miss
+     an overlap between two windows on opposite sides of 0.  The windows are
+     small (one vector on SVE2), which puts both of them where nothing can be
+     mapped.  That can't be where a reference starts if it runs in every
+     iteration, so such a reference is too far from the other one to overlap
+     it.  Two masked references can both start out there though, and they
+     overlap in a later iteration once the lanes that run land above 0.  */
+  if ((alias_pair.flags & DR_ALIAS_SEG_MAY_WRAP)
+      && DR_IS_CONDITIONAL_IN_STMT (dr_a.dr)
+      && DR_IS_CONDITIONAL_IN_STMT (dr_b.dr))
     return false;
 
   /* Make sure that both DRs access the same pattern of bytes,
@@ -2223,7 +2236,10 @@ create_intersect_range_checks_index (class loop *loop, tree *cond_expr,
 			   abs_step, &niter_access2))
     return false;
 
-  bool waw_or_war_p = (alias_pair.flags & ~(DR_ALIAS_WAR | DR_ALIAS_WAW)) == 0;
+  /* All of the arithmetic below is modulo the range of the index type, so it
+     doesn't matter if a segment wraps.  */
+  bool waw_or_war_p = (alias_pair.flags & ~(DR_ALIAS_WAR | DR_ALIAS_WAW
+					    | DR_ALIAS_SEG_MAY_WRAP)) == 0;
 
   int found = -1;
   for (unsigned int i = 0; i < DR_NUM_DIMENSIONS (dr_a.dr); i++)
@@ -2429,7 +2445,7 @@ create_waw_or_war_checks (tree *cond_expr,
      (b) the accesses are well-ordered in both the original and new code
 	 (see the comment above the DR_ALIAS_* flags for details); and
      (c) the DR_STEPs describe all access pairs covered by ALIAS_PAIR.  */
-  if (alias_pair.flags & ~(DR_ALIAS_WAR | DR_ALIAS_WAW))
+  if (alias_pair.flags & ~(DR_ALIAS_WAR | DR_ALIAS_WAW | DR_ALIAS_SEG_MAY_WRAP))
     return false;
 
   /* Check for equal (but possibly variable) steps.  */
@@ -2525,7 +2541,14 @@ create_waw_or_war_checks (tree *cond_expr,
      less than the size of the object underlying DR_A.  We also know
      that last_chunk_b <= |step|; this is checked elsewhere if it isn't
      guaranteed at compile time.  There can therefore be no overflow if
-     "limit" is calculated in an unsigned type with pointer precision.  */
+     "limit" is calculated in an unsigned type with pointer precision.
+
+     This also works for DR_ALIAS_SEG_MAY_WRAP.  The lanes of DR_A don't all
+     have to be in one object then, but whoever set the flag made sure that
+     the segment is smaller than the address space, which is enough to keep
+     "limit" from overflowing.  The test itself is a single comparison modulo
+     the size of the address space, so it's correct wherever the segments are,
+     and the distance between them stays the same in later iterations.  */
   tree addr_a = fold_build_pointer_plus (DR_BASE_ADDRESS (dr_a.dr),
 					 DR_OFFSET (dr_a.dr));
   addr_a = fold_build_pointer_plus (addr_a, DR_INIT (dr_a.dr));
@@ -2686,7 +2709,9 @@ dr_seg_max_iters (tree step)
    of bytes that the segment covers, both as sizetype values, and store them in
    *START_OUT and *SIZE_OUT.  The start is exact modulo the size of the address
    space even if the segment reaches past the top of it.  The size is exact
-   since dr_seg_max_iters and dr_seg_access_limit keep it from wrapping.  */
+   since DR_ALIAS_SEG_MAY_WRAP requires the segment to be smaller than the
+   address space and dr_seg_access_limit keeps the access from adding to it
+   enough to wrap.  */
 
 static void
 get_segment_start_and_size (const dr_with_seg_len &d, tree *start_out,

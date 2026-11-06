@@ -3977,10 +3977,10 @@ vect_vfa_niters_segment_size (loop_vec_info loop_vinfo, dr_vec_info *dr_info,
 /* Return true if the first and last lanes of DR_INFO in one vector iteration
    can be further apart than PTRDIFF_MAX bytes, given that the vectorization
    factor is VF.  Those lanes can't all run in one object, and the test for a
-   pair with equal steps compares the ends of segments that cover all of the
-   lanes, without allowing for an end that wraps.  A variable step counts if
-   DR_INFO is masked, since the masks are then all that says which lanes run and
-   nothing limits the step.  */
+   pair with equal steps relies on the segment that covers all of the lanes
+   being smaller than the address space.  A variable step counts if DR_INFO is
+   masked, since the masks are then all that says which lanes run and nothing
+   limits the step.  */
 
 static bool
 vect_lanes_may_wrap_p (dr_vec_info *dr_info, poly_uint64 vf)
@@ -4301,6 +4301,7 @@ vect_prune_runtime_alias_test_list (loop_vec_info loop_vinfo)
       unsigned HOST_WIDE_INT access_size_a, access_size_b;
       unsigned HOST_WIDE_INT align_a, align_b;
       bool seg_may_wrap_p = false;
+      bool lanes_may_wrap_p = false;
 
       /* Ignore the alias if the VF we chose ended up being no greater
 	 than the dependence distance.  */
@@ -4354,9 +4355,17 @@ vect_prune_runtime_alias_test_list (loop_vec_info loop_vinfo)
       /* See whether we can handle the alias using a bounds check on
 	 the step, and whether that's likely to be the best approach.
 	 (It might not be, for example, if the minimum step is much larger
-	 than the number of bytes handled by one vector iteration.)  */
+	 than the number of bytes handled by one vector iteration.)
+
+	 This assumes that a step past the bound keeps the two references
+	 apart, but a huge step can make different lanes meet modulo the size
+	 of the address space.  A reference that runs in every iteration has
+	 lanes that are all valid addresses, which rules out a step that large,
+	 so this is only a problem if both references are masked.  */
       if (!ignore_step_p
 	  && TREE_CODE (DR_STEP (dr_info_a->dr)) != INTEGER_CST
+	  && !(DR_IS_CONDITIONAL_IN_STMT (dr_info_a->dr)
+	       && DR_IS_CONDITIONAL_IN_STMT (dr_info_b->dr))
 	  && vectorizable_with_step_bound_p (loop_vinfo, dr_info_a, dr_info_b,
 					     &lower_bound)
 	  && (vect_small_gap_p (loop_vinfo, dr_info_a, lower_bound)
@@ -4451,6 +4460,11 @@ vect_prune_runtime_alias_test_list (loop_vec_info loop_vinfo)
 					       "Unsupported alias check on"
 					       " lanes that are too far apart"
 					       "\n");
+
+	      /* The lanes of a masked reference that don't run can be anywhere,
+		 including past the top of the address space from its base.  */
+	      lanes_may_wrap_p = (DR_IS_CONDITIONAL_IN_STMT (dr_info_a->dr)
+				  || DR_IS_CONDITIONAL_IN_STMT (dr_info_b->dr));
 
 	      length_factor = size_int (vect_factor);
 	      segment_length_a = vect_vfa_segment_size (dr_info_a,
@@ -4549,7 +4563,7 @@ vect_prune_runtime_alias_test_list (loop_vec_info loop_vinfo)
 	(dr_a, dr_b, (preserves_scalar_order_p
 		      ? dr_with_seg_len_pair_t::WELL_ORDERED
 		      : dr_with_seg_len_pair_t::REORDERED));
-      if (seg_may_wrap_p)
+      if (seg_may_wrap_p || lanes_may_wrap_p)
 	dr_with_seg_len_pair.flags |= DR_ALIAS_SEG_MAY_WRAP;
 
       comp_alias_ddrs.safe_push (dr_with_seg_len_pair);

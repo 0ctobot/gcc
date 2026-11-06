@@ -272,10 +272,12 @@ public:
 	that the segment length counts.  The segment can therefore reach
 	past the top of the address space in a valid program, and the
 	run-time test has to be correct for a segment that wraps around.
-	Whoever sets this flag must also make sure that the iteration count
-	is at most dr_seg_max_iters for both steps whenever the test passes,
-	since the test relies on the segment being smaller than the address
-	space.
+	Whoever sets this flag must also make sure that the segment is
+	smaller than the address space whenever the test passes, since the
+	test relies on that.  A length based on the scalar iteration count
+	needs that count to be at most dr_seg_max_iters for both steps, while
+	a length based on the vectorization factor needs the lanes of one
+	vector iteration to be close enough to each other.
 
    The ordering assumption mentioned above is that for every pair
    (DR_A, DR_B) in P:
