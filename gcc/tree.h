@@ -1491,6 +1491,11 @@ class auto_suppress_location_wrappers
 #define COND_EXPR_THEN(NODE)	(TREE_OPERAND (COND_EXPR_CHECK (NODE), 1))
 #define COND_EXPR_ELSE(NODE)	(TREE_OPERAND (COND_EXPR_CHECK (NODE), 2))
 
+/* True if a COND_EXPR comes from an if statement rather than a ?: operator.
+   A jump from outside of an if statement can target a label in its arms.  */
+#define COND_EXPR_IF_STMT_P(NODE) \
+  (COND_EXPR_CHECK (NODE)->base.private_flag)
+
 /* Accessors for the chains of recurrences.  */
 #define CHREC_LEFT(NODE)        TREE_OPERAND (POLYNOMIAL_CHREC_CHECK (NODE), 0)
 #define CHREC_RIGHT(NODE)       TREE_OPERAND (POLYNOMIAL_CHREC_CHECK (NODE), 1)
