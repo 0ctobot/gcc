@@ -14152,6 +14152,7 @@ c_finish_if_stmt (location_t if_locus, tree cond, tree then_block,
   tree stmt;
 
   stmt = build3 (COND_EXPR, void_type_node, cond, then_block, else_block);
+  COND_EXPR_IF_STMT_P (stmt) = 1;
   SET_EXPR_LOCATION (stmt, if_locus);
   add_stmt (stmt);
 }

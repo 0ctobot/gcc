@@ -5863,12 +5863,16 @@ gimplify_cond_expr (tree *expr_p, gimple_seq *pre_p, fallback_t fallback)
     return GS_ERROR;
   gcc_assert (TREE_OPERAND (expr, 0) != NULL_TREE);
 
-  /* A void ?: operator looks the same as an if statement here.  Its arms are in
-     the same full expression as its predicate, so they can use the predicate's
-     temporaries.  Keep the scope open across the arms unless one of them has a
-     label that can be jumped to, which the operator's arms can't have since the
-     C FE rejects jumps into a statement expression.  */
+  /* The arms of a void ?: operator are in the same full expression as its
+     predicate, so they can use the predicate's temporaries.  Keep the scope open
+     across the arms unless this is an if statement with a label in an arm, since
+     a jump to that label would skip the stack save.  The arms of an if statement
+     can't read the temporaries in its predicate, so closing the scope early is
+     fine there.  An operator's arms can have labels too, in a statement
+     expression, but those are safe since the C FE rejects jumps into a statement
+     expression.  */
   if (gimplify_ctxp->stmt_alloca_tmp
+      && COND_EXPR_IF_STMT_P (expr)
       && (stmt_has_label_p (TREE_OPERAND (expr, 1))
 	  || stmt_has_label_p (TREE_OPERAND (expr, 2))))
     pred_scope.close (&TREE_OPERAND (expr, 0));
