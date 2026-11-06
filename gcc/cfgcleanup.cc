@@ -2720,6 +2720,14 @@ try_optimize_cfg (int mode)
 		      edge e;
 		      edge_iterator ei;
 
+		      /* A forwarder block falling into B is about to lose its
+			 only successor. Clear the flag now since an edge
+			 reaching that block later in this walk would otherwise
+			 be threaded through a successor that no longer
+			 exists.  */
+		      FOR_EACH_EDGE (e, ei, b->preds)
+			e->src->flags &= ~BB_FORWARDER_BLOCK;
+
 		      if (current_ir_type () == IR_RTL_CFGLAYOUT)
 			{
 			  rtx_insn *insn;
