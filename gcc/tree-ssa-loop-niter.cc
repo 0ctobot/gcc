@@ -927,8 +927,16 @@ number_of_iterations_ne_max (mpz_t bnd, bool no_overflow, tree c, tree s,
 
   /* If the induction variable can overflow, the number of iterations is at
      most the period of the control variable (or infinite, but in that case
-     the whole # of iterations analysis will fail).  */
-  if (!no_overflow)
+     the whole # of iterations analysis will fail).
+
+     The same goes for an exit that might not get taken, even when the
+     induction variable doesn't overflow.  C needn't be a multiple of S when
+     another exit can end the loop first, so the number of iterations computed
+     for this exit can be any value in that period, no matter how much sooner
+     the loop has to stop.  BND has to cover that value: may_eliminate_iv uses
+     it to tell whether an induction variable with a shorter period can be
+     compared against its value at the computed number of iterations.  */
+  if (!no_overflow || !exit_must_be_taken)
     {
       max = wi::mask <widest_int> (TYPE_PRECISION (type)
 				   - wi::ctz (wi::to_wide (s)), false);
@@ -940,17 +948,13 @@ number_of_iterations_ne_max (mpz_t bnd, bool no_overflow, tree c, tree s,
      iterates at most (range of type / S) times.  */
   wi::to_mpz (wi::minus_one (TYPE_PRECISION (type)), bnd, UNSIGNED);
 
-  /* If the induction variable is guaranteed to reach the value of C before
-     overflow, ... */
-  if (exit_must_be_taken)
-    {
-      /* ... then we can strengthen this to C / S, and possibly we can use
-	 the upper bound on C given by BNDS.  */
-      if (TREE_CODE (c) == INTEGER_CST)
-	wi::to_mpz (wi::to_wide (c), bnd, UNSIGNED);
-      else if (bnds_u_valid)
-	mpz_set (bnd, bnds->up);
-    }
+  /* Since the induction variable is guaranteed to reach the value of C before
+     overflow, we can strengthen this to C / S, and possibly we can use the
+     upper bound on C given by BNDS.  */
+  if (TREE_CODE (c) == INTEGER_CST)
+    wi::to_mpz (wi::to_wide (c), bnd, UNSIGNED);
+  else if (bnds_u_valid)
+    mpz_set (bnd, bnds->up);
 
   mpz_init (d);
   wi::to_mpz (wi::to_wide (s), d, UNSIGNED);
