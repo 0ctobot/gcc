@@ -833,10 +833,14 @@ pcom_worker::determine_offset (struct data_reference *a,
   aff_tree diff, baseb, step;
   tree typea, typeb;
 
-  /* Check that both the references access the location in the same type.  */
+  /* Check that both the references access the location in the same type.
+     The conversion check is asymmetric (a function pointer converts uselessly
+     to void *, but not the other way around), and a chain copies values between
+     its references in either direction, so it must hold both ways.  */
   typea = TREE_TYPE (DR_REF (a));
   typeb = TREE_TYPE (DR_REF (b));
-  if (!useless_type_conversion_p (typeb, typea))
+  if (!useless_type_conversion_p (typeb, typea)
+      || !useless_type_conversion_p (typea, typeb))
     return false;
 
   /* Check whether the base address and the step of both references is the
