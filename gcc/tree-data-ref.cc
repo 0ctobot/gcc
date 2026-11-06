@@ -3439,52 +3439,140 @@ dr_classify_stride (tree step, tree scale, tree size,
 		     < precision));
 }
 
-/* Return true if the objects that the access functions in ACCESS_FNS select at
-   each dimension from FIRST outwards are either the same or fully disjoint, for
-   the reference REF.  UNCONSTRAINED_BASE says whether the last dimension is the
-   evolution of the pointer in BASE_OBJECT.  */
+/* What a dimension of a reference says about the objects it selects.  */
+
+struct dr_outer_dim
+{
+  /* False for a dimension that doesn't step over objects, such as a field.  */
+  bool strided_p;
+
+  /* The size of the objects, and the size of a unit of the access function or
+     null if the access function is in bytes.  */
+  tree size;
+  tree scale;
+
+  /* The initial value of the access function.  */
+  tree init;
+
+  /* Whether all of the steps satisfy each of the conditions that
+     dr_classify_stride describes.  All steps of the dimension must satisfy the
+     same condition because mixing them doesn't compose: steps of 32 and 24 over
+     a 24-byte object combine to reach an offset of 8.  */
+  bool aligned_p;
+  bool multiple_p;
+};
+
+/* Add to DIMS what the access functions in ACCESS_FNS say about the objects
+   that they select at each dimension from FIRST outwards, for the reference
+   REF.  UNCONSTRAINED_BASE says whether the last dimension is the evolution of
+   the pointer in BASE_OBJECT.  Return false if an evolution isn't known.  */
 
 static bool
-dr_outer_objects_disjoint_p (tree ref, const vec<tree> &access_fns,
-			     unsigned int first, bool unconstrained_base,
-			     tree base_object)
+dr_collect_outer_dims (tree ref, const vec<tree> &access_fns,
+		       unsigned int first, bool unconstrained_base,
+		       tree base_object, vec<dr_outer_dim> *dims)
 {
-  /* Walk the references in the order that dr_analyze_indices created the
-     dimensions, in which REALPART_EXPR and IMAGPART_EXPR have one too.  */
   for (unsigned int i = 0; i < access_fns.length (); ++i)
     {
-      tree scale = NULL_TREE, size = NULL_TREE;
-      bool strided = true;
+      dr_outer_dim dim = {};
+      dim.strided_p = true;
       if (unconstrained_base && i + 1 == access_fns.length ())
-	size = TYPE_SIZE_UNIT (TREE_TYPE (base_object));
+	dim.size = TYPE_SIZE_UNIT (TREE_TYPE (base_object));
       else if (TREE_CODE (ref) == ARRAY_REF)
-	scale = size = array_ref_element_size (ref);
+	dim.scale = dim.size = array_ref_element_size (ref);
       else
-	strided = false;
+	dim.strided_p = false;
       if (handled_component_p (ref))
 	ref = TREE_OPERAND (ref, 0);
-      if (i < first || !strided)
+      if (i < first)
 	continue;
-
+      if (!dim.strided_p)
+	{
+	  dims->safe_push (dim);
+	  continue;
+	}
       tree fn = access_fns[i];
       if (chrec_contains_undetermined (fn))
 	return false;
-      bool all_aligned = true, all_multiple = true;
+      dim.aligned_p = dim.multiple_p = true;
       for (; TREE_CODE (fn) == POLYNOMIAL_CHREC; fn = CHREC_LEFT (fn))
 	{
 	  tree step = CHREC_RIGHT (fn);
 	  if (tree_contains_chrecs (step, NULL))
 	    return false;
 	  bool aligned, multiple;
-	  dr_classify_stride (step, scale, size, &aligned, &multiple);
-	  all_aligned &= aligned;
-	  all_multiple &= multiple;
+	  dr_classify_stride (step, dim.scale, dim.size, &aligned, &multiple);
+	  dim.aligned_p &= aligned;
+	  dim.multiple_p &= multiple;
 	}
-      if (tree_contains_chrecs (fn, NULL)
-	  || !(all_aligned || all_multiple))
+      if (tree_contains_chrecs (fn, NULL))
 	return false;
+      dim.init = fn;
+      dims->safe_push (dim);
     }
   return true;
+}
+
+/* Return true if the objects that dimensions A and B of two references select
+   from the same enclosing object are either the same or fully disjoint.  Each
+   reference walks a set of offsets from its initial value, so this requires
+   both sets to be multiples of one distance that's no smaller than the objects,
+   with the initial values also a multiple of that distance apart.  Checking
+   each reference on its own proves nothing: a walk by 16 bytes and a walk by 12
+   bytes from the same address each keep their own 12-byte objects apart, yet
+   the object at offset 16 of the first overlaps the one at offset 12 of the
+   second.  */
+
+static bool
+dr_outer_dims_disjoint_p (const dr_outer_dim &a, const dr_outer_dim &b)
+{
+  if (!a.strided_p || !b.strided_p)
+    return a.strided_p == b.strided_p;
+
+  if (!a.size
+      || !b.size
+      || !operand_equal_p (a.size, b.size, 0)
+      || !a.scale != !b.scale
+      || (a.scale && !operand_equal_p (a.scale, b.scale, 0)))
+    return false;
+
+  bool aligned = a.aligned_p && b.aligned_p;
+  bool multiple = a.multiple_p && b.multiple_p;
+  if (!aligned && !multiple)
+    return false;
+
+  if (operand_equal_p (a.init, b.init, 0))
+    return true;
+
+  /* An array index counts whole elements, so a difference we can't work out
+     still can't be a partial overlap for as long as addresses don't wrap.  A
+     byte offset has no such guarantee.  */
+  tree diff = fold_binary (MINUS_EXPR, ssizetype,
+			   fold_convert (ssizetype, a.init),
+			   fold_convert (ssizetype, b.init));
+  tree scale = a.scale ? fold_convert (sizetype, a.scale) : size_one_node;
+  if (!diff
+      || TREE_CODE (diff) != INTEGER_CST
+      || TREE_CODE (scale) != INTEGER_CST
+      || !tree_fits_uhwi_p (a.size)
+      || integer_zerop (a.size))
+    return a.scale && multiple && !flag_wrapv_pointer;
+
+  offset_int bytes = wi::to_offset (diff) * wi::to_offset (scale);
+  if (bytes == 0)
+    return true;
+
+  offset_int mag = wi::abs (bytes);
+  if (aligned
+      && (unsigned int) wi::ctz (bytes) >= ceil_log2 (tree_to_uhwi (a.size)))
+    return true;
+
+  /* The steps stay below 1 << (precision - 2), and the difference must too for
+     the sum not to wrap.  */
+  return (multiple
+	  && wi::multiple_of_p (mag, wi::to_offset (a.size), UNSIGNED)
+	  && (wi::min_precision (mag, UNSIGNED) + 2
+	      <= TYPE_PRECISION (sizetype)));
 }
 
 /* An access function describes which subobject of an enclosing object gets
@@ -3517,14 +3605,22 @@ dr_access_fns_separate_p (struct data_reference *a, struct data_reference *b,
   if (i == length)
     return true;
 
-  return (dr_outer_objects_disjoint_p (DR_REF (a), indices_a->access_fns,
-				       start_a + i + 1,
-				       indices_a->unconstrained_base,
-				       indices_a->base_object)
-	  && dr_outer_objects_disjoint_p (DR_REF (b), indices_b->access_fns,
-					  start_b + i + 1,
-					  indices_b->unconstrained_base,
-					  indices_b->base_object));
+  /* The decision is about the two references together, so that each dimension
+     from there outwards needs one rule that both of them satisfy.  */
+  auto_vec<dr_outer_dim, 4> dims_a, dims_b;
+  if (!dr_collect_outer_dims (DR_REF (a), indices_a->access_fns,
+			      start_a + i + 1, indices_a->unconstrained_base,
+			      indices_a->base_object, &dims_a)
+      || !dr_collect_outer_dims (DR_REF (b), indices_b->access_fns,
+				 start_b + i + 1, indices_b->unconstrained_base,
+				 indices_b->base_object, &dims_b)
+      || dims_a.length () != dims_b.length ())
+    return false;
+
+  for (unsigned int j = 0; j < dims_a.length (); ++j)
+    if (!dr_outer_dims_disjoint_p (dims_a[j], dims_b[j]))
+      return false;
+  return true;
 }
 
 /* Initialize a data dependence relation RES in LOOP_NEST.  USE_ALT_INDICES
