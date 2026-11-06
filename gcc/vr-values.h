@@ -67,11 +67,12 @@ private:
     tree vec;
   };
 
-  vec<edge> to_remove_edges;
+  // The edges to remove, each with the switch it leaves.
+  vec<std::pair<gswitch *, edge> > to_remove_edges;
   vec<switch_update> to_update_switch_stmts;
   class range_query *query;
   int m_not_executable_flag;   // Non zero if not_executable flag exists.
-  vec<edge> m_flag_set_edges;  // List of edges with flag to be cleared.
+  bool m_flag_set_p;           // True if any edge has the flag set.
 };
 
 extern bool range_fits_type_p (const irange *vr,
