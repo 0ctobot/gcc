@@ -5096,6 +5096,18 @@ stabilize_reference (tree ref)
       break;
 
     case COMPOUND_EXPR:
+      /* A SAVE_EXPR can't hold an object of variable size, such as a VLA
+	 compound literal with its size expression in the first operand.  Save
+	 the address of the object instead, which evaluates both operands just
+	 once too.  */
+      if (TYPE_SIZE_UNIT (TREE_TYPE (ref))
+	  && !poly_int_tree_p (TYPE_SIZE_UNIT (TREE_TYPE (ref))))
+	{
+	  tree addr = build1 (ADDR_EXPR, build_pointer_type (TREE_TYPE (ref)),
+			      ref);
+	  result = build_nt (INDIRECT_REF, save_expr (addr));
+	  break;
+	}
       /* We cannot wrap the first expression in a SAVE_EXPR, as then
 	 it wouldn't be ignored.  This matters when dealing with
 	 volatiles.  */
