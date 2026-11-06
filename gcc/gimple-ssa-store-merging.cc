@@ -5297,6 +5297,35 @@ store_overwrites_past_fault_p (imm_store_chain_info *chain,
   return false;
 }
 
+/* Count the stores of CHAIN that have to be visible if the store STMT of BITSIZE
+   bits at BITPOS, which is about to join CHAIN, faults.
+   terminate_all_aliasing_chains skips the chain of STMT, and a store through the
+   same pointer can fault too, like P[512] after P[0] from a long *P.  It can't
+   fault on bytes that an earlier store of CHAIN has just written, though, which
+   fault_at_stmt_keeps_ref_live_p can't tell since it goes by the pointer's target
+   type, and that's char for *((char *) P + 3) after *P.  */
+
+static void
+note_fault_at_chain_store (imm_store_chain_info *chain, gimple *stmt,
+			   unsigned HOST_WIDE_INT bitsize,
+			   unsigned HOST_WIDE_INT bitpos)
+{
+  store_immediate_info *info;
+  unsigned int i;
+  FOR_EACH_VEC_ELT (chain->m_store_info, i, info)
+    if (info->bitpos <= bitpos
+	&& bitpos + bitsize <= info->bitpos + info->bitsize)
+      return;
+
+  FOR_EACH_VEC_ELT_FROM (chain->m_store_info, i, info, chain->m_fault_limit)
+    {
+      ao_ref lhs_ref;
+      ao_ref_init (&lhs_ref, gimple_assign_lhs (info->stmt));
+      if (fault_at_stmt_keeps_ref_live_p (stmt, &lhs_ref))
+	chain->m_fault_limit = i + 1;
+    }
+}
+
 /* Record the store STMT for store merging optimization if it can be
    optimized.  Return true if any changes were made.  */
 
@@ -5481,6 +5510,8 @@ pass_store_merging::process_store (gimple *stmt)
   store_immediate_info *info;
   if (chain_info)
     {
+      note_fault_at_chain_store (*chain_info, stmt, const_bitsize,
+				 const_bitpos);
       unsigned int ord = (*chain_info)->m_store_info.length ();
       info = new store_immediate_info (const_bitsize, const_bitpos,
 				       const_bitregion_start,

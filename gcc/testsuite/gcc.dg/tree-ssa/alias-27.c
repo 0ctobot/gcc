@@ -7,4 +7,4 @@ void f (long *p) {
   __builtin_memset (p, 0, 100);
 }
 
-/* { dg-final { scan-tree-dump-not "= 42" "optimized" } } */
+/* { dg-final { scan-tree-dump-times "= 42" 2 "optimized" } } */

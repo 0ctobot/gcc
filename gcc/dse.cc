@@ -51,6 +51,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "rtl-iter.h"
 #include "cfgcleanup.h"
 #include "calls.h"
+#include "tree-ssa-dse.h"
 
 /* This file contains three techniques for performing Dead Store
    Elimination (dse).
@@ -988,17 +989,32 @@ mem_may_fault_p (rtx mem)
   return !DECL_P (base) || tree_could_trap_p (base);
 }
 
+/* Return true if MEM stays inside the object that its pointer's target type
+   describes, according to access_within_pointer_target_p ().  */
+
+static bool
+mem_within_pointer_target_p (rtx mem)
+{
+  return (MEM_EXPR (mem)
+	  && MEM_OFFSET_KNOWN_P (mem)
+	  && access_within_pointer_target_p (MEM_EXPR (mem)));
+}
+
 /* Return true if the store in S_INFO has to stay because an access to MEM may
    fault with S_INFO's memory visible to a signal handler.  MEM goes through
-   BASE and GROUP_ID, and going through the same pointer as the store doesn't
-   count since the store has already been through that pointer.  */
+   BASE and GROUP_ID.  An access through the same pointer as the store doesn't
+   count when both of them stay inside the object the pointer points to, since
+   the store having gone through shows that the object is valid.  */
 
 static bool
 fault_keeps_store_p (class store_info *s_info, rtx mem, int group_id,
 		     cselib_val *base)
 {
   if (!mem_may_fault_p (mem)
-      || (s_info->group_id == group_id && s_info->cse_base == base))
+      || (s_info->group_id == group_id
+	  && s_info->cse_base == base
+	  && mem_within_pointer_target_p (mem)
+	  && mem_within_pointer_target_p (s_info->mem)))
     return false;
 
   if (s_info->group_id >= 0

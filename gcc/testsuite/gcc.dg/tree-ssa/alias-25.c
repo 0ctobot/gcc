@@ -7,5 +7,5 @@ void f (long *p) {
   __builtin_free (p);
 }
 
-/* { dg-final { scan-tree-dump-not "= 42" "optimized" } } */
+/* { dg-final { scan-tree-dump-times "= 42" 2 "optimized" } } */
 

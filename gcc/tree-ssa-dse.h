@@ -40,5 +40,6 @@ bool bb_ends_function_p (basic_block);
 
 bool function_may_stop_unseen_p (function *);
 bool fault_at_stmt_keeps_ref_live_p (gimple *, ao_ref *);
+bool access_within_pointer_target_p (tree);
 
 #endif   /* GCC_TREE_SSA_DSE_H  */

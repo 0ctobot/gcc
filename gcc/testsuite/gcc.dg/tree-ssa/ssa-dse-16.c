@@ -9,9 +9,10 @@ void foo (struct X *x, int i)
     with the IL too much.  */
   a.a[i] = 3;
   a.a[1] = 0;
-  /* The following store is dead.  */
+  /* The following store stays, since the variable index means that nothing
+     shows the rest of x->b[i] to be valid.  */
   x->b[i].a[0] = 1;
   x->b[i] = a;
 }
 
-/* { dg-final { scan-tree-dump "Deleted dead store" "dse1" } } */
+/* { dg-final { scan-tree-dump-not "Deleted dead store" "dse1" } } */

@@ -1283,9 +1283,42 @@ exit_vop_keeps_ref_live_p (tree vop, ao_ref *ref)
 	  && ref_may_alias_global_p (ref, true));
 }
 
-/* Return true if ACCESS may fault and it isn't through POINTER, the pointer or
-   object that a store to be deleted goes through.  Indexing into a named object
-   can only fault on an out-of-bounds index, which isn't counted on here.  */
+/* Return true if ACCESS goes through a pointer and stays inside the object that
+   the pointer's target type describes, at an offset that's known at compile
+   time.  An object is either valid or it isn't, so one access inside it having
+   gone through the pointer means that another access inside it can't fault.
+   This says nothing about an access outside of the object, like p[512] from a
+   long *p, or one with a variable index, since those can reach another page.  */
+
+bool
+access_within_pointer_target_p (tree access)
+{
+  tree base = get_base_address (access);
+  if (TREE_CODE (base) != MEM_REF)
+    return false;
+
+  tree target = TREE_TYPE (TREE_TYPE (TREE_OPERAND (base, 1)));
+  if (!COMPLETE_TYPE_P (target) || !tree_fits_uhwi_p (TYPE_SIZE (target)))
+    return false;
+
+  poly_int64 offset, size, max_size;
+  bool reverse;
+  tree ref_base = get_ref_base_and_extent (access, &offset, &size, &max_size,
+					   &reverse);
+  if (ref_base != base || !known_size_p (max_size) || maybe_ne (size, max_size))
+    return false;
+
+  poly_offset_int start = mem_ref_offset (base) << LOG2_BITS_PER_UNIT;
+  start += offset;
+  return (known_ge (start, 0)
+	  && known_le (start + size, wi::to_offset (TYPE_SIZE (target))));
+}
+
+/* Return true if ACCESS may fault and it isn't covered by POINTER, the pointer
+   or object that a store to be deleted goes through, or NULL if the store says
+   nothing about whether what ACCESS goes through is valid.  Indexing into a
+   named object can only fault on an out-of-bounds index, which isn't counted on
+   here.  */
 
 static bool
 access_may_fault_apart_from_p (tree access, tree pointer)
@@ -1297,9 +1330,14 @@ access_may_fault_apart_from_p (tree access, tree pointer)
   if (DECL_P (base) && !tree_could_trap_p (base))
     return false;
 
-  if (TREE_CODE (base) == MEM_REF || TREE_CODE (base) == TARGET_MEM_REF)
-    base = TREE_OPERAND (base, 0);
-  return !operand_equal_p (base, pointer, 0);
+  if (!pointer)
+    return true;
+
+  if (TREE_CODE (base) != MEM_REF && TREE_CODE (base) != TARGET_MEM_REF)
+    return !operand_equal_p (base, pointer, 0);
+
+  return (!operand_equal_p (TREE_OPERAND (base, 0), pointer, 0)
+	  || !access_within_pointer_target_p (access));
 }
 
 /* Return true if CALL may fault on memory it doesn't get through POINTER.  A
@@ -1365,7 +1403,7 @@ call_may_fault_apart_from_p (gcall *call, tree pointer)
 	    arg = TREE_OPERAND (arg, 0);
 	}
 
-      if (!operand_equal_p (arg, pointer, 0))
+      if (!pointer || !operand_equal_p (arg, pointer, 0))
 	return true;
     }
 
@@ -1578,10 +1616,10 @@ local_exposed_before_stmt_p (tree decl, gimple *stmt)
    virtual use-def chain doesn't show it.  STMT can be an assignment, an asm
    with memory operands or a call that can access memory, since knowing that a
    callee doesn't touch REF says nothing about whether it faults on something
-   else.  An access through the same pointer as
-   REF is fine to ignore since the store it comes after has already gone through
-   that pointer, and without that exception no pair of stores could ever be
-   merged.  */
+   else.  An access inside the object that REF's pointer points to is fine to
+   ignore when REF is inside that object too, since REF being stored shows that
+   the object is valid, and without that exception no pair of stores to a
+   structure could ever be merged.  */
 
 bool
 fault_at_stmt_keeps_ref_live_p (gimple *stmt, ao_ref *ref)
@@ -1591,7 +1629,8 @@ fault_at_stmt_keeps_ref_live_p (gimple *stmt, ao_ref *ref)
 
   tree pointer = get_base_address (ao_ref_base (ref));
   if (TREE_CODE (pointer) == MEM_REF || TREE_CODE (pointer) == TARGET_MEM_REF)
-    pointer = TREE_OPERAND (pointer, 0);
+    pointer = (!ref->ref || access_within_pointer_target_p (ref->ref)
+	       ? TREE_OPERAND (pointer, 0) : NULL_TREE);
 
   if (!stmt_may_fault_apart_from_p (stmt, pointer)
       || !ref_may_alias_global_p (ref, true))
