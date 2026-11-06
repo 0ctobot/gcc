@@ -1302,6 +1302,118 @@ access_may_fault_apart_from_p (tree access, tree pointer)
   return !operand_equal_p (base, pointer, 0);
 }
 
+/* Return true if CALL may fault on memory it doesn't get through POINTER.  A
+   const call can't touch memory, while any other callee may do so through
+   whatever it knows about, regardless of what's known about what it clobbers or
+   reads.  An internal function or a normal builtin only goes through the
+   pointers it's given, so it can't fault on anything else if each of them is
+   either POINTER or the address of a named object or constant.  */
+
+static bool
+call_may_fault_apart_from_p (gcall *call, tree pointer)
+{
+  if (!gimple_vuse (call))
+    return false;
+
+  tree lhs = gimple_call_lhs (call);
+  if (lhs && access_may_fault_apart_from_p (lhs, pointer))
+    return true;
+
+  /* A const call's virtual use can only come from storing its result to memory
+     or from reading an aggregate that's passed by value.  */
+  if (gimple_call_flags (call) & ECF_CONST)
+    {
+      for (unsigned i = 0; i < gimple_call_num_args (call); ++i)
+	{
+	  tree arg = gimple_call_arg (call, i);
+	  if (!is_gimple_reg_type (TREE_TYPE (arg))
+	      && access_may_fault_apart_from_p (arg, pointer))
+	    return true;
+	}
+      return false;
+    }
+
+  bool internal = gimple_call_internal_p (call);
+  if (!internal && !gimple_call_builtin_p (call, BUILT_IN_NORMAL))
+    return true;
+
+  /* These take a pointer without accessing anything through it.  */
+  if (gimple_call_builtin_p (call, BUILT_IN_PREFETCH)
+      || gimple_call_builtin_p (call, BUILT_IN_STACK_RESTORE))
+    return false;
+
+  for (unsigned i = 0; i < gimple_call_num_args (call); ++i)
+    {
+      tree arg = gimple_call_arg (call, i);
+      if (!POINTER_TYPE_P (TREE_TYPE (arg)))
+	continue;
+
+      /* The alias type operand of an internal function looks like a pointer.  */
+      if (internal && TREE_CODE (arg) == INTEGER_CST)
+	continue;
+
+      if (TREE_CODE (arg) == ADDR_EXPR)
+	{
+	  tree base = get_base_address (TREE_OPERAND (arg, 0));
+	  if (!base
+	      || CONSTANT_CLASS_P (base)
+	      || (DECL_P (base) && !tree_could_trap_p (base)))
+	    continue;
+
+	  arg = base;
+	  if (TREE_CODE (arg) == MEM_REF || TREE_CODE (arg) == TARGET_MEM_REF)
+	    arg = TREE_OPERAND (arg, 0);
+	}
+
+      if (!operand_equal_p (arg, pointer, 0))
+	return true;
+    }
+
+  return false;
+}
+
+/* Return true if a memory operand of ASM_STMT may fault and it isn't through
+   POINTER.  */
+
+static bool
+asm_may_fault_apart_from_p (gasm *asm_stmt, tree pointer)
+{
+  for (unsigned i = 0; i < gimple_asm_noutputs (asm_stmt); ++i)
+    if (access_may_fault_apart_from_p (TREE_VALUE (gimple_asm_output_op (asm_stmt,
+									 i)),
+				       pointer))
+      return true;
+
+  for (unsigned i = 0; i < gimple_asm_ninputs (asm_stmt); ++i)
+    if (access_may_fault_apart_from_p (TREE_VALUE (gimple_asm_input_op (asm_stmt,
+									i)),
+				       pointer))
+      return true;
+
+  return false;
+}
+
+/* Return true if STMT may fault on memory it doesn't get through POINTER.  */
+
+static bool
+stmt_may_fault_apart_from_p (gimple *stmt, tree pointer)
+{
+  if (gcall *call = dyn_cast <gcall *> (stmt))
+    return call_may_fault_apart_from_p (call, pointer);
+
+  if (gasm *asm_stmt = dyn_cast <gasm *> (stmt))
+    return asm_may_fault_apart_from_p (asm_stmt, pointer);
+
+  if (!is_gimple_assign (stmt))
+    return false;
+
+  return ((gimple_store_p (stmt)
+	   && access_may_fault_apart_from_p (gimple_assign_lhs (stmt), pointer))
+	  || (gimple_assign_load_p (stmt)
+	      && access_may_fault_apart_from_p (gimple_assign_rhs1 (stmt),
+						pointer)));
+}
+
 /* Return true if STMT only uses the pointers passed to it for the duration of
    the call, without any way for them to outlive it.  */
 
@@ -1463,7 +1575,10 @@ local_exposed_before_stmt_p (tree decl, gimple *stmt)
 
 /* Return true if STMT may fault on memory unrelated to REF, in which case a
    signal handler gets to see what's in REF at that point even though the
-   virtual use-def chain doesn't show it.  An access through the same pointer as
+   virtual use-def chain doesn't show it.  STMT can be an assignment, an asm
+   with memory operands or a call that can access memory, since knowing that a
+   callee doesn't touch REF says nothing about whether it faults on something
+   else.  An access through the same pointer as
    REF is fine to ignore since the store it comes after has already gone through
    that pointer, and without that exception no pair of stores could ever be
    merged.  */
@@ -1471,20 +1586,15 @@ local_exposed_before_stmt_p (tree decl, gimple *stmt)
 static bool
 fault_at_stmt_keeps_ref_live_p (gimple *stmt, ao_ref *ref)
 {
-  if (!is_gimple_assign (stmt) || gimple_clobber_p (stmt))
+  if (gimple_clobber_p (stmt))
     return false;
 
   tree pointer = get_base_address (ao_ref_base (ref));
   if (TREE_CODE (pointer) == MEM_REF || TREE_CODE (pointer) == TARGET_MEM_REF)
     pointer = TREE_OPERAND (pointer, 0);
 
-  bool may_fault
-    = ((gimple_store_p (stmt)
-	&& access_may_fault_apart_from_p (gimple_assign_lhs (stmt), pointer))
-       || (gimple_assign_load_p (stmt)
-	   && access_may_fault_apart_from_p (gimple_assign_rhs1 (stmt),
-					     pointer)));
-  if (!may_fault || !ref_may_alias_global_p (ref, true))
+  if (!stmt_may_fault_apart_from_p (stmt, pointer)
+      || !ref_may_alias_global_p (ref, true))
     return false;
 
   /* ref_may_alias_global_p doesn't care about where the address of a local

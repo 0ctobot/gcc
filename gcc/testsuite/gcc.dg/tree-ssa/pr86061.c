@@ -9,7 +9,7 @@ void g (struct S *p)
 {
   char a[sizeof p->n + 1];
 
-  __builtin_memset (a, 0, sizeof a);   // dead store, can be eliminated
+  __builtin_memset (a, 0, sizeof a);   // stays, since the strncpy can fault
 
   __builtin_strncpy (a, p->n, sizeof a - 1);
   a[sizeof a - 1] = '\0';
@@ -17,4 +17,4 @@ void g (struct S *p)
   f (a);
 }
 
-/* { dg-final { scan-tree-dump-times "Deleted dead call" 1 "dse1" } } */
+/* { dg-final { scan-tree-dump-times "Deleted dead call" 0 "dse1" } } */

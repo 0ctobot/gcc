@@ -19,4 +19,4 @@ int test2 (int *a)
 	write (a);
 	return *a;
 }
-/* { dg-final { scan-tree-dump-times "Deleted dead store" 2 "dse1"} } */
+/* { dg-final { scan-tree-dump-times "Deleted dead store" 1 "dse1"} } */

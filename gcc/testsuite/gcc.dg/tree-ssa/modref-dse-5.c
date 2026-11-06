@@ -39,4 +39,4 @@ set (struct a *a)
   a->b=1;
   return ret;
 }
-/* { dg-final { scan-tree-dump "Deleted dead store: wrap" "dse1" } } */
+/* { dg-final { scan-tree-dump-not "Deleted dead store: wrap" "dse1" } } */

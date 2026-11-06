@@ -23,4 +23,4 @@ set (struct a *a)
   my_pleasure (a);
   a->b=1;
 }
-/* { dg-final { scan-tree-dump "Deleted dead store: kill_me" "dse1" } } */
+/* { dg-final { scan-tree-dump-not "Deleted dead store: kill_me" "dse1" } } */

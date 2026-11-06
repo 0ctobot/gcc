@@ -2717,7 +2717,10 @@ scan_insn (bb_info_t bb_info, rtx_insn *insn, int max_active_local_stores)
 		    }
 		}
 	      else
-		clear_rhs_from_active_local_stores ();
+		/* Without knowing how much memset writes, nothing says that it
+		   won't fault partway through on something other than the
+		   active stores, which need to be in memory when it does.  */
+		add_non_frame_wild_read (bb_info);
 	    }
 	}
       else if (SIBLING_CALL_P (insn)

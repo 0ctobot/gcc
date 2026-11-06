@@ -55,6 +55,6 @@ void m (char *s)
   frob (a);
 }
 
-/* { dg-final { scan-tree-dump-times "Deleted dead call" 2 "dse1" } } */
-/* { dg-final { scan-tree-dump-times "Trimming statement " 4 "dse1" } } */
+/* { dg-final { scan-tree-dump-times "Deleted dead call" 1 "dse1" } } */
+/* { dg-final { scan-tree-dump-times "Trimming statement " 2 "dse1" } } */
 

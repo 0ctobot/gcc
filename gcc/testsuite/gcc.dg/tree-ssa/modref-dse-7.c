@@ -19,4 +19,4 @@ test(struct list *l, int *a)
 	kill (l, a);
 	return;
 }
-/* { dg-final { scan-tree-dump-not "12345" "optimized"} } */
+/* { dg-final { scan-tree-dump "12345" "optimized"} } */
