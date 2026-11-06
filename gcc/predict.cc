@@ -939,6 +939,17 @@ set_even_probabilities (basic_block bb,
       unlikely_count = 0;
     }
 
+  /* The likely edge might not be one of the edges we're assigning a probability
+     to, if it's never executed or its probability is already known.  Then the
+     remaining edges aren't competing with it and just share what's left.  */
+  if (likely_count == 1)
+    {
+      edge likely_edge = (*likely_edges->begin ())->ep_edge;
+      if (likely_edge->probability.initialized_p ()
+	  || unlikely_executed_edge_p (likely_edge))
+	likely_count = 0;
+    }
+
   /* If we have one likely edge, then use its probability and distribute
      remaining probabilities as even.  */
   if (likely_count == 1)
@@ -963,7 +974,7 @@ set_even_probabilities (basic_block bb,
 		remainder -= (profile_probability::very_unlikely ()
 			      * unlikely_count);
 		int count = nedges - unlikely_count - 1;
-		gcc_assert (count >= 0);
+		gcc_assert (count > 0);
 
 		e->probability = remainder / count;
 	      }
