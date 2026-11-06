@@ -125,6 +125,20 @@ tree_associate_condition_with_expr (tree stmt, unsigned uid)
 /* Hash set of poisoned variables in a bind expr.  */
 static hash_set<tree> *asan_poisoned_variables = NULL;
 
+/* Where the variables and the user labels that a jump can come back to are in
+   the function being gimplified, or NULL if every label has to count as such a
+   label.  See find_back_jump_labels.  */
+static hash_map<tree, unsigned> *reinit_places;
+
+/* The flag of each variable whose re-run initializer gets built in a temporary
+   while automatic variable initialization is in effect, or NULL unless
+   gimplify_body is working on a C or Objective-C function.  See
+   reinit_auto_init.  */
+static hash_map<tree, tree> *reinit_auto_init_vars;
+
+static void gimple_add_init_for_auto_var (tree, enum auto_init_type,
+					  gimple_seq *);
+
 /* Hash set of compound literal decls whose DECL_EXPR was already gimplified
    in the current function.  */
 static hash_set<tree> *gimplified_compound_literals = NULL;
@@ -262,8 +276,22 @@ struct gimplify_ctx
   /* The formal temporary table.  Should this be persistent?  */
   hash_table<gimplify_hasher> *temp_htab;
 
+  /* Where the last jump is that can come back to a place gimplified so far in
+     the current BIND_EXPR, including its closed inner ones, without leaving the
+     BIND_EXPR.  This is zero if there's no such place, and UINT_MAX if control
+     can come back at any time.  See find_back_jump_labels and
+     reinit_possible_p.  */
+  unsigned reinit_last_jump;
+  /* The declaration being initialized if the initialization may run again in
+     the same lifetime.  */
+  tree reinit_decl;
+  /* The statements that clear the flags of reinit_auto_init, which go at the
+     start of the body of this context.  */
+  gimple_seq reinit_flags;
+
   int conditions;
   unsigned into_ssa : 1;
+  unsigned has_reinit_receiver : 1;
   unsigned allow_rhs_cond_expr : 1;
   /* A statement expression's variable-sized temporary that's yet to be
      allocated, and the BIND_EXPR that has to keep it alive.  */
@@ -407,6 +435,8 @@ push_gimplify_context (bool in_ssa, bool rhs_cond_ok)
   struct gimplify_ctx *c = ctx_alloc ();
 
   c->prev_context = gimplify_ctxp;
+  if (c->prev_context)
+    c->has_reinit_receiver = c->prev_context->has_reinit_receiver;
   gimplify_ctxp = c;
   gimplify_ctxp->into_ssa = in_ssa;
   gimplify_ctxp->allow_rhs_cond_expr = rhs_cond_ok;
@@ -434,9 +464,61 @@ pop_gimplify_context (gimple *body)
   else
     record_vars (c->temps);
 
+  if (c->reinit_flags)
+    {
+      if (body)
+	{
+	  gbind *bind = as_a <gbind *> (body);
+	  gimple_seq seq = c->reinit_flags;
+	  gimple_seq_add_seq_without_update (&seq, gimple_bind_body (bind));
+	  gimple_bind_set_body (bind, seq);
+	}
+      else
+	{
+	  gcc_assert (gimplify_ctxp);
+	  gimple_seq_add_seq_without_update (&gimplify_ctxp->reinit_flags,
+					     c->reinit_flags);
+	}
+    }
+
   delete c->temp_htab;
   c->temp_htab = NULL;
   ctx_free (c);
+}
+
+/* Give DECL the automatic initialization that it would get at a declaration
+   without an initializer, ahead of an initializer of DECL that gets built in a
+   temporary.  The first run of that initializer reads DECL before anything has
+   been stored to it, while a re-run has to see the value of the previous run.
+   The block of DECL can be entered at a case label or at a label that a goto
+   from outside of the block jumps to, so no place in the block gets reached on
+   the first run alone.  A flag tells the runs apart instead: it's clear at the
+   start of the function and at the start of the block, the cleanup of the
+   block clears it on the way out, and the first run sets it.  A longjmp or a
+   computed or nonlocal goto out of the block skips the cleanup, which leaves
+   the flag set for an entry at a label until the block starts again.  */
+
+static void
+reinit_auto_init (tree decl, gimple_seq *seq_p)
+{
+  tree flag = create_tmp_var (boolean_type_node, "reinit");
+  gimple_seq_add_stmt_without_update (&gimplify_ctxp->reinit_flags,
+				      gimple_build_assign (flag,
+							   boolean_false_node));
+  reinit_auto_init_vars->put (decl, flag);
+
+  tree first = create_artificial_label (UNKNOWN_LOCATION);
+  tree done = create_artificial_label (UNKNOWN_LOCATION);
+  gimple_seq_add_stmt_without_update (seq_p,
+				      gimple_build_cond (EQ_EXPR, flag,
+							 boolean_false_node,
+							 first, done));
+  gimple_seq_add_stmt_without_update (seq_p, gimple_build_label (first));
+  gimple_add_init_for_auto_var (decl, flag_auto_var_init, seq_p);
+  gimple_seq_add_stmt_without_update (seq_p,
+				      gimple_build_assign (flag,
+							   boolean_true_node));
+  gimple_seq_add_stmt_without_update (seq_p, gimple_build_label (done));
 }
 
 /* Push a GIMPLE_BIND tuple onto the stack of bindings.  */
@@ -1555,6 +1637,7 @@ gimplify_bind_expr (tree *expr_p, gimple_seq *pre_p)
   tree bind_expr = *expr_p;
   bool old_keep_stack = gimplify_ctxp->keep_stack;
   bool old_save_stack = gimplify_ctxp->save_stack;
+  unsigned old_reinit_last_jump = gimplify_ctxp->reinit_last_jump;
   tree t;
   gbind *bind_stmt;
   gimple_seq body, cleanup;
@@ -1563,6 +1646,10 @@ gimplify_bind_expr (tree *expr_p, gimple_seq *pre_p)
   tree ret_clauses = NULL;
 
   tree temp = voidify_wrapper_expr (bind_expr, NULL);
+
+  /* Coming back to a place before this BIND_EXPR ends the lifetime of its
+     variables, so only places inside it count for them.  */
+  gimplify_ctxp->reinit_last_jump = 0;
 
   /* Mark variables seen in this bind expr.  */
   for (t = BIND_EXPR_VARS (bind_expr); t ; t = DECL_CHAIN (t))
@@ -1860,6 +1947,26 @@ gimplify_bind_expr (tree *expr_p, gimple_seq *pre_p)
   gimplify_full_stmt (&BIND_EXPR_BODY (bind_expr), &body);
   gimplify_ctxp->in_full_expr = old_in_full_expr;
   gimplify_ctxp->stmt_alloca_long = old_stmt_alloca_long;
+
+  /* See reinit_auto_init.  */
+  if (reinit_auto_init_vars && !reinit_auto_init_vars->is_empty ())
+    {
+      gimple_seq clear_seq = NULL;
+      for (t = BIND_EXPR_VARS (bind_expr); t; t = DECL_CHAIN (t))
+	if (tree *flag = reinit_auto_init_vars->get (t))
+	  {
+	    gimple *clear = gimple_build_assign (*flag, boolean_false_node);
+	    /* The block can be the body of a switch, which jumps past this to
+	       a case label.  Don't let -Wswitch-unreachable warn about it.  */
+	    suppress_warning (clear, OPT_Wswitch_unreachable);
+	    gimplify_seq_add_stmt (&clear_seq, clear);
+	  }
+      if (clear_seq)
+	{
+	  gimple_seq_add_seq (&clear_seq, body);
+	  body = clear_seq;
+	}
+    }
   gimple_bind_set_body (bind_stmt, body);
 
   /* Source location wise, the cleanup code (stack_restore and clobbers)
@@ -1919,6 +2026,16 @@ gimplify_bind_expr (tree *expr_p, gimple_seq *pre_p)
 	      gimple_set_location (clobber_stmt, end_locus);
 	      gimplify_seq_add_stmt (&cleanup, clobber_stmt);
 	    }
+
+	  /* See reinit_auto_init.  */
+	  if (reinit_auto_init_vars)
+	    if (tree *flag = reinit_auto_init_vars->get (t))
+	      {
+		gimple *clear = gimple_build_assign (*flag, boolean_false_node);
+		gimple_set_location (clear, end_locus);
+		gimplify_seq_add_stmt (&cleanup, clear);
+		reinit_auto_init_vars->remove (t);
+	      }
 
 	  if (flag_openacc && oacc_declare_returns != NULL)
 	    {
@@ -2007,6 +2124,8 @@ gimplify_bind_expr (tree *expr_p, gimple_seq *pre_p)
   if (!gimplify_ctxp->keep_stack)
     gimplify_ctxp->keep_stack = old_keep_stack;
   gimplify_ctxp->save_stack = old_save_stack;
+  gimplify_ctxp->reinit_last_jump = MAX (gimplify_ctxp->reinit_last_jump,
+					 old_reinit_last_jump);
 
   gimple_pop_bind_expr ();
 
@@ -2293,6 +2412,116 @@ var_needs_auto_init_p (tree decl)
   return false;
 }
 
+/* Walk state for find_reinit_read_r.  */
+
+struct reinit_read_walk
+{
+  tree decl;
+  hash_set<tree> visited;
+};
+
+/* Callback for walk_tree from reinit_needs_tmp_p.  DATA is the walk state.
+   Find what can make the old value of the variable visible while its
+   initializer is being evaluated: a read of it by name, a jump that abandons
+   the initializer and leaves the variable to be read below, or a read through a
+   pointer if the variable has its address taken.  */
+
+static tree
+find_reinit_read_r (tree *tp, int *, void *data)
+{
+  auto w = static_cast<reinit_read_walk *> (data);
+  tree t = *tp;
+
+  if (t == w->decl)
+    return t;
+
+  switch (TREE_CODE (t))
+    {
+    case GOTO_EXPR:
+      /* An artificial label is the control flow of something like a loop, and
+	 a break out of the initializer leaves the block of the variable.  */
+      if (TREE_CODE (GOTO_DESTINATION (t)) != LABEL_DECL
+	  || !DECL_ARTIFICIAL (GOTO_DESTINATION (t)))
+	return t;
+      break;
+
+    case ASM_EXPR:
+      if (ASM_LABELS (t))
+	return t;
+      break;
+
+    case INDIRECT_REF:
+    case MEM_REF:
+      if (TREE_ADDRESSABLE (w->decl))
+	return t;
+      break;
+
+    case DECL_EXPR:
+      /* The variable of a compound literal needn't be in any BIND_EXPR's list
+	 of variables, so walk_tree doesn't reach its initializer on its
+	 own.  */
+      if (VAR_P (DECL_EXPR_DECL (t)))
+	return walk_tree (&DECL_INITIAL (DECL_EXPR_DECL (t)),
+			  find_reinit_read_r, data, &w->visited);
+      break;
+
+    default:
+      break;
+    }
+
+  return NULL_TREE;
+}
+
+/* Return true if VAL, the initializer of DECL, has to be built in a temporary
+   since DECL can hold a value when VAL runs again and that value must stay in
+   place until the new one is complete.  The gimplifier stores the parts of an
+   aggregate one by one and may clear it first, and gimplify_modify_expr_rhs
+   pushes the store down into the arms of a conditional or the right operand
+   of a comma.  A call alone only has to stay out of the return slot of
+   DECL.  */
+
+static bool
+reinit_needs_tmp_p (tree decl, tree val)
+{
+  if (!val
+      || TREE_CODE (val) == CALL_EXPR
+      || !AGGREGATE_TYPE_P (TREE_TYPE (decl))
+      || TREE_CODE (DECL_SIZE_UNIT (decl)) != INTEGER_CST)
+    return false;
+
+  if (TREE_SIDE_EFFECTS (val))
+    {
+      /* Anything in VAL can abandon it with a longjmp.  */
+      if (gimplify_ctxp->has_reinit_receiver || TREE_ADDRESSABLE (decl))
+	return true;
+    }
+  /* A plain copy has nothing to clear or to store a part at a time.  */
+  else if (DECL_P (val)
+	   || handled_component_p (val)
+	   || INDIRECT_REF_P (val)
+	   || TREE_CODE (val) == MEM_REF)
+    return false;
+
+  reinit_read_walk w;
+  w.decl = decl;
+  return walk_tree (&val, find_reinit_read_r, &w, &w.visited) != NULL_TREE;
+}
+
+/* Return true if control can come back to a place above the declaration of DECL
+   being gimplified without leaving its block, which runs its initializer again
+   within its lifetime.  A variable that find_back_jump_labels didn't record
+   only needs such a place to exist.  */
+
+static bool
+reinit_possible_p (tree decl)
+{
+  unsigned last_jump = gimplify_ctxp->reinit_last_jump;
+  if (!last_jump)
+    return false;
+  unsigned *place = reinit_places ? reinit_places->get (decl) : NULL;
+  return !place || last_jump > *place;
+}
+
 /* Gimplify a DECL_EXPR node *STMT_P by making any necessary allocation
    and initialization explicit.  */
 
@@ -2383,9 +2612,60 @@ gimplify_decl_expr (tree *stmt_p, gimple_seq *seq_p)
 	  if (!TREE_STATIC (decl))
 	    {
 	      DECL_INITIAL (decl) = NULL_TREE;
+	      /* In C, a jump back to a place inside the block of DECL doesn't
+		 end its lifetime, so DECL can hold a value when its initializer
+		 runs again, and that value has to stay in place until the new
+		 one is complete.  A call in the initializer can read it through
+		 the address of DECL, and a call that abandons the initialization
+		 with a longjmp must leave it behind.  Only a setjmp before the
+		 declaration or a user label before it with a jump back from
+		 further down allows this, since a loop body is a block of its
+		 own.  The read takes a DECL with its address taken.  The longjmp
+		 only matters if something in this function can regain control
+		 after it, since otherwise it ends this frame and DECL along with
+		 it.  */
+	      tree old_reinit_decl = gimplify_ctxp->reinit_decl;
+	      bool init_in_tmp = false;
+	      gimplify_ctxp->reinit_decl = NULL_TREE;
+	      if (reinit_possible_p (decl)
+		  && (lang_GNU_C () || lang_GNU_OBJC ()))
+		{
+		  if (gimplify_ctxp->has_reinit_receiver
+		      || TREE_ADDRESSABLE (decl))
+		    gimplify_ctxp->reinit_decl = decl;
+		  /* A compound literal always claims side effects, so ask its
+		     initializer.  */
+		  tree val = init;
+		  if (TREE_CODE (val) == COMPOUND_LITERAL_EXPR)
+		    val = DECL_INITIAL (COMPOUND_LITERAL_EXPR_DECL (val));
+		  if (reinit_needs_tmp_p (decl, val))
+		    {
+		      if (reinit_auto_init_vars
+			  && var_needs_auto_init_p (decl)
+			  && !decl_had_value_expr_p)
+			reinit_auto_init (decl, seq_p);
+		      init = get_initialized_tmp_var (init, seq_p);
+		      init_in_tmp = true;
+		    }
+		}
 	      init = build2 (INIT_EXPR, void_type_node, decl, init);
 	      gimplify_and_add (init, seq_p);
 	      ggc_free (init);
+	      gimplify_ctxp->reinit_decl = old_reinit_decl;
+	      /* Building a CONSTRUCTOR in the variable itself can leave its
+		 padding zero even without automatic variable initialization,
+		 as when it clears the whole object first, which is what
+		 -fzero-init-padding-bits and the rule for members without an
+		 initializer ask for.  That only happened to the temporary here,
+		 and the copy can't be relied on to carry it since SRA can
+		 scalarize that copy, so clear the padding again whichever
+		 option is in effect.  */
+	      if (init_in_tmp
+		  && !is_gimple_reg (decl)
+		  && !DECL_HARD_REGISTER (decl)
+		  && clear_padding_type_may_have_padding_p (TREE_TYPE (decl))
+		  && flag_auto_var_init != AUTO_INIT_CXX26)
+		gimple_add_padding_init_for_auto_var (decl, false, seq_p);
 	      /* Clear TREE_READONLY if we really have an initialization.  */
 	      if (!DECL_INITIAL (decl)
 		  && !omp_privatize_by_reference (decl))
@@ -2541,6 +2821,11 @@ warn_switch_unreachable_and_auto_init_r (gimple_stmt_iterator *gsi_p,
       break;
 
     case GIMPLE_ASSIGN:
+      /* Skip the clearing of a flag of reinit_auto_init at the start of the
+	 body, along with any other assignment that this warning is
+	 suppressed for.  */
+      if (warning_suppressed_p (stmt, OPT_Wswitch_unreachable))
+	break;
       /* See comment below in the GIMPLE_CALL case.  */
       if (flag_auto_var_init > AUTO_INIT_UNINITIALIZED
 	  && gimple_assign_single_p (stmt)
@@ -3349,6 +3634,14 @@ gimplify_label_expr (tree *expr_p, gimple_seq *pre_p)
 
   tree label = LABEL_EXPR_LABEL (*expr_p);
   glabel *label_stmt = gimple_build_label (label);
+  if (!DECL_ARTIFICIAL (label))
+    {
+      if (!reinit_places)
+	gimplify_ctxp->reinit_last_jump = UINT_MAX;
+      else if (unsigned *jump = reinit_places->get (label))
+	gimplify_ctxp->reinit_last_jump = MAX (gimplify_ctxp->reinit_last_jump,
+					       *jump);
+    }
   gimple_set_location (label_stmt, EXPR_LOCATION (*expr_p));
   gimplify_seq_add_stmt (pre_p, label_stmt);
 
@@ -5091,7 +5384,8 @@ gimplify_call_expr (tree *expr_p, gimple_seq *pre_p, fallback_t fallback)
      we add an abnormal incoming edge to the call.  So do not use SSA
      vars there.  */
   bool returns_twice = call_expr_flags (*expr_p) & ECF_RETURNS_TWICE;
-
+  if (returns_twice)
+    gimplify_ctxp->reinit_last_jump = UINT_MAX;
 
   /* Gimplify the function arguments.  */
   if (nargs > 0)
@@ -7349,9 +7643,11 @@ gimplify_modify_expr_rhs (tree *expr_p, tree *from_p, tree *to_p,
 		       || (DECL_P (*to_p) && DECL_REGISTER (*to_p)))
 		/* Don't force regs into memory.  */
 		use_target = false;
-	      else if (TREE_CODE (*expr_p) == INIT_EXPR)
+	      else if (TREE_CODE (*expr_p) == INIT_EXPR
+		       && *to_p != gimplify_ctxp->reinit_decl)
 		/* It's OK to use the target directly if it's being
-		   initialized. */
+		   initialized, unless it can hold a value from an earlier
+		   run of the same initialization; see gimplify_decl_expr.  */
 		use_target = true;
 	      else if (TREE_CODE (TYPE_SIZE_UNIT (TREE_TYPE (*to_p)))
 		       != INTEGER_CST)
@@ -22271,6 +22567,194 @@ gimplify_one_sizepos (tree *expr_p, gimple_seq *stmt_p)
     *expr_p = get_initialized_tmp_var (*expr_p, stmt_p, NULL, false);
 }
 
+/* Callback for walk_tree from function_has_reinit_receiver_p.  DATA is the
+   walk's pointer set.  */
+
+static tree
+find_reinit_receiver_r (tree *tp, int *, void *data)
+{
+  tree t = *tp;
+
+  switch (TREE_CODE (t))
+    {
+    case CALL_EXPR:
+      if (call_expr_flags (t) & ECF_RETURNS_TWICE)
+	return t;
+      break;
+
+    case TRY_CATCH_EXPR:
+    case TRY_FINALLY_EXPR:
+      /* In C, an exception leaving a call runs a cleanup in this frame and then
+	 carries on up the stack.  A cleanup can only read a variable through a
+	 pointer, and a variable with its address taken counts no matter what.
+	 Objective-C's @catch and @finally can read it by name and @catch can go
+	 on running the function.  */
+      if (flag_exceptions && !lang_GNU_C ())
+	return t;
+      break;
+
+    case DECL_EXPR:
+      /* The variable of a compound literal needn't be in any BIND_EXPR's list
+	 of variables, so walk_tree doesn't reach its initializer on its own.  */
+      if (VAR_P (DECL_EXPR_DECL (t)))
+	{
+	  auto pset = static_cast<hash_set<tree> *> (data);
+	  return walk_tree (&DECL_INITIAL (DECL_EXPR_DECL (t)),
+			    find_reinit_receiver_r, data, pset);
+	}
+      break;
+
+    default:
+      break;
+    }
+
+  return NULL_TREE;
+}
+
+/* Return true if FNDECL can regain control after a call in its body abandons
+   the initialization of a variable, which lets the function see that the
+   variable kept its old value.  A longjmp to a frame further up ends the frame
+   of FNDECL and all of its variables with it, so it takes a returns_twice call
+   in the body, wherever it may be since a goto can reach it from below, a nested
+   function that can jump to one of the labels of FNDECL, or in Objective-C a
+   handler or a cleanup that runs when an exception unwinds through the frame.
+   Nested functions all count since DECL_NONLOCAL isn't set on labels until
+   tree-nested runs, after gimplification.  */
+
+static bool
+function_has_reinit_receiver_p (tree fndecl)
+{
+  cgraph_node *cgn = cgraph_node::get (fndecl);
+  if (cgn && first_nested_function (cgn))
+    return true;
+
+  hash_set<tree> pset;
+  return walk_tree (&DECL_SAVED_TREE (fndecl), find_reinit_receiver_r, &pset,
+		    &pset) != NULL_TREE;
+}
+
+/* Walk state for find_back_jump_labels_r.  */
+
+struct back_jump_walk
+{
+  hash_set<tree> visited;
+  /* The labels walked so far.  */
+  hash_set<tree> seen;
+  hash_map<tree, unsigned> *places;
+  /* The last place handed out, which only grows as the walk goes on.  */
+  unsigned place;
+  /* The place of the statement being walked in the innermost BIND_EXPR.  */
+  unsigned stmt_place;
+};
+
+/* Callback for walk_tree from find_back_jump_labels.  DATA is the walk state.
+   Labels and jumps must be visited in the order they get gimplified.  Among the
+   operands of one expression that order can differ, but a jump into a statement
+   expression is an error, so a label in one operand can't be reached from
+   another.  The order can differ for a jump in one operand and a compound
+   literal in another too, and that jump can reach a label above both of them.
+   A variable thus takes the place of the whole statement holding it, which
+   comes before any jump in that statement.  Return non-NULL at a computed
+   goto.  */
+
+static tree
+find_back_jump_labels_r (tree *tp, int *walk_subtrees, void *data)
+{
+  auto w = static_cast<back_jump_walk *> (data);
+  tree t = *tp;
+
+  switch (TREE_CODE (t))
+    {
+    case LABEL_EXPR:
+      w->seen.add (LABEL_EXPR_LABEL (t));
+      break;
+
+    case GOTO_EXPR:
+      if (TREE_CODE (GOTO_DESTINATION (t)) != LABEL_DECL)
+	return t;
+      if (w->seen.contains (GOTO_DESTINATION (t)))
+	w->places->put (GOTO_DESTINATION (t), ++w->place);
+      break;
+
+    case ASM_EXPR:
+      for (tree l = ASM_LABELS (t); l; l = TREE_CHAIN (l))
+	if (w->seen.contains (TREE_VALUE (l)))
+	  w->places->put (TREE_VALUE (l), ++w->place);
+      break;
+
+    case BIND_EXPR:
+      /* walk_tree would visit the initializers of all the variables here, ahead
+	 of any statements that come before their declarations.  They're walked
+	 at their DECL_EXPR instead.  */
+      *walk_subtrees = 0;
+      {
+	tree stop = NULL_TREE;
+	unsigned old_stmt_place = w->stmt_place;
+	if (TREE_CODE (BIND_EXPR_BODY (t)) == STATEMENT_LIST)
+	  for (tree_stmt_iterator i = tsi_start (BIND_EXPR_BODY (t));
+	       !stop && !tsi_end_p (i); tsi_next (&i))
+	    {
+	      w->stmt_place = ++w->place;
+	      stop = walk_tree (tsi_stmt_ptr (i), find_back_jump_labels_r, data,
+				&w->visited);
+	    }
+	else
+	  {
+	    w->stmt_place = ++w->place;
+	    stop = walk_tree (&BIND_EXPR_BODY (t), find_back_jump_labels_r, data,
+			      &w->visited);
+	  }
+	w->stmt_place = old_stmt_place;
+	return stop;
+      }
+
+    case DECL_EXPR:
+      if (VAR_P (DECL_EXPR_DECL (t)))
+	{
+	  tree decl = DECL_EXPR_DECL (t);
+	  if (DECL_INITIAL (decl))
+	    w->places->put (decl, w->stmt_place);
+	  if (tree stop = walk_tree (&DECL_SIZE_UNIT (decl),
+				     find_back_jump_labels_r, data,
+				     &w->visited))
+	    return stop;
+	  return walk_tree (&DECL_INITIAL (decl), find_back_jump_labels_r, data,
+			    &w->visited);
+	}
+      break;
+
+    default:
+      break;
+    }
+
+  return NULL_TREE;
+}
+
+/* Record in PLACES where the variables with an initializer in FNDECL are, and
+   where the last jump is to each label that a jump can come back to from
+   further down, as numbers that grow in the order those get gimplified.
+   Running the initializer of a declaration again within its lifetime takes a
+   jump from its statement or below to a label above it.  Nothing else can go up
+   without leaving the block of the declaration, since a loop around the
+   declaration has that block inside of it.  A label above a declaration thus
+   only counts for that declaration if the last jump to the label comes later
+   than the declaration, which leaves out a retry loop above it.  The usual
+   forward goto to a label at the end of a block can't run anything twice.
+   Return false if FNDECL has a computed goto, which can go back to any label
+   with its address taken, since every label has to count then.  Only taking the
+   address doesn't make a label a target, as in the kernel's _THIS_IP_.  */
+
+static bool
+find_back_jump_labels (tree fndecl, hash_map<tree, unsigned> *places)
+{
+  back_jump_walk w;
+  w.places = places;
+  w.place = 0;
+  w.stmt_place = 0;
+  return !walk_tree (&DECL_SAVED_TREE (fndecl), find_back_jump_labels_r, &w,
+		     &w.visited);
+}
+
 /* Gimplify the body of statements of FNDECL and return a GIMPLE_BIND node
    containing the sequence of corresponding GIMPLE statements.  If DO_PARMS
    is true, also gimplify the parameters.  */
@@ -22307,6 +22791,24 @@ gimplify_body (tree fndecl, bool do_parms)
      first, but the g++ front end doesn't always do it that way.  */
   unshare_body (fndecl);
   unvisit_body (fndecl);
+
+  /* This must come before gimplification takes the body apart.  C++ ends the
+     lifetime of a variable on a jump back past its declaration and needs copy
+     elision, so re-run initializations only exist in C and Objective-C.  */
+  hash_map<tree, unsigned> places;
+  hash_map<tree, tree> auto_init_vars;
+  if (lang_GNU_C () || lang_GNU_OBJC ())
+    {
+      gimplify_ctxp->has_reinit_receiver
+	= function_has_reinit_receiver_p (fndecl);
+
+      /* A nested function can jump to any label of FNDECL.  */
+      cgraph_node *cgn = cgraph_node::get (fndecl);
+      if ((!cgn || !first_nested_function (cgn))
+	  && find_back_jump_labels (fndecl, &places))
+	reinit_places = &places;
+      reinit_auto_init_vars = &auto_init_vars;
+    }
 
   /* Make sure input_location isn't set to something weird.  */
   input_location = DECL_SOURCE_LOCATION (fndecl);
@@ -22396,6 +22898,8 @@ gimplify_body (tree fndecl, bool do_parms)
       gimplify_omp_ctxp = NULL;
     }
 
+  reinit_places = NULL;
+  reinit_auto_init_vars = NULL;
   pop_gimplify_context (outer_bind);
   gcc_assert (gimplify_ctxp == NULL);
 
