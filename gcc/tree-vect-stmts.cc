@@ -12300,7 +12300,7 @@ vectorizable_condition (vec_info *vinfo,
 	masks = &LOOP_VINFO_MASKS (loop_vinfo);
       else
 	{
-	  scalar_cond_masked_key cond (cond_expr, 1);
+	  scalar_cond_masked_key cond (cond_expr, vec_num);
 	  if (loop_vinfo->scalar_cond_masked_set.contains (cond))
 	    masks = &LOOP_VINFO_MASKS (loop_vinfo);
 	  else
