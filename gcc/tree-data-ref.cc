@@ -3648,6 +3648,61 @@ dr_access_fns_separate_p (struct data_reference *a, struct data_reference *b,
   return true;
 }
 
+/* Return true if REF goes through a trailing array of a structure, which can
+   take it past the end of the structure.  */
+
+static bool
+dr_ref_may_exceed_struct_p (tree ref)
+{
+  for (; handled_component_p (ref); ref = TREE_OPERAND (ref, 0))
+    if (TREE_CODE (ref) == ARRAY_REF
+	&& TREE_CODE (TREE_OPERAND (ref, 0)) == COMPONENT_REF
+	&& array_ref_flexible_size_p (ref))
+      return true;
+  return false;
+}
+
+/* The final access function of an unconstrained base counts bytes from the
+   pointer being dereferenced, and the subscript tests only compare where
+   accesses start, without any notion of how many bytes each one covers.  Two
+   start addresses that never coincide can therefore get reported as independent
+   even when the accessed bytes overlap, e.g., an 8-byte load at P + 20 * I and
+   an 8-byte store at P + 20 * I + 16 share 4 bytes in the following iteration.
+   The same evolution in both references likewise yields just a distance of 0
+   when the stride is smaller than the access.
+
+   Return true if those access functions in INDICES_A and INDICES_B, the indices
+   in use for A and B, only ever select objects of the base type that are either
+   identical or fully disjoint, which makes the subscript tests exact for them.
+   USE_ALT_INDICES is true for the fallback to whole addresses, which has the
+   same problem.  */
+
+static bool
+dr_base_evolutions_disjoint_p (struct data_reference *a,
+			       struct data_reference *b,
+			       struct indices *indices_a,
+			       struct indices *indices_b, bool use_alt_indices)
+{
+  /* The size of the base type says nothing about the extent of an access that
+     runs past the end of it.  The fallback to whole addresses can still handle
+     this since its base type is the type of the reference.  */
+  if (!use_alt_indices
+      && (dr_ref_may_exceed_struct_p (DR_REF (a))
+	  || dr_ref_may_exceed_struct_p (DR_REF (b))))
+    return false;
+
+  auto_vec<dr_outer_dim, 1> dims_a, dims_b;
+  if (!dr_collect_outer_dims (DR_REF (a), indices_a->access_fns,
+			      indices_a->access_fns.length () - 1, true,
+			      indices_a->base_object, &dims_a)
+      || !dr_collect_outer_dims (DR_REF (b), indices_b->access_fns,
+				 indices_b->access_fns.length () - 1, true,
+				 indices_b->base_object, &dims_b))
+    return false;
+
+  return dr_outer_dims_disjoint_p (dims_a[0], dims_b[0]);
+}
+
 /* Initialize a data dependence relation RES in LOOP_NEST.  USE_ALT_INDICES
    is true when the main indices of A and B were not comparable so we try again
    with alternate indices computed on an indirect reference.  */
@@ -3908,10 +3963,13 @@ initialize_data_dependence_relation (struct data_dependence_relation *res,
   /* Stop relying on the access functions if the enclosing objects could
      partially overlap, so that the dependence comes from the addresses.  */
   if (same_base_p
-      && !use_alt_indices
-      && !dr_access_fns_separate_p (a, b, indices_a, indices_b,
-				    full_seq.start_a, full_seq.start_b,
-				    full_seq.length))
+      && ((indices_a->unconstrained_base
+	   && !dr_base_evolutions_disjoint_p (a, b, indices_a, indices_b,
+					      use_alt_indices))
+	  || (!use_alt_indices
+	      && !dr_access_fns_separate_p (a, b, indices_a, indices_b,
+					    full_seq.start_a, full_seq.start_b,
+					    full_seq.length))))
     full_seq.length = 0;
 
   /* Punt if we didn't find a suitable sequence.  */
