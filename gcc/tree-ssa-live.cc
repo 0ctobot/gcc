@@ -926,12 +926,22 @@ remove_unused_locals (void)
 	      {
 		tree lhs = gimple_call_lhs (stmt);
 		tree base = get_base_address (lhs);
-		if ((DECL_P (base) && !is_used_p (base))
+		/* Only a VAR_DECL can be unused here. A RESULT_DECL is never
+		   marked as used, yet what's stored in it is what the caller
+		   gets to read once NRV has made a local variable into it. The
+		   same goes for what a by-reference result points to, since
+		   that pointer comes from the caller and isn't uninitialized
+		   despite being a default definition.  */
+		if ((VAR_P (base) && !is_used_p (base))
 		    || (TREE_CODE (lhs) == MEM_REF
 			&& TREE_CODE (TREE_OPERAND (lhs, 0)) == SSA_NAME
 			&& SSA_NAME_IS_DEFAULT_DEF (TREE_OPERAND (lhs, 0))
 			&& (TREE_CODE (SSA_NAME_VAR (TREE_OPERAND (lhs, 0)))
-			    != PARM_DECL)))
+			    != PARM_DECL)
+			&& !(TREE_CODE (SSA_NAME_VAR (TREE_OPERAND (lhs, 0)))
+			     == RESULT_DECL
+			     && DECL_BY_REFERENCE (SSA_NAME_VAR
+						   (TREE_OPERAND (lhs, 0))))))
 		  {
 		    unlink_stmt_vdef (stmt);
 		    gsi_remove (&gsi, true);
