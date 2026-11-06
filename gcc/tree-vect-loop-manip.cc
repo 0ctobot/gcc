@@ -4357,11 +4357,28 @@ vect_create_cond_for_lower_bounds (loop_vec_info loop_vinfo, tree *cond_expr)
 void
 vect_create_cond_for_alias_checks (loop_vec_info loop_vinfo, tree * cond_expr)
 {
-  const vec<dr_with_seg_len_pair_t> &comp_alias_ddrs =
+  vec<dr_with_seg_len_pair_t> &comp_alias_ddrs =
     LOOP_VINFO_COMP_ALIAS_DDRS (loop_vinfo);
 
   if (comp_alias_ddrs.is_empty ())
     return;
+
+  /* A partial vector covers lanes past the last scalar iteration that don't
+     run, even for a reference that isn't masked.  The segments of a pair with
+     equal steps are based on the vectorization factor and cover those lanes all
+     the same, so they can wrap in a valid program.  We only know about the
+     partial vectors now, long after the pairs were made.  The segments of a
+     pair with different steps are based on the scalar iteration count and only
+     cover lanes that run, which doesn't need the flag.  Merging can't hide the
+     first kind of segment in a pair that looks like the second kind, since the
+     two pairs would need the same length for their shared reference, which
+     means that the vectorization factor is the iteration count and that all of
+     the lanes run anyway.  */
+  if (LOOP_VINFO_USING_PARTIAL_VECTORS_P (loop_vinfo))
+    for (dr_with_seg_len_pair_t &pair : comp_alias_ddrs)
+      if (operand_equal_p (DR_STEP (pair.first.dr),
+			   DR_STEP (pair.second.dr), 0))
+	pair.flags |= DR_ALIAS_SEG_MAY_WRAP;
 
   create_runtime_alias_checks (LOOP_VINFO_LOOP (loop_vinfo),
 			       &comp_alias_ddrs, cond_expr);
