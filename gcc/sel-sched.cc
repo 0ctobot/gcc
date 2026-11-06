@@ -4560,6 +4560,16 @@ create_block_for_bookkeeping (edge e1, edge e2)
 
   gcc_assert (e2->dest == bb);
 
+  /* The split handed NEW_BB the live set BB had before the move.  That set
+     is stale only when the moved insn was the head of BB: the backward pass
+     of the move refreshes the live set at each insn it ascends, and it has
+     nothing to ascend in that case.  The set may then be missing a register
+     that the moved insn used to set below this point.  Refresh it now since
+     redirecting E1 can create a jump-only block whose live set is computed
+     once from NEW_BB and isn't revisited afterwards.  In every other case
+     this recomputes a set that's already current.  */
+  update_liveness_on_insn (sel_bb_head (new_bb));
+
   /* Skip block for bookkeeping copy when leaving E1->src.  */
   if (e1->flags & EDGE_FALLTHRU)
     sel_redirect_edge_and_branch_force (e1, new_bb);
