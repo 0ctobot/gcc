@@ -3515,6 +3515,14 @@ cond_if_else_store_replacement_1 (basic_block then_bb, basic_block else_bb,
       || stmt_references_abnormal_ssa_name (else_assign))
     return false;
 
+  /* The stores get removed and replaced by a new store after the merge, which
+     cannot preserve an EH region.  A must-not-throw region is the one that
+     matters here since a store in a landing pad's region ends its basic
+     block.  */
+  if (lookup_stmt_eh_lp (then_assign) != 0
+      || lookup_stmt_eh_lp (else_assign) != 0)
+    return false;
+
   /* Allow both being clobbers but no other volatile operations. */
   if (gimple_clobber_p (then_assign)
       && gimple_clobber_p (else_assign))

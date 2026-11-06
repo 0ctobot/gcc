@@ -545,8 +545,11 @@ sink_common_stores_to_bb (basic_block bb)
 	    {
 	      tree arg = gimple_phi_arg_def (phi, i);
 	      gimple *def = SSA_NAME_DEF_STMT (arg);
+	      /* Merging the stores deletes them from the EH table, which would
+		 lose a must-not-throw region as well as a landing pad's
+		 region.  */
 	      if (! is_gimple_assign (def)
-		  || stmt_can_throw_internal (cfun, def)
+		  || lookup_stmt_eh_lp (def) != 0
 		  || (gimple_phi_arg_edge (phi, i)->flags & EDGE_ABNORMAL)
 		  || stmt_references_abnormal_ssa_name (def))
 		{
