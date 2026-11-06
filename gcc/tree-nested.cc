@@ -140,6 +140,11 @@ maybe_record_nested_function (cgraph_node *node)
       nested_function_info *origin_info
 		 = nested_function_info::get_create (origin);
 
+      /* The C front end asks for each nested function to be recorded after
+	 parsing it, by which point creating its node may have recorded it.  */
+      if (info->origin)
+	return;
+
       info->origin = origin;
       info->next_nested = origin_info->nested;
       origin_info->nested = node;
