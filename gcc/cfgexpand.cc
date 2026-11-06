@@ -2220,9 +2220,14 @@ stack_protect_classify_type (tree type)
     {
     case ARRAY_TYPE:
       t = TYPE_MAIN_VARIANT (TREE_TYPE (type));
-      if (t == char_type_node
-	  || t == signed_char_type_node
-	  || t == unsigned_char_type_node)
+      /* Check the flag instead of comparing T against the character type nodes
+	 since plain char doesn't survive LTO streaming as char_type_node.  TUs
+	 can disagree on -f[un]signed-char, so plain char is streamed like any
+	 other type and lto1 reads it back separately from its own node.  The
+	 precision check excludes wider character types.  */
+      if (TREE_CODE (t) == INTEGER_TYPE
+	  && TYPE_STRING_FLAG (t)
+	  && TYPE_PRECISION (t) == CHAR_TYPE_SIZE)
 	{
 	  unsigned HOST_WIDE_INT max = param_ssp_buffer_size;
 	  unsigned HOST_WIDE_INT len;
