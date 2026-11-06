@@ -273,15 +273,19 @@ widest_int_from_isl_expr_int (__isl_keep isl_ast_expr *expr)
   gcc_assert (isl_ast_expr_get_type (expr) == isl_ast_expr_int);
   isl_val *val = isl_ast_expr_get_val (expr);
   size_t n = isl_val_n_abs_num_chunks (val, sizeof (HOST_WIDE_INT));
-  HOST_WIDE_INT *chunks = XALLOCAVEC (HOST_WIDE_INT, n);
-  if (n > WIDEST_INT_MAX_ELTS
+  /* The chunks hold the absolute value as an unsigned number, whereas
+     widest_int takes the top bit of the top element as the sign.  Add a zero
+     element on top to keep a value like 2^64 - 1 from turning into -1.  */
+  HOST_WIDE_INT *chunks = XALLOCAVEC (HOST_WIDE_INT, n + 1);
+  if (n >= WIDEST_INT_MAX_ELTS
       || isl_val_get_abs_num_chunks (val, sizeof (HOST_WIDE_INT), chunks) == -1)
     {
       isl_val_free (val);
       set_codegen_error ();
       return 0;
     }
-  widest_int wi = widest_int::from_array (chunks, n, true);
+  chunks[n] = 0;
+  widest_int wi = widest_int::from_array (chunks, n + 1, true);
   if (isl_val_is_neg (val))
     wi = -wi;
   isl_val_free (val);
