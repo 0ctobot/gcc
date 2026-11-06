@@ -56,6 +56,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "gimple-predict.h"
 #include "alias.h"
 #include "tree-ssa-threadedge.h"
+#include "tree-ssa-dse.h"
 
 /* Return the singleton PHI in the SEQ of PHIs for edges E0 and E1. */
 
@@ -3493,6 +3494,19 @@ cond_store_replacement (basic_block middle_bb, basic_block join_bb, edge e0,
   return true;
 }
 
+/* Return true if the function may not get past something that follows STMT in
+   its basic block.  */
+
+static bool
+stmts_after_may_end_function_p (gimple *stmt)
+{
+  gimple_stmt_iterator gsi = gsi_for_stmt (stmt);
+  for (gsi_next (&gsi); !gsi_end_p (gsi); gsi_next (&gsi))
+    if (stmt_may_end_function_p (cfun, gsi_stmt (gsi)))
+      return true;
+  return false;
+}
+
 /* Do the main work of conditional store replacement.  */
 
 static bool
@@ -3538,6 +3552,14 @@ cond_if_else_store_replacement_1 (basic_block then_bb, basic_block else_bb,
   lhs_base = get_base_address (lhs);
   if (lhs_base == NULL_TREE
       || (!DECL_P (lhs_base) && TREE_CODE (lhs_base) != MEM_REF))
+    return false;
+
+  /* The stores end up in the join block, which the function may never reach.
+     Memory visible outside of the function has to hold them before that.  */
+  if (!gimple_clobber_p (then_assign)
+      && ref_may_alias_global_p (lhs, true)
+      && (stmts_after_may_end_function_p (then_assign)
+	  || stmts_after_may_end_function_p (else_assign)))
     return false;
 
   then_rhs = gimple_assign_rhs1 (then_assign);
