@@ -124,6 +124,8 @@ static char *print_spelling (char *);
 static void warning_init (location_t, int, const char *);
 static tree digest_init (location_t, tree, tree, tree, tree, bool, bool, bool,
 			 bool, bool, bool);
+static tree strip_init_conversions (tree);
+static tree init_drop_copied_flexible_elts (tree);
 static void output_init_element (location_t, tree, tree, bool, tree, tree, bool,
 				 bool, struct obstack *);
 static void output_pending_init_elements (int, struct obstack *);
@@ -10182,6 +10184,19 @@ digest_init (location_t init_loc, tree decl, tree type, tree init,
 	  inside_init = DECL_INITIAL (decl);
 	}
 
+      /* Folding a read of a const object leaves its initializer here, which
+	 can hold more than a copy of the object does.  */
+      if (code == RECORD_TYPE || code == UNION_TYPE)
+	{
+	  tree ctor = strip_init_conversions (inside_init);
+	  if (TREE_CODE (ctor) == CONSTRUCTOR)
+	    {
+	      tree stripped = init_drop_copied_flexible_elts (ctor);
+	      if (stripped != ctor)
+		inside_init = stripped;
+	    }
+	}
+
       if (code == ARRAY_TYPE && TREE_CODE (inside_init) != STRING_CST
 	  && TREE_CODE (inside_init) != CONSTRUCTOR)
 	{
@@ -10820,7 +10835,7 @@ build_init_member_ref (tree base, tree field)
   return ref;
 }
 
-/* Return CTOR, the initializer of an object being copied into a subobject,
+/* Return CTOR, the initializer of an object being copied into another object,
    without the data of any flexible array member.  A copy of a struct doesn't
    include that member, and nothing reserves room for its data in the object
    holding the copy.  Finishing the definition of an object completes the array
@@ -12288,6 +12303,31 @@ find_init_member (tree field, struct obstack * braced_init_obstack)
   return NULL_TREE;
 }
 
+/* Return true if INIT, the initializer of a struct or union, holds data for a
+   flexible array member.  */
+
+static bool
+init_flexible_array_data_p (tree init)
+{
+  init = strip_init_conversions (init);
+  if (TREE_CODE (init) != CONSTRUCTOR)
+    return false;
+
+  unsigned HOST_WIDE_INT ix;
+  tree field, val;
+  FOR_EACH_CONSTRUCTOR_ELT (CONSTRUCTOR_ELTS (init), ix, field, val)
+    if (field
+	&& TREE_CODE (field) == FIELD_DECL
+	&& flexible_array_member_type_p (TREE_TYPE (field)))
+      {
+	if (TREE_CODE (val) != CONSTRUCTOR || CONSTRUCTOR_NELTS (val))
+	  return true;
+      }
+    else if (init_flexible_array_data_p (val))
+      return true;
+  return false;
+}
+
 /* "Output" the next constructor element.
    At top level, really output it to assembler code now.
    Otherwise, collect it in a list from which we will make a CONSTRUCTOR.
@@ -12333,6 +12373,7 @@ output_init_element (location_t loc, tree value, tree origtype,
 		     TYPE_MAIN_VARIANT (type)))
     value = array_to_pointer_conversion (input_location, value);
 
+  bool braced_p = TREE_CODE (strip_init_conversions (value)) == CONSTRUCTOR;
   if (TREE_CODE (value) == COMPOUND_LITERAL_EXPR
       && require_constant_value && pending)
     {
@@ -12420,6 +12461,20 @@ output_init_element (location_t loc, tree value, tree origtype,
 			     require_constant_value, require_constexpr_value);
   if (new_value == error_mark_node)
     {
+      constructor_erroneous = 1;
+      return;
+    }
+  /* A compound literal initializing an object with static storage is handled
+     as if it were the brace-enclosed list it contains, and that list holding
+     data for a flexible array member isn't valid here since pop_init_level
+     rejects it.  A brace-enclosed list got its error there already.  */
+  if (pending
+      && !braced_p
+      && RECORD_OR_UNION_TYPE_P (type)
+      && init_flexible_array_data_p (new_value))
+    {
+      error_init (loc, "initialization of flexible array member in a nested "
+		  "context");
       constructor_erroneous = 1;
       return;
     }
