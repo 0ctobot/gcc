@@ -259,6 +259,10 @@ struct gensum_param_desc
   /* For parameters passing data by reference, this is parameter index to
      compute indices to bb_dereferences.  */
   int deref_index;
+  /* Size in bytes of the object that callers are known to provide: the
+     parameter itself when it's passed by value, or the referenced object when
+     it's a safe_ref.  Zero when no such object is known.  */
+  unsigned known_size;
 };
 
 /* Properly deallocate accesses of DESC.  TODO: Since this data structure is
@@ -1375,6 +1379,8 @@ create_parameter_descriptors (cgraph_node *node,
       desc->split_candidate = true;
       if (desc->by_ref && !desc->safe_ref)
 	desc->deref_index = unsafe_by_ref_count++;
+      else
+	desc->known_size = type_size;
     }
   return ret;
 }
@@ -1902,6 +1908,17 @@ scan_expr_access (tree expr, gimple *stmt, isra_scan_context ctx,
     {
       disqualify_split_candidate (desc, "Encountered an access with too big "
 				  "offset or size");
+      return;
+    }
+  /* Splitting moves this access into all callers, where it runs unconditionally
+     even if it's guarded here.  Callers only guarantee that the known object is
+     readable, so an access past its end can fault in the caller on a path that
+     never reaches the access in this function.  */
+  if (desc->known_size
+      && (offset + size) / BITS_PER_UNIT > desc->known_size)
+    {
+      disqualify_split_candidate (desc, "Encountered an access past the end "
+				  "of the object.");
       return;
     }
 
@@ -2661,6 +2678,10 @@ process_scan_results (cgraph_node *node, struct function *fun,
 	    if (desc->safe_ref)
 	      {
 		csum->m_arg_flow[argidx].safe_to_import_accesses = true;
+		/* A reference only vouches for its own object, but the callee
+		   can cast the pointer it receives to something bigger.  Bound
+		   the accesses that can be imported to the known object.  */
+		csum->m_arg_flow[argidx].unit_size = desc->known_size;
 		continue;
 	      }
 
@@ -3982,7 +4003,8 @@ param_splitting_across_edge (cgraph_edge *cs)
 	    {
 	      const char *pull_failure
 		= pull_accesses_from_callee (cs->caller, caller_ipcp_ts, idx,
-					     param_desc, arg_desc, 0, 0, &res);
+					     param_desc, arg_desc, 0,
+					     ipf->unit_size, &res);
 	      if (pull_failure)
 		{
 		  if (dump_file && (dump_flags & TDF_DETAILS))
