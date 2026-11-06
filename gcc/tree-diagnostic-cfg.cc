@@ -198,8 +198,7 @@ private:
     bitmap_clear (visited);
 
     n = pre_and_rev_post_order_compute_fn (fun, NULL, rpo, true);
-    for (i = n_basic_blocks_for_fn (fun) - n;
-	 i < n_basic_blocks_for_fn (fun); i++)
+    for (i = 0; i < n; i++)
       {
 	basic_block bb = BASIC_BLOCK_FOR_FN (fun, rpo[i]);
 	add_cfg_node (g, node_map, parent_node, fun->funcdef_no, bb);
