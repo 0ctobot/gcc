@@ -156,7 +156,8 @@ struct pair_fusion_bb_info
   static const size_t obstack_alignment = sizeof (void *);
 
   pair_fusion_bb_info (bb_info *bb, pair_fusion *d)
-    : m_bb (bb), m_pass (d), m_emitted_tombstone (false)
+    : m_bb (bb), m_pass (d), m_emitted_tombstone (false),
+      m_scanned_volatile_insns (false)
   {
     obstack_specify_allocation (&m_obstack, OBSTACK_CHUNK_SIZE,
 				obstack_alignment, obstack_chunk_alloc,
@@ -187,6 +188,11 @@ private:
   bitmap_head m_tombstone_bitmap;
   bool m_emitted_tombstone;
 
+  // The insns of this BB with volatile references, in program order.  This is
+  // filled in the first time that volatile_insn_between_p needs it.
+  auto_vec<insn_info *> m_volatile_insns;
+  bool m_scanned_volatile_insns;
+
   inline splay_tree_node<access_record *> *node_alloc (access_record *);
 
   template<typename Map>
@@ -195,6 +201,8 @@ private:
 
   inline void merge_pairs (insn_list_t &, insn_list_t &,
 			   bool load_p, unsigned access_size);
+
+  inline bool volatile_insn_between_p (insn_info *first, insn_info *second);
 
   inline bool try_fuse_pair (bool load_p, unsigned access_size,
 			     insn_info *i1, insn_info *i2);
@@ -2496,6 +2504,39 @@ pair_fusion::get_viable_bases (insn_info *insns[2],
   return writeback;
 }
 
+// Return true if an insn with a volatile reference sits between FIRST and
+// SECOND.  Such an insn is an asm volatile, an unspec_volatile or a volatile
+// memory access, which needn't show up as a memory hazard: an asm volatile with
+// no memory clobber has no memory defs or uses at all, even though it can stop
+// the function or let something else look at memory.  The scheduler treats a
+// volatile asm and an unspec_volatile as full barriers (see reg_pending_barrier
+// in sched-deps.cc), and accesses can't be fused across one any more than they
+// can be scheduled across one.
+//
+// This has to look at the pattern itself because insn_info::has_volatile_refs ()
+// is false for an asm with no outputs, whose pattern is a bare ASM_OPERANDS.
+//
+// None of these insns ever get deleted or moved by this pass, and new insns it
+// creates aren't volatile, so scanning the BB once is enough.
+bool
+pair_fusion_bb_info::volatile_insn_between_p (insn_info *first,
+					      insn_info *second)
+{
+  if (!m_scanned_volatile_insns)
+    {
+      for (auto insn : m_bb->real_nondebug_insns ())
+	if (volatile_refs_p (PATTERN (insn->rtl ())))
+	  m_volatile_insns.safe_push (insn);
+      m_scanned_volatile_insns = true;
+    }
+
+  unsigned ix
+    = m_volatile_insns.lower_bound (first, [](insn_info *const &a,
+					      insn_info *const &b)
+				    { return *a < *b; });
+  return ix < m_volatile_insns.length () && *m_volatile_insns[ix] < *second;
+}
+
 // Given two adjacent memory accesses of the same size, I1 and I2, try
 // and see if we can merge them into a paired access.
 //
@@ -2521,6 +2562,17 @@ pair_fusion_bb_info::try_fuse_pair (bool load_p, unsigned access_size,
       insns[0] = i2;
       insns[1] = i1;
       reversed = true;
+    }
+
+  // The pair ends up somewhere between the two insns, so forming it always
+  // moves at least one of the accesses past whatever sits in between.
+  if (volatile_insn_between_p (insns[0], insns[1]))
+    {
+      if (dump_file)
+	fprintf (dump_file,
+		 "can't form pair (%d,%d) across a volatile reference\n",
+		 insns[0]->uid (), insns[1]->uid ());
+      return false;
     }
 
   rtx cand_mems[2];
