@@ -74,6 +74,8 @@ static void expr_object_size (struct object_size_info *, tree, tree);
 static bool merge_object_sizes (struct object_size_info *, tree, tree);
 static bool plus_stmt_object_size (struct object_size_info *, tree, gimple *);
 static bool object_size_variable_offset_p (tree, bool = false);
+static bool object_size_may_step_back_p (tree);
+static bool object_size_step_returns_p (tree, tree, tree);
 static bool cond_expr_object_size (struct object_size_info *, tree, gimple *);
 static void init_offset_limit (void);
 static void check_for_plus_in_loops (struct object_size_info *, tree);
@@ -2182,12 +2184,19 @@ plus_stmt_object_size (struct object_size_info *osi, tree var, gimple *stmt)
 
       /* The static maximum for a pointer stepped back in a loop or moved by a
 	 non-constant offset presumes the pointer never went below where it
-	 started, and a constant going forward from there isn't necessarily
-	 past the end of the subobject just because it's past the end of that
-	 maximum.  Saying 0 for it would abort on valid code, so handle it like
-	 a folded offset.  An offset that stays inside the maximum is left
-	 alone, which keeps the check on all the ordinary uses of such a
-	 pointer.  */
+	 started.  A step that may take it below the subobject, or a constant
+	 going forward from a pointer that may already be there, gives a
+	 pointer that can have more left than the maximum says.  Saying too
+	 little aborts on valid code, so the subobject can't be trusted and
+	 only the whole object bounds such a pointer.  */
+      bool back = (maxsub
+		   && !(object_size_type & OST_DYNAMIC)
+		   && object_size_step_returns_p (var, op0, op1));
+
+      /* What's left is a chain of exact constants, whose maximum already
+	 tracks the lowest pointer.  Going past the end of that maximum after a
+	 step back isn't necessarily past the end of the subobject, so handle
+	 it like a folded offset.  */
       bool below = false;
       if (maxsub
 	  && !folded
@@ -2208,8 +2217,16 @@ plus_stmt_object_size (struct object_size_info *osi, tree var, gimple *stmt)
 	}
       folded |= below;
 
+      /* A static non-constant offset is presumed to stay in the subobject,
+	 as described below, so it doesn't go below the start of an object
+	 reached through a parameter either.  The bias for that could only
+	 turn its size into an unknown one in size_for_offset.  */
       tree offwhole = wholesize;
-      if (!pos_offset && !size_unknown_p (bytes, 0))
+      if (!pos_offset
+	  && !size_unknown_p (bytes, 0)
+	  && !(maxsub
+	       && !(object_size_type & OST_DYNAMIC)
+	       && TREE_CODE (op1) != INTEGER_CST))
 	offwhole = wholesize_for_offset (op0, wholesize, object_size_type);
 
       /* size_for_offset doesn't make sense for -1 size, but it does for size 0
@@ -2217,13 +2234,23 @@ plus_stmt_object_size (struct object_size_info *osi, tree var, gimple *stmt)
 	 a non-zero size.  */
       if (size_unknown_p (bytes, 0))
 	;
-      /* A static non-constant offset is presumed to stay in the subobject,
-	 since a static maximum subobject size would be of no use for such
-	 pointers otherwise.  The same goes for a static pointer stepped in a
-	 loop, whose sizes only settle at the fixed point.  Anything else may
-	 leave the subobject downward, or in either direction when the offset
-	 may be folded, which includes a folded offset applied after such a
-	 loop.  */
+      /* The size of the whole object doesn't depend on the fixed point for the
+	 subobject, so this gives the same answer on a loop in every pass.  */
+      else if (back)
+	{
+	  tree sz, whole;
+	  compute_builtin_object_size (var, object_size_type & ~OST_SUBOBJECT,
+				       &sz, &whole);
+	  bytes = sz;
+	  wholesize = size_unknown_p (whole, object_size_type) ? sz : whole;
+	}
+      /* A static non-constant offset that isn't negated is presumed to stay in
+	 the subobject, since a static maximum subobject size would be of no use
+	 for such pointers otherwise.  The same goes for a static pointer
+	 stepped in a loop, whose sizes only settle at the fixed point.
+	 Anything else may leave the subobject downward, or in either direction
+	 when the offset may be folded, which includes a folded offset applied
+	 after such a loop.  */
       else if (maxsub
 	       && (!pos_offset || folded)
 	       && ((object_size_type & OST_DYNAMIC)
@@ -2830,6 +2857,49 @@ check_for_plus_in_loops (struct object_size_info *osi, tree var)
 }
 
 
+/* The questions about the chain of definitions of a pointer whose answers are
+   kept for the function at hand.  Each of them walks the whole chain behind
+   the pointer, and the pass asks them again about the same pointer for each
+   step built on it and for each call that uses it.  */
+
+enum object_size_chain_query
+{
+  CHAIN_MAY_STEP_BACK,
+  CHAIN_END
+};
+
+/* For each of those questions, by the SSA name version of a pointer: which
+   pointers have an answer, and which of those answered true.  */
+
+static bitmap chain_known[CHAIN_END];
+static bitmap chain_answer[CHAIN_END];
+
+/* Return the answer FN gives to QUERY for PTR, which is only worked out the
+   first time the pass asks about an SSA name and is kept until the pass is
+   done with the function, like the object sizes themselves.  FN walks the
+   chain with a visited set and a limit of its own, so its answer doesn't
+   depend on who asked: a chain cut short by the limit gives the conservative
+   true, and false only comes from a complete walk.  */
+
+static bool
+object_size_chain_memo (enum object_size_chain_query query, tree ptr,
+			bool (*fn) (tree))
+{
+  if (TREE_CODE (ptr) != SSA_NAME)
+    return fn (ptr);
+
+  unsigned int version = SSA_NAME_VERSION (ptr);
+  if (bitmap_bit_p (chain_known[query], version))
+    return bitmap_bit_p (chain_answer[query], version);
+
+  bool answer = fn (ptr);
+  bitmap_set_bit (chain_known[query], version);
+  if (answer)
+    bitmap_set_bit (chain_answer[query], version);
+
+  return answer;
+}
+
 /* Initialize data structures for the object size computation.  */
 
 void
@@ -2847,6 +2917,12 @@ init_object_sizes (void)
     }
 
   init_offset_limit ();
+
+  for (int i = 0; i < CHAIN_END; i++)
+    {
+      chain_known[i] = BITMAP_ALLOC (NULL);
+      chain_answer[i] = BITMAP_ALLOC (NULL);
+    }
 }
 
 
@@ -2856,6 +2932,12 @@ void
 fini_object_sizes (void)
 {
   int object_size_type;
+
+  for (int i = 0; i < CHAIN_END; i++)
+    {
+      BITMAP_FREE (chain_known[i]);
+      BITMAP_FREE (chain_answer[i]);
+    }
 
   for (object_size_type = 0; object_size_type < OST_END; object_size_type++)
     {
@@ -2872,15 +2954,20 @@ do_valueize (tree t)
   return t;
 }
 
-/* Return true if PTR is computed with a non-constant offset anywhere in its
-   chain of definitions.  With NEGATIVE, a negative constant offset counts too,
-   which covers every step that could take PTR below where it started.  */
+/* Walk the chain of definitions of PTR and call STEP with the result, the base
+   and the offset of each step that moves a pointer.  Return true as soon as
+   STEP does.  A chain too long to walk also gives true, which is the
+   conservative answer for all the users of this.  With SUBOBJECT, stop at the
+   address of a member: where the enclosing object came from says nothing about
+   where a pointer is relative to one of that object's members.  */
 
+template <typename F>
 static bool
-object_size_variable_offset_p (tree ptr, bool negative)
+object_size_walk_steps (tree ptr, F step, bool subobject = false)
 {
   auto_bitmap visited;
   auto_vec<tree, 8> worklist;
+  int limit = param_ssa_name_def_chain_limit;
 
   worklist.safe_push (ptr);
   while (!worklist.is_empty ())
@@ -2889,6 +2976,8 @@ object_size_variable_offset_p (tree ptr, bool negative)
       if (TREE_CODE (ptr) == ADDR_EXPR)
 	{
 	  tree base = TREE_OPERAND (ptr, 0);
+	  if (subobject && handled_component_p (base))
+	    continue;
 	  while (handled_component_p (base))
 	    base = TREE_OPERAND (base, 0);
 	  if (TREE_CODE (base) == MEM_REF)
@@ -2899,6 +2988,11 @@ object_size_variable_offset_p (tree ptr, bool negative)
       if (TREE_CODE (ptr) != SSA_NAME
 	  || !bitmap_set_bit (visited, SSA_NAME_VERSION (ptr)))
 	continue;
+
+      /* Running into the limit deliberately reads as a chain that may repeat
+	 or step back, which is the conservative answer for every user.  */
+      if (limit-- == 0)
+	return true;
 
       gimple *stmt = SSA_NAME_DEF_STMT (ptr);
       switch (gimple_code (stmt))
@@ -2918,13 +3012,28 @@ object_size_variable_offset_p (tree ptr, bool negative)
 	  switch (gimple_assign_rhs_code (stmt))
 	    {
 	    case POINTER_PLUS_EXPR:
-	      if (TREE_CODE (gimple_assign_rhs2 (stmt)) != INTEGER_CST
-		  || (negative
-		      && compare_tree_int (gimple_assign_rhs2 (stmt),
-					   offset_limit) > 0))
+	      if (step (ptr, gimple_assign_rhs1 (stmt),
+			gimple_assign_rhs2 (stmt)))
 		return true;
 	      worklist.safe_push (gimple_assign_rhs1 (stmt));
 	      break;
+
+	    case ADDR_EXPR:
+	      {
+		tree base = TREE_OPERAND (gimple_assign_rhs1 (stmt), 0);
+		if (subobject && handled_component_p (base))
+		  break;
+		while (handled_component_p (base))
+		  base = TREE_OPERAND (base, 0);
+		if (TREE_CODE (base) == MEM_REF)
+		  {
+		    if (step (ptr, TREE_OPERAND (base, 0),
+			      TREE_OPERAND (base, 1)))
+		      return true;
+		    worklist.safe_push (TREE_OPERAND (base, 0));
+		  }
+		break;
+	      }
 
 	    case COND_EXPR:
 	      worklist.safe_push (gimple_assign_rhs2 (stmt));
@@ -2945,6 +3054,113 @@ object_size_variable_offset_p (tree ptr, bool negative)
     }
 
   return false;
+}
+
+/* Return true if the constant offset OFF moves a pointer backward.  */
+
+static bool
+object_size_negative_offset_p (tree off)
+{
+  return (TREE_CODE (off) == INTEGER_CST
+	  && compare_tree_int (off, offset_limit) > 0);
+}
+
+/* Return true if PTR is computed with a non-constant offset anywhere in its
+   chain of definitions.  With NEGATIVE, a negative constant offset counts too,
+   which covers every step that could take PTR below where it started.  */
+
+static bool
+object_size_variable_offset_p (tree ptr, bool negative)
+{
+  return object_size_walk_steps (ptr, [negative] (tree, tree, tree off)
+    {
+      return (TREE_CODE (off) != INTEGER_CST
+	      || (negative && object_size_negative_offset_p (off)));
+    });
+}
+
+/* Return true if the step that gives LHS from BASE repeats, i.e., BASE is
+   computed from LHS.  */
+
+static bool
+object_size_step_repeats_p (tree lhs, tree base)
+{
+  return object_size_walk_steps (base, [lhs] (tree res, tree, tree)
+    {
+      return res == lhs;
+    }, true);
+}
+
+/* Return true if PTR may be below where its chain of definitions started by an
+   amount that nothing in the chain pins down, due to a non-constant offset or
+   a negative constant that repeats on a cycle.  A chain of exact constants
+   doesn't count, since its maximum follows the pointer step by step.  */
+
+static bool
+object_size_may_step_back_1 (tree ptr)
+{
+  return object_size_walk_steps (ptr, [] (tree lhs, tree base, tree off)
+    {
+      return (TREE_CODE (off) != INTEGER_CST
+	      || (object_size_negative_offset_p (off)
+		  && object_size_step_repeats_p (lhs, base)));
+    }, true);
+}
+
+/* Return object_size_may_step_back_1 (PTR), asking it once for each SSA
+   name.  */
+
+static bool
+object_size_may_step_back_p (tree ptr)
+{
+  return object_size_chain_memo (CHAIN_MAY_STEP_BACK, ptr,
+				 object_size_may_step_back_1);
+}
+
+/* Return true if the non-constant offset OFF is computed by subtracting, which
+   makes it a step backward rather than an index that merely might be
+   negative.  */
+
+static bool
+object_size_negated_offset_p (tree off)
+{
+  while (TREE_CODE (off) == SSA_NAME)
+    {
+      gimple *stmt = SSA_NAME_DEF_STMT (off);
+      if (!is_gimple_assign (stmt))
+	return false;
+
+      switch (gimple_assign_rhs_code (stmt))
+	{
+	case NEGATE_EXPR:
+	case MINUS_EXPR:
+	  return true;
+	case MULT_EXPR:
+	  return object_size_negative_offset_p (gimple_assign_rhs2 (stmt));
+	CASE_CONVERT:
+	  off = gimple_assign_rhs1 (stmt);
+	  break;
+	default:
+	  return false;
+	}
+    }
+
+  return false;
+}
+
+/* Return true if the step LHS = BASE + OFF gives a pointer that may have come
+   back from below its subobject, or that may be there still.  */
+
+static bool
+object_size_step_returns_p (tree lhs, tree base, tree off)
+{
+  if (TREE_CODE (off) != INTEGER_CST)
+    return object_size_negated_offset_p (off);
+
+  if (object_size_negative_offset_p (off))
+    return object_size_step_repeats_p (lhs, base);
+
+  return object_size_may_step_back_p (base);
 }
 
 /* Process a __builtin_object_size or __builtin_dynamic_object_size call in
@@ -2973,13 +3189,13 @@ early_object_sizes_execute_one (gimple_stmt_iterator *i, gimple *call)
   if (TREE_CODE (ptr) != ADDR_EXPR && TREE_CODE (ptr) != SSA_NAME)
     return;
 
-  /* The static estimate for a non-constant offset presumes that the offset
-     stays in the subobject.  __builtin_dynamic_object_size can see where the
-     offset actually goes when it's expanded later, so don't let the estimate
-     cap it.  */
+  /* The static estimate for a non-constant offset or a pointer stepped back in
+     a loop presumes that the pointer stays in the subobject.
+     __builtin_dynamic_object_size can see where the pointer actually goes when
+     it's expanded later, so don't let the estimate cap it.  */
   if (object_size_type == 1
       && gimple_call_builtin_p (call, BUILT_IN_DYNAMIC_OBJECT_SIZE)
-      && object_size_variable_offset_p (ptr))
+      && object_size_may_step_back_p (ptr))
     return;
 
   tree type = TREE_TYPE (lhs);
