@@ -1,7 +1,7 @@
 /* { dg-do run } */
 /* { dg-options "-O2" } */
 
-/* A pointer stepped below a member of an object of unknown size by an offset
+/* A pointer stepped out of a member of an object of unknown size by an offset
    that's only known at run time may still be well inside the enclosing
    object, so its maximum size may be larger than what's left, but never
    smaller.  The same goes for a pointer stepped again from there, in either
@@ -95,6 +95,9 @@ main (void)
   /* Back, then forward.  */
   check (p, -16, 4);
   check (p, -16, 20);
+  /* Forward past the end of the member, then back.  */
+  check (p, 24, -10);
+  check (p, 24, -30);
   /* Back, forward, then back again.  */
   check3 (p, -16, 4, -8);
   /* Steps that stay in the member keep its exact size.  */
