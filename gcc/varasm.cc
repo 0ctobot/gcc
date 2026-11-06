@@ -5877,7 +5877,11 @@ output_constructor_regular_field (oc_local_state *local)
 	{
 	  unsigned HOST_WIDE_INT fldsize
 	    = array_size_for_constructor (local->val);
-	  fieldsize = int_size_in_bytes (TREE_TYPE (local->val));
+	  /* The C front end leaves the array type of the data in a static
+	     compound literal incomplete, which leaves the initializer as the
+	     only source of its size.  */
+	  fieldsize = (COMPLETE_TYPE_P (TREE_TYPE (local->val))
+		       ? int_size_in_bytes (TREE_TYPE (local->val)) : fldsize);
 	  /* In most cases fieldsize == fldsize as the size of the initializer
 	     determines how many elements the flexible array member has.  For
 	     C++ fldsize can be smaller though, if the last or several last or

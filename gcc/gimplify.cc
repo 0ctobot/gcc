@@ -6789,14 +6789,19 @@ gimplify_modify_expr_rhs (tree *expr_p, tree *from_p, tree *to_p,
 	     field basis.  However, if the target is volatile and the type
 	     is aggregate and non-addressable, gimplify_init_constructor
 	     knows that it needs to ensure a single access to the target
-	     and it will return GS_OK only in this case.  */
+	     and it will return GS_OK only in this case.  The data of a
+	     flexible array member makes a variable bigger than its type, and
+	     the assignment must not store that data since it copies the size
+	     of the type alone.  */
 	  if (TREE_READONLY (*from_p)
 	      && DECL_INITIAL (*from_p)
 	      && TREE_CODE (DECL_INITIAL (*from_p)) == CONSTRUCTOR
 	      && !TREE_THIS_VOLATILE (*from_p)
 	      && (!TREE_THIS_VOLATILE (*to_p)
 		  || (AGGREGATE_TYPE_P (TREE_TYPE (*to_p))
-		      && !TREE_ADDRESSABLE (TREE_TYPE (*to_p)))))
+		      && !TREE_ADDRESSABLE (TREE_TYPE (*to_p))))
+	      && tree_int_cst_equal (DECL_SIZE_UNIT (*from_p),
+				     TYPE_SIZE_UNIT (TREE_TYPE (*from_p))))
 	    {
 	      tree old_from = *from_p;
 	      enum gimplify_status subret;
