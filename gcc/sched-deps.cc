@@ -3035,6 +3035,10 @@ sched_analyze_insn (class deps_desc *deps, rtx x, rtx_insn *insn)
 	reg_pending_barrier = TRUE_BARRIER;
       else if (find_reg_note (insn, REG_SETJMP, NULL))
 	reg_pending_barrier = MOVE_BARRIER;
+      /* Nothing placed after a noreturn call ever executes, so it must stay
+	 last just like a jump that's followed by a barrier.  */
+      else if (find_reg_note (insn, REG_NORETURN, NULL))
+	reg_pending_barrier = MOVE_BARRIER;
     }
 
   if (JUMP_P (insn))
@@ -3907,8 +3911,12 @@ deps_analyze_insn (class deps_desc *deps, rtx_insn *insn)
       /* In the absence of interprocedural alias analysis, we must flush
          all pending reads and writes, and start new dependencies starting
          from here.  But only flush writes for constant calls (which may
-         be passed a pointer to something we haven't written yet).  */
-      flush_pending_lists (deps, insn, true, ! RTL_CONST_OR_PURE_CALL_P (insn));
+         be passed a pointer to something we haven't written yet).  A looping
+         constant call might not return, so a volatile read must stay above
+         it too.  */
+      flush_pending_lists (deps, insn, true,
+			   ! RTL_CONST_OR_PURE_CALL_P (insn)
+			   || RTL_LOOPING_CONST_OR_PURE_CALL_P (insn));
 
       if (!deps->readonly)
         {
