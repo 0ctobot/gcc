@@ -272,6 +272,7 @@ struct gimplify_ctx
 
   int conditions;
   unsigned into_ssa : 1;
+  unsigned has_reinit_receiver : 1;
   unsigned allow_rhs_cond_expr : 1;
   unsigned in_cleanup_point_expr : 1;
   unsigned keep_stack : 1;
@@ -410,6 +411,8 @@ push_gimplify_context (bool in_ssa, bool rhs_cond_ok)
   struct gimplify_ctx *c = ctx_alloc ();
 
   c->prev_context = gimplify_ctxp;
+  if (c->prev_context)
+    c->has_reinit_receiver = c->prev_context->has_reinit_receiver;
   gimplify_ctxp = c;
   gimplify_ctxp->into_ssa = in_ssa;
   gimplify_ctxp->allow_rhs_cond_expr = rhs_cond_ok;
@@ -2392,15 +2395,22 @@ gimplify_decl_expr (tree *stmt_p, gimple_seq *seq_p)
 	      DECL_INITIAL (decl) = NULL_TREE;
 	      /* In C, a jump back to a place inside the block of DECL doesn't
 		 end its lifetime, so DECL can hold a value when its initializer
-		 runs again.  If a call in the initializer then abandons the
-		 initialization with a longjmp, DECL must still hold that value.
-		 C++ ends the lifetime on the jump back and needs copy elision.
-		 Only a user label or a setjmp before the declaration allows
-		 this, since a loop body is a block of its own.  */
+		 runs again, and that value has to stay in place until the new
+		 one is complete.  A call in the initializer can read it through
+		 the address of DECL, and a call that abandons the initialization
+		 with a longjmp must leave it behind.  Only a user label or a
+		 setjmp before the declaration allows this, since a loop body is
+		 a block of its own.  The read takes a DECL with its address
+		 taken.  The longjmp only matters if something in this function
+		 can regain control after it, since otherwise it ends this frame
+		 and DECL along with it.  */
 	      tree old_reinit_decl = gimplify_ctxp->reinit_decl;
+	      bool init_in_tmp = false;
 	      gimplify_ctxp->reinit_decl = NULL_TREE;
 	      if (gimplify_ctxp->reinit_points
-		  && (lang_GNU_C () || lang_GNU_OBJC ()))
+		  && (gimplify_ctxp->has_reinit_receiver
+		      || (TREE_ADDRESSABLE (decl)
+			  && (lang_GNU_C () || lang_GNU_OBJC ()))))
 		{
 		  gimplify_ctxp->reinit_decl = decl;
 		  /* The gimplifier stores the parts of an aggregate one by one
@@ -2414,12 +2424,24 @@ gimplify_decl_expr (tree *stmt_p, gimple_seq *seq_p)
 		      && TREE_SIDE_EFFECTS (ctor)
 		      && AGGREGATE_TYPE_P (TREE_TYPE (decl))
 		      && TREE_CODE (DECL_SIZE_UNIT (decl)) == INTEGER_CST)
-		    init = get_initialized_tmp_var (init, seq_p);
+		    {
+		      init = get_initialized_tmp_var (init, seq_p);
+		      init_in_tmp = true;
+		    }
 		}
 	      init = build2 (INIT_EXPR, void_type_node, decl, init);
 	      gimplify_and_add (init, seq_p);
 	      ggc_free (init);
 	      gimplify_ctxp->reinit_decl = old_reinit_decl;
+	      /* gimplify_init_constructor only cleared the temporary's padding,
+		 and the copy can't be relied on to carry it since SRA can
+		 scalarize that copy.  */
+	      if (init_in_tmp
+		  && !is_gimple_reg (decl)
+		  && clear_padding_type_may_have_padding_p (TREE_TYPE (decl))
+		  && var_needs_auto_init_p (decl)
+		  && flag_auto_var_init != AUTO_INIT_CXX26)
+		gimple_add_padding_init_for_auto_var (decl, false, seq_p);
 	      /* Clear TREE_READONLY if we really have an initialization.  */
 	      if (!DECL_INITIAL (decl)
 		  && !omp_privatize_by_reference (decl))
@@ -22248,6 +22270,69 @@ gimplify_one_sizepos (tree *expr_p, gimple_seq *stmt_p)
     *expr_p = get_initialized_tmp_var (*expr_p, stmt_p, NULL, false);
 }
 
+/* Callback for walk_tree from function_has_reinit_receiver_p.  DATA is the
+   walk's pointer set.  */
+
+static tree
+find_reinit_receiver_r (tree *tp, int *, void *data)
+{
+  tree t = *tp;
+
+  switch (TREE_CODE (t))
+    {
+    case CALL_EXPR:
+      if (call_expr_flags (t) & ECF_RETURNS_TWICE)
+	return t;
+      break;
+
+    case TRY_CATCH_EXPR:
+    case TRY_FINALLY_EXPR:
+      /* A cleanup runs in this frame when an exception leaves a call, and it
+	 can read a variable through a pointer.  */
+      if (flag_exceptions)
+	return t;
+      break;
+
+    case DECL_EXPR:
+      /* The variable of a compound literal needn't be in any BIND_EXPR's list
+	 of variables, so walk_tree doesn't reach its initializer on its own.  */
+      if (VAR_P (DECL_EXPR_DECL (t)))
+	{
+	  auto pset = static_cast<hash_set<tree> *> (data);
+	  return walk_tree (&DECL_INITIAL (DECL_EXPR_DECL (t)),
+			    find_reinit_receiver_r, data, pset);
+	}
+      break;
+
+    default:
+      break;
+    }
+
+  return NULL_TREE;
+}
+
+/* Return true if FNDECL can regain control after a call in its body abandons
+   the initialization of a variable, which is the only way for the function to
+   see that the variable kept its old value.  A longjmp to a frame further up
+   ends the frame of FNDECL and all of its variables with it, so it takes a
+   returns_twice call in the body, wherever it may be since a goto can reach it
+   from below, a nested function that can jump to one of the labels of FNDECL,
+   or a cleanup that runs when an exception unwinds through the frame.  Nested
+   functions all count since DECL_NONLOCAL isn't set on labels until
+   tree-nested runs, after gimplification.  */
+
+static bool
+function_has_reinit_receiver_p (tree fndecl)
+{
+  cgraph_node *cgn = cgraph_node::get (fndecl);
+  if (cgn && first_nested_function (cgn))
+    return true;
+
+  hash_set<tree> pset;
+  return walk_tree (&DECL_SAVED_TREE (fndecl), find_reinit_receiver_r, &pset,
+		    &pset) != NULL_TREE;
+}
+
 /* Gimplify the body of statements of FNDECL and return a GIMPLE_BIND node
    containing the sequence of corresponding GIMPLE statements.  If DO_PARMS
    is true, also gimplify the parameters.  */
@@ -22284,6 +22369,13 @@ gimplify_body (tree fndecl, bool do_parms)
      first, but the g++ front end doesn't always do it that way.  */
   unshare_body (fndecl);
   unvisit_body (fndecl);
+
+  /* This must come before gimplification takes the body apart.  C++ ends the
+     lifetime of a variable on a jump back past its declaration and needs copy
+     elision, so re-run initializations only exist in C and Objective-C.  */
+  if (lang_GNU_C () || lang_GNU_OBJC ())
+    gimplify_ctxp->has_reinit_receiver
+      = function_has_reinit_receiver_p (fndecl);
 
   /* Make sure input_location isn't set to something weird.  */
   input_location = DECL_SOURCE_LOCATION (fndecl);
