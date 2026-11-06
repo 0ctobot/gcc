@@ -44,6 +44,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "gimple-match.h"
 #include "recog.h"		/* FIXME: for insn_data */
 #include "optabs-libfuncs.h"
+#include "cfganal.h"
 #include "cfgloop.h"
 #include "tree-vectorizer.h"
 
@@ -1228,11 +1229,10 @@ expand_vector_condition (gimple_stmt_iterator *gsi)
       vbfld_1 = tmp_7 | tmp_9;
 
      Build these in a separate sequence since gimple_build then doesn't follow
-     SSA edges out of it.  We don't walk the blocks in dominator order, so
-     tmp_6 can be defined by a comparison that we haven't lowered yet.  Folding
-     through it would insert a new comparison before GSI, where the walk never
-     sees it, and expand cannot handle a comparison the target doesn't
-     support.  */
+     SSA edges out of it.  tmp_6 can be defined by a comparison that the target
+     supports, and folding ~tmp_6 through it would insert the inverse comparison
+     before GSI, where the walk never sees it.  Expand cannot handle that
+     comparison if the target doesn't support it.  */
   if (VECTOR_BOOLEAN_TYPE_P (type)
       && SCALAR_INT_MODE_P (TYPE_MODE (type))
       && useless_type_conversion_p (type, TREE_TYPE (a)))
@@ -2453,8 +2453,36 @@ expand_vector_operations (void)
   basic_block bb;
   bool cfg_changed = false;
 
+  /* Lowering a statement folds the replacement statements it builds, and that
+     folding looks through SSA definitions.  A definition that's still unlowered
+     can get folded into a replacement, which then performs an operation the
+     target lacks (e.g., a conversion sunk into an unsupported VEC_COND_EXPR).
+     Replacements go before the iterator, so that operation would never get
+     lowered.
+
+     Prevent this by visiting each block only after its dominators, which
+     guarantees that every definition is lowered before its uses.  A depth first
+     search preorder does that since a dominator is always an ancestor in the
+     search tree.  PHI arguments are the only uses that can precede their
+     definitions, and folding doesn't look through PHIs.  Unreachable blocks
+     aren't covered by the search, so they go last.  */
+  int *order = XNEWVEC (int, n_basic_blocks_for_fn (cfun));
+  int n = pre_and_rev_post_order_compute_fn (cfun, order, NULL, false);
+  auto_sbitmap reachable (last_basic_block_for_fn (cfun));
+  bitmap_clear (reachable);
+  for (int i = 0; i < n; i++)
+    bitmap_set_bit (reachable, order[i]);
   FOR_EACH_BB_FN (bb, cfun)
+    if (!bitmap_bit_p (reachable, bb->index))
+      order[n++] = bb->index;
+
+  for (int i = 0; i < n; i++)
     {
+      /* Purging dead EH edges may have deleted this block.  */
+      bb = BASIC_BLOCK_FOR_FN (cfun, order[i]);
+      if (!bb)
+	continue;
+
       for (gsi = gsi_start_bb (bb); !gsi_end_p (gsi); gsi_next (&gsi))
 	{
 	  expand_vector_operations_1 (&gsi);
@@ -2476,6 +2504,7 @@ expand_vector_operations (void)
 	}
     }
 
+  free (order);
   return cfg_changed ? TODO_cleanup_cfg : 0;
 }
 
