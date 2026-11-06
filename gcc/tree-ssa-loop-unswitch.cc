@@ -1333,6 +1333,36 @@ find_loop_guard (class loop *loop, vec<gimple *> &dbg_to_reset)
 	}
     }
 
+  /* check_exit_phi rejected real uses outside of the loop of anything defined
+     in the loop, since those would need an exit PHI.  Debug binds have no such
+     PHI, and the hoisted guard makes the code after the loop reachable without
+     going through the skipped blocks, so their definitions no longer dominate
+     such binds.  The check above only looks at the blocks that aren't skipped,
+     so gather the uses of everything else here.  */
+  for (i = 0; i < loop->num_nodes; i++)
+    {
+      basic_block bb = body[i];
+      if (!dominated_by_p (CDI_DOMINATORS,
+			   bb, guard_edge == te ? fe->dest : te->dest))
+	continue;
+      for (gphi_iterator gsi = gsi_start_phis (bb);
+	   !gsi_end_p (gsi); gsi_next (&gsi))
+	if (!virtual_operand_p (gimple_phi_result (gsi.phi ())))
+	  used_outside_loop_p (loop, gimple_phi_result (gsi.phi ()),
+			       dbg_to_reset);
+      for (gimple_stmt_iterator gsi = gsi_start_bb (bb);
+	   !gsi_end_p (gsi); gsi_next (&gsi))
+	{
+	  tree name;
+	  ssa_op_iter op_iter;
+	  gimple *stmt = gsi_stmt (gsi);
+	  if (is_gimple_debug (stmt))
+	    continue;
+	  FOR_EACH_SSA_TREE_OPERAND (name, stmt, op_iter, SSA_OP_DEF)
+	    used_outside_loop_p (loop, name, dbg_to_reset);
+	}
+    }
+
   if (dump_enabled_p ())
     dump_printf_loc (MSG_NOTE, loc,
 		     "suitable to hoist\n");
