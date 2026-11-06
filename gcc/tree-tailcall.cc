@@ -32,6 +32,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "fold-const.h"
 #include "stor-layout.h"
 #include "gimple-iterator.h"
+#include "gimple-fold.h"
 #include "gimplify-me.h"
 #include "tree-cfg.h"
 #include "tree-into-ssa.h"
@@ -341,6 +342,47 @@ independent_of_stmt_p (tree expr, gimple *at, gimple_stmt_iterator gsi,
 
 enum par { FAIL, OK, TRY_MOVE };
 
+/* Return the type that the accumulators are computed in.
+
+   The accumulators evaluate the operations in the opposite order of the
+   recursion, so their intermediate values can overflow even when no operation
+   in the original program does.  That overflow must not be undefined, so use
+   the unsigned counterpart of any integer type that doesn't wrap on its own.
+   Pointers accumulate their offsets in sizetype.  */
+
+static tree
+tailcall_accumulator_type (void)
+{
+  tree ret_type = TREE_TYPE (DECL_RESULT (current_function_decl));
+  if (POINTER_TYPE_P (ret_type))
+    return sizetype;
+  if (ANY_INTEGRAL_TYPE_P (ret_type) && !TYPE_OVERFLOW_WRAPS (ret_type))
+    return unsigned_type_for (ret_type);
+  return ret_type;
+}
+
+/* Return true if the accumulators can absorb an operation of type TYPE.
+
+   The operations following the call have to end at the return value, and the
+   only conversions allowed on the way there are no-ops that keep the mode.
+   An operation in another kind of type, such as floating-point arithmetic in
+   a function returning int, can never reach the return value and has no
+   conversion to the accumulator type.  */
+
+static bool
+tailcall_accumulates_type_p (tree type)
+{
+  tree ret_type = TREE_TYPE (DECL_RESULT (current_function_decl));
+  if (TYPE_MODE (type) != TYPE_MODE (ret_type))
+    return false;
+  if (VECTOR_TYPE_P (type))
+    return (VECTOR_TYPE_P (ret_type)
+	    && tree_int_cst_equal (TYPE_SIZE (type), TYPE_SIZE (ret_type)));
+  if (INTEGRAL_TYPE_P (ret_type) || POINTER_TYPE_P (ret_type))
+    return INTEGRAL_TYPE_P (type) || POINTER_TYPE_P (type);
+  return TREE_CODE (type) == TREE_CODE (ret_type);
+}
+
 /* Simulates the effect of an assignment STMT on the return value of the tail
    recursive CALL passed in ASS_VAR.  M and A are the multiplicative and the
    additive factor for the real return value.  */
@@ -456,39 +498,62 @@ process_assignment (gassign *stmt,
 						    to_move)))
     ;
   else
-    return TRY_MOVE;
+    {
+      /* Moving STMT ahead of the call evaluates it even when the call doesn't
+	 return, which isn't acceptable if STMT can trap.  The move rewrites
+	 signed overflow away for scalars only, so also punt on vector and
+	 complex arithmetic that doesn't wrap.  */
+      tree dest_type = TREE_TYPE (dest);
+      if (gimple_could_trap_p (stmt)
+	  || (ANY_INTEGRAL_TYPE_P (dest_type)
+	      && !INTEGRAL_TYPE_P (dest_type)
+	      && TYPE_OVERFLOW_UNDEFINED (dest_type)))
+	return FAIL;
+      return TRY_MOVE;
+    }
 
+  /* The accumulators don't compute the intermediate values of the original
+     order of operations, so they can't preserve its overflow traps.  */
+  if (ANY_INTEGRAL_TYPE_P (TREE_TYPE (dest))
+      && TYPE_OVERFLOW_TRAPS (TREE_TYPE (dest)))
+    return FAIL;
+
+  if (!tailcall_accumulates_type_p (TREE_TYPE (dest)))
+    return FAIL;
+
+  tree acc_type = tailcall_accumulator_type ();
   switch (code)
     {
     case PLUS_EXPR:
-      *a = non_ass_var;
+      *a = fold_convert (acc_type, non_ass_var);
       *ass_var = dest;
       return OK;
 
     case POINTER_PLUS_EXPR:
       if (op0 != *ass_var)
 	return FAIL;
-      *a = non_ass_var;
+      *a = fold_convert (acc_type, non_ass_var);
       *ass_var = dest;
       return OK;
 
     case MULT_EXPR:
-      *m = non_ass_var;
+      *m = fold_convert (acc_type, non_ass_var);
       *ass_var = dest;
       return OK;
 
     case NEGATE_EXPR:
-      *m = build_minus_one_cst (TREE_TYPE (op0));
+      *m = build_minus_one_cst (acc_type);
       *ass_var = dest;
       return OK;
 
     case MINUS_EXPR:
+      non_ass_var = fold_convert (acc_type, non_ass_var);
       if (*ass_var == op0)
-        *a = fold_build1 (NEGATE_EXPR, TREE_TYPE (non_ass_var), non_ass_var);
+        *a = fold_build1 (NEGATE_EXPR, acc_type, non_ass_var);
       else
         {
-	  *m = build_minus_one_cst (TREE_TYPE (non_ass_var));
-          *a = fold_build1 (NEGATE_EXPR, TREE_TYPE (non_ass_var), non_ass_var);
+	  *m = build_minus_one_cst (acc_type);
+          *a = fold_build1 (NEGATE_EXPR, acc_type, non_ass_var);
         }
 
       *ass_var = dest;
@@ -1566,6 +1631,13 @@ find_tail_calls (basic_block bb, edge esucc, struct tailcall **ret,
 	{
 	  gimple_stmt_iterator mgsi = gsi_for_stmt (stmt);
 	  gsi_move_before (&mgsi, &gsi);
+	  /* The original program doesn't reach STMT if the call doesn't return,
+	     so STMT can't be allowed to introduce undefined overflow here.  */
+	  if (gimple_needing_rewrite_undefined (stmt))
+	    {
+	      mgsi = gsi_for_stmt (stmt);
+	      rewrite_to_defined_unconditional (&mgsi);
+	    }
 	}
       if (!tailr_arg_needs_copy)
 	tailr_arg_needs_copy = BITMAP_ALLOC (NULL);
@@ -1621,7 +1693,8 @@ adjust_return_value_with_ops (enum tree_code code, const char *label,
 {
 
   tree ret_type = TREE_TYPE (DECL_RESULT (current_function_decl));
-  tree result = make_temp_ssa_name (ret_type, NULL, label);
+  tree res_type = POINTER_TYPE_P (ret_type) ? ret_type : TREE_TYPE (acc);
+  tree result = make_temp_ssa_name (res_type, NULL, label);
   gassign *stmt;
 
   if (POINTER_TYPE_P (ret_type))
@@ -1638,9 +1711,8 @@ adjust_return_value_with_ops (enum tree_code code, const char *label,
       if (code == POINTER_PLUS_EXPR)
 	tem = fold_build2 (code, TREE_TYPE (op1), op1, acc);
       else
-	tem = fold_build2 (code, TREE_TYPE (op1),
-			   fold_convert (TREE_TYPE (op1), acc), op1);
-      tree rhs = fold_convert (ret_type, tem);
+	tem = fold_build2 (code, res_type, acc, fold_convert (res_type, op1));
+      tree rhs = fold_convert (res_type, tem);
       rhs = force_gimple_operand_gsi (&gsi, rhs,
 				      false, NULL, true, GSI_SAME_STMT);
       stmt = gimple_build_assign (result, rhs);
@@ -1659,21 +1731,8 @@ static tree
 update_accumulator_with_ops (enum tree_code code, tree acc, tree op1,
 			     gimple_stmt_iterator gsi)
 {
-  gassign *stmt;
   tree var = copy_ssa_name (acc);
-  if (types_compatible_p (TREE_TYPE (acc), TREE_TYPE (op1)))
-    stmt = gimple_build_assign (var, code, acc, op1);
-  else
-    {
-      tree rhs = fold_convert (TREE_TYPE (acc),
-			       fold_build2 (code,
-					    TREE_TYPE (op1),
-					    fold_convert (TREE_TYPE (op1), acc),
-					    op1));
-      rhs = force_gimple_operand_gsi (&gsi, rhs,
-				      false, NULL, false, GSI_CONTINUE_LINKING);
-      stmt = gimple_build_assign (var, rhs);
-    }
+  gassign *stmt = gimple_build_assign (var, code, acc, op1);
   gsi_insert_after (&gsi, stmt, GSI_NEW_STMT);
   return var;
 }
@@ -1741,6 +1800,10 @@ adjust_return_value (basic_block bb, tree m, tree a)
   if (a)
     retval = adjust_return_value_with_ops (PLUS_EXPR, "acc_tmp", a_acc, retval,
 					   gsi);
+  /* The accumulators can be in a different type than the function's result.  */
+  tree ret_type = TREE_TYPE (DECL_RESULT (current_function_decl));
+  retval = force_gimple_operand_gsi (&gsi, fold_convert (ret_type, retval),
+				     true, NULL, true, GSI_SAME_STMT);
   gimple_return_set_retval (ret_stmt, retval);
   update_stmt (ret_stmt);
 }
@@ -1962,16 +2025,12 @@ optimize_tail_call (struct tailcall *t, bool opt_tailcalls,
    current function.  LABEL is the name used to creating the temporary
    variable for the accumulator.  The accumulator will be inserted in the
    phis of a basic block BB with single predecessor with an initial value
-   INIT converted to the current function return type.  */
+   INIT, which is in the accumulator type.  */
 
 static tree
 create_tailcall_accumulator (const char *label, basic_block bb, tree init)
 {
-  tree ret_type = TREE_TYPE (DECL_RESULT (current_function_decl));
-  if (POINTER_TYPE_P (ret_type))
-    ret_type = sizetype;
-
-  tree tmp = make_temp_ssa_name (ret_type, NULL, label);
+  tree tmp = make_temp_ssa_name (tailcall_accumulator_type (), NULL, label);
   gphi *phi;
 
   phi = create_phi_node (tmp, bb);
@@ -2107,17 +2166,15 @@ tree_optimize_tail_calls_1 (bool opt_tailcalls, bool only_musttail,
 	      }
 	  phis_constructed = true;
 	}
-      tree ret_type = TREE_TYPE (DECL_RESULT (current_function_decl));
-      if (POINTER_TYPE_P (ret_type))
-	ret_type = sizetype;
+      tree acc_type = tailcall_accumulator_type ();
 
       if (act->add && !a_acc)
 	a_acc = create_tailcall_accumulator ("add_acc", first,
-					     build_zero_cst (ret_type));
+					     build_zero_cst (acc_type));
 
       if (act->mult && !m_acc)
 	m_acc = create_tailcall_accumulator ("mult_acc", first,
-					     build_one_cst (ret_type));
+					     build_one_cst (acc_type));
     }
 
   if (a_acc || m_acc)
