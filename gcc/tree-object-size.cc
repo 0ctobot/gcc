@@ -2460,30 +2460,26 @@ merge_object_sizes (struct object_size_info *osi, tree dest, tree orig)
 }
 
 
-/* Return true if the offset OP1 from OP0 in STMT may come from several pointer
-   steps folded together, e.g., container_of, a member access and a step turned
-   into a single positive offset.  Such an offset can look like it leaves a
-   subobject when none of the steps in the source do.  The early pass runs
-   before a function's own statements are optimized, so only a statement from an
-   inlined function can be folded by then, since the inlined body already went
-   through the optimizations of its own function.  Any statement can be folded
-   after that, but a function's own statement only counts when the early pass
-   capped its size with the estimate from before the folding.
-   __builtin_dynamic_object_size gets no such cap with a non-constant offset,
-   and a cap from before the folding is of no use to it when OP0 may be one of
-   several pointers, since the size depends on the pointer in use at run time.
-   Offsets in these cases have to be taken at face value in order to catch one
-   that really leaves the subobject.  */
+/* Return true if the offset in STMT may come from several pointer steps folded
+   together, e.g., container_of, a member access and a step turned into a single
+   positive offset.  Such an offset can look like it leaves a subobject when
+   none of the steps in the source do.  The early pass runs before a function's
+   own statements are optimized, so only a statement from an inlined function
+   can be folded by then, since the inlined body already went through the
+   optimizations of its own function.  Any statement can be folded after that,
+   whether or not its offset is constant, and nothing in the statement tells a
+   folded offset from one straight from the source.  An offset from the source
+   that really leaves the subobject is left to the cap the early pass computed
+   from before the folding.  For __builtin_dynamic_object_size with an offset
+   that isn't constant, that cap is the dynamic size of the subobject, which the
+   early pass computes when the offset comes from the function's own body.
+   Otherwise, such an offset falls back to the bound of the enclosing object,
+   since a size of 0 would abort valid code.  */
 
 static bool
-object_size_offset_folded_p (int object_size_type, gimple *stmt, tree op0,
-			     tree op1)
+object_size_offset_folded_p (gimple *stmt)
 {
-  if (!object_sizes_early
-      && (!(object_size_type & OST_DYNAMIC)
-	  || (TREE_CODE (op1) == INTEGER_CST
-	      && !object_size_merged_p (op0)
-	      && !object_size_variable_offset_p (op0))))
+  if (!object_sizes_early)
     return true;
 
   for (tree block = gimple_block (stmt);
@@ -2593,29 +2589,110 @@ size_outside_subobject (int object_size_type, tree op0, tree op1, bool folded,
      branch: the size for the subobject is 0 whenever OUTSIDE holds.  The whole
      size stays that of the subobject when the enclosing object is known, since
      size_for_offset uses the larger of the size and the whole size, which
-     still leaves the right result for further offsets in both cases.  An
-     unknown enclosing object's size of (size_t) -1 doesn't work that way: in
-     the subobject's whole size, it puts the pointer at the start of an object
-     of that size, where a later negative offset wraps the size around to a
-     tiny one.  Such a pointer gets a size of offset_limit in a whole size of
-     (size_t) -1 instead, which leaves more than any object can have after any
-     valid offset.  That size is only for later offsets, so it's flagged to
-     become (size_t) -1 for the user.  A pointer that stays inside gets less
-     than its subobject's size, which is below offset_limit, so the flag only
-     catches the encoding.  */
-  if (!known)
+     still leaves the right result for further offsets in both cases.  */
+  if (known)
     {
-      res = build_int_cstu (sizetype, offset_limit);
-      tree all = size_binop (MULT_EXPR,
-			     fold_convert (sizetype, unshare_expr (outside)),
-			     size_unknown (object_size_type));
-      *pwholesize = size_binop (MAX_EXPR, wholesize, all);
-      *pencoded = size_one_node;
+      *pbytes = size_binop (PLUS_EXPR, size_for_offset (bytes, op1, wholesize),
+			    size_binop (MULT_EXPR,
+					fold_convert (sizetype, outside), res));
+      return true;
     }
-  *pbytes = size_binop (PLUS_EXPR, size_for_offset (bytes, op1, wholesize),
-			size_binop (MULT_EXPR, fold_convert (sizetype, outside),
-				    res));
+
+  /* An unknown enclosing object's size of (size_t) -1 doesn't work that way:
+     in the subobject's whole size, it puts the pointer at the start of an
+     object of that size, where a later negative offset wraps the size around
+     to a tiny one.  A pointer below the subobject gets a size of offset_limit
+     in a whole size of (size_t) -1 instead, which leaves more than any object
+     can have after any valid offset.  A pointer past the end of the subobject
+     needs at least as much, but a later offset may step it back into the
+     subobject, as a loop or a chain of folded offsets can, where the size of
+     the subobject bounds it again.  Such a pointer gets offset_limit plus the
+     size of the subobject, in a whole size that's larger by its net offset
+     from the start of the subobject.  The next offset then finds the end of
+     the subobject at the size minus offset_limit, and the same net offset as
+     for a pointer inside the subobject, so a pointer back inside gets exactly
+     what's left of the subobject.  For any other pointer, the size minus
+     offset_limit wraps around to more than the larger of the size and the
+     whole size, so the smaller of the two is the end of the subobject in both
+     cases.  A pointer below the subobject, with its size of offset_limit,
+     reads as being past the end of a subobject of size 0, which keeps it
+     outside for good.  Only a pointer further past the end of the subobject
+     than any object reaches can wrap the new whole size around.  An offset
+     that isn't folded only takes the pointer outside when it lands below the
+     subobject or when an earlier folded offset already took it outside, which
+     a size of at least offset_limit tells.  Landing at or past the end of the
+     subobject from inside it leaves a size of 0 instead, as it does with a
+     known enclosing object.  These encodings are only for later offsets, so
+     a size of at least offset_limit is flagged to become (size_t) -1 for the
+     user.  A pointer that stays inside gets less than its subobject's size,
+     which is below offset_limit, so the flag only catches encodings.  */
+  tree limit = build_int_cstu (sizetype, offset_limit);
+  tree shift = fold_build2 (MINUS_EXPR, sizetype, bytes, limit);
+  tree end = size_binop (MIN_EXPR, unshare_expr (top), shift);
+  tree sub = size_binop (MIN_EXPR, wholesize, unshare_expr (shift));
+  tree out = fold_convert (sizetype,
+			   fold_build2 (GE_EXPR, boolean_type_node,
+					unshare_expr (net), end));
+  if (!folded)
+    {
+      tree was = fold_build2 (GE_EXPR, boolean_type_node,
+			      unshare_expr (bytes), limit);
+      was = size_binop (MAX_EXPR, fold_convert (sizetype, was),
+			fold_convert (sizetype, unshare_expr (outside)));
+      out = size_binop (MULT_EXPR, out, was);
+    }
+  tree below = fold_convert (sizetype,
+			     fold_build2 (GT_EXPR, boolean_type_node,
+					  unshare_expr (net), limit));
+  below = size_binop (MULT_EXPR, unshare_expr (out), below);
+  tree past = size_binop (MINUS_EXPR, unshare_expr (out),
+			  unshare_expr (below));
+  tree inner = size_binop (MINUS_EXPR,
+			   size_binop (MAX_EXPR, unshare_expr (end),
+				       unshare_expr (net)),
+			   unshare_expr (net));
+  *pbytes = size_binop (PLUS_EXPR, inner,
+			size_binop (PLUS_EXPR,
+				    size_binop (MULT_EXPR,
+						unshare_expr (out), limit),
+				    size_binop (MULT_EXPR,
+						unshare_expr (past),
+						unshare_expr (end))));
+  tree at = fold_build2 (PLUS_EXPR, sizetype, limit, unshare_expr (end));
+  at = fold_build2 (PLUS_EXPR, sizetype, at, unshare_expr (net));
+  tree all = size_binop (MULT_EXPR, below, size_unknown (object_size_type));
+  *pwholesize = size_binop (MAX_EXPR, size_binop (MAX_EXPR, sub, all),
+			    size_binop (MULT_EXPR, past, at));
+  *pencoded = size_one_node;
   return true;
+}
+
+/* Return the pointer that PTR is computed from through a chain of steps in the
+   function's own body, each of which moves the result of the one before it,
+   and add the offsets of those steps to *POFF unless POFF is null.  The chain
+   ends at the first pointer that isn't the result of such a step, such as the
+   address of a member, a PHI or a step from an inlined function.  */
+
+static tree
+object_size_own_steps_start (tree ptr, tree *poff)
+{
+  for (int limit = param_ssa_name_def_chain_limit;
+       TREE_CODE (ptr) == SSA_NAME && limit > 0;
+       limit--)
+    {
+      gimple *stmt = SSA_NAME_DEF_STMT (ptr);
+      if (!is_gimple_assign (stmt)
+	  || gimple_assign_rhs_code (stmt) != POINTER_PLUS_EXPR
+	  || object_size_offset_folded_p (stmt))
+	break;
+
+      if (poff)
+	*poff = fold_build2 (PLUS_EXPR, sizetype, gimple_assign_rhs2 (stmt),
+			     *poff);
+      ptr = gimple_assign_rhs1 (stmt);
+    }
+
+  return ptr;
 }
 
 /* Compute object_sizes for VAR, defined to the result of an assignment
@@ -2636,6 +2713,21 @@ plus_stmt_object_size (struct object_size_info *osi, tree var, gimple *stmt)
     {
       op0 = gimple_assign_rhs1 (stmt);
       op1 = gimple_assign_rhs2 (stmt);
+
+      /* The dynamic size of a subobject after a chain of steps in the
+	 function's own body only depends on where the last step lands, which
+	 is the sum of their offsets from where the chain starts.  Taken one at
+	 a time, a step that leaves the subobject downward keeps the pointer
+	 outside of it for good, even when a later step brings it back inside
+	 or past the end, since the size of a pointer below the subobject can't
+	 carry how far below it went.  Take the whole chain as one step
+	 instead, which gives 0 at or past the end of the subobject, the exact
+	 size inside of it and the bound of the enclosing object below it.  The
+	 late pass treats every step as folded, so this only happens early.  */
+      if ((object_size_type & (OST_DYNAMIC | OST_SUBOBJECT | OST_MINIMUM))
+	  == (OST_DYNAMIC | OST_SUBOBJECT)
+	  && !object_size_offset_folded_p (stmt))
+	op0 = object_size_own_steps_start (op0, &op1);
     }
   else if (gimple_assign_rhs_code (stmt) == ADDR_EXPR)
     {
@@ -2685,9 +2777,7 @@ plus_stmt_object_size (struct object_size_info *osi, tree var, gimple *stmt)
 
       bool maxsub = ((object_size_type & (OST_SUBOBJECT | OST_MINIMUM))
 		     == OST_SUBOBJECT);
-      bool folded = (maxsub
-		     && object_size_offset_folded_p (object_size_type, stmt,
-						     op0, op1));
+      bool folded = maxsub && object_size_offset_folded_p (stmt);
 
       /* The static maximum for a pointer stepped back in a loop or moved by a
 	 non-constant offset presumes the pointer never went below where it
@@ -4225,12 +4315,35 @@ object_size_step_returns_p (tree lhs, tree base, tree off)
   return object_size_may_step_back_p (base);
 }
 
+/* Return true if PTR is computed through a step in the function's own body
+   whose offset isn't constant or which repeats, without going through the
+   address of a member on the way.  Such a step is still the one in the source,
+   so the dynamic size of the subobject comes out exact for it now, while the
+   late pass can't tell it from a folded one.  A chain too long to walk gives
+   false.  */
+
+static bool
+object_size_own_variable_step_p (tree ptr)
+{
+  bool found = false;
+  object_size_walk_steps (ptr, [&found] (tree lhs, tree base, tree off)
+    {
+      found = (!object_size_offset_folded_p (SSA_NAME_DEF_STMT (lhs))
+	       && (TREE_CODE (off) != INTEGER_CST
+		   || object_size_step_repeats_p (lhs, base)));
+      return found;
+    }, true);
+  return found;
+}
+
 /* Process a __builtin_object_size or __builtin_dynamic_object_size call in
    CALL early for subobjects before any object information is lost due to
    optimization.  Insert a MIN or MAX expression of the result and
    __builtin_object_size at I so that it may be processed in the second pass.
    __builtin_dynamic_object_size is treated like __builtin_object_size here
-   since we're only looking for constant bounds.  */
+   since we're only looking for constant bounds, except for a subobject size
+   whose pointer moves by an offset from the function's own body that isn't
+   constant.  */
 
 static void
 early_object_sizes_execute_one (gimple_stmt_iterator *i, gimple *call)
@@ -4251,6 +4364,54 @@ early_object_sizes_execute_one (gimple_stmt_iterator *i, gimple *call)
   if (TREE_CODE (ptr) != ADDR_EXPR && TREE_CODE (ptr) != SSA_NAME)
     return;
 
+  tree type = TREE_TYPE (lhs);
+  tree bytes;
+
+  /* The late pass gives an offset that lands past the end of a subobject the
+     rest of the enclosing object, since it can't tell an offset written in the
+     source from several folded together.  For an offset from the function's
+     own body, the dynamic size of the subobject computed now is exact and
+     drops to 0 past the end, which is what the size of the subobject means.
+     When the enclosing object is already known, that's the size.  Otherwise,
+     use it to cap the size of the whole object, which leaves the late pass
+     only the work of finding the enclosing object, as inlining this function
+     may reveal.  An offset that may be negative is fine too, since a pointer
+     that lands below the subobject gets the bound of the enclosing object
+     here as well.  A subobject without a static size, such as a flexible
+     array member, or an index into an array of structures that may be
+     negative is left to the late pass.  The steps of the function's own body
+     that lead to PTR are sized as one offset from the pointer they start
+     from, so that pointer is the one that needs a static size.  A step that
+     may take PTR below the subobject leaves the static maximum for PTR itself
+     to the enclosing object, which isn't known behind a parameter, but the
+     dynamic size doesn't depend on that.  */
+  tree whole;
+  if (object_size_type == 1
+      && gimple_call_builtin_p (call, BUILT_IN_DYNAMIC_OBJECT_SIZE)
+      && object_size_own_variable_step_p (ptr)
+      && !object_size_pointer_index_may_go_below_p (ptr)
+      && compute_builtin_object_size (object_size_own_steps_start (ptr, NULL),
+				      object_size_type, &bytes)
+      && compute_builtin_object_size (ptr, OST_DYNAMIC | OST_SUBOBJECT,
+				      &bytes)
+      && TREE_CODE (bytes) != INTEGER_CST)
+    {
+      bytes = force_gimple_operand_gsi (i, fold_convert (type, bytes), true,
+					NULL_TREE, true, GSI_SAME_STMT);
+      if (compute_builtin_object_size (ptr, OST_DYNAMIC, &whole))
+	{
+	  replace_call_with_value (i, bytes);
+	  return;
+	}
+      tree tem = make_ssa_name (type);
+      gimple_call_set_lhs (call, tem);
+      gimple_call_set_arg (call, 1, build_int_cst (TREE_TYPE (ost), 0));
+      gimple *g = gimple_build_assign (lhs, MIN_EXPR, tem, bytes);
+      gsi_insert_after (i, g, GSI_NEW_STMT);
+      update_stmt (call);
+      return;
+    }
+
   /* The static estimate for a non-constant offset or a pointer stepped back in
      a loop presumes that the pointer stays in the subobject.
      __builtin_dynamic_object_size can see where the pointer actually goes when
@@ -4265,8 +4426,6 @@ early_object_sizes_execute_one (gimple_stmt_iterator *i, gimple *call)
 	  || object_size_pointer_index_may_go_below_p (ptr)))
     return;
 
-  tree type = TREE_TYPE (lhs);
-  tree bytes;
   if (!compute_builtin_object_size (ptr, object_size_type, &bytes)
       || !int_fits_type_p (bytes, type))
     return;
