@@ -1925,6 +1925,20 @@ set_addresses_taken (gimple *stmt, bitmap addresses_taken)
 					set_addresses_taken_1);
 }
 
+/* Return VAL reinterpreted as TYPE, for a partial store that's rewritten as a
+   BIT_INSERT_EXPR.  Fold the reinterpretation of a value, so an empty
+   CONSTRUCTOR becomes a zero of TYPE, since a VIEW_CONVERT_EXPR of a
+   CONSTRUCTOR isn't valid GIMPLE.  Don't fold a memory reference, since fold
+   turns a punned MEM_REF into a MEM_REF of TYPE that isn't volatile.  */
+
+static tree
+build_partial_store_pun (tree type, tree val)
+{
+  if (REFERENCE_CLASS_P (val) || DECL_P (val))
+    return build1 (VIEW_CONVERT_EXPR, type, val);
+  return fold_build1 (VIEW_CONVERT_EXPR, type, val);
+}
+
 /* Compute TREE_ADDRESSABLE and whether we have unhandled partial defs
    for local variables.  */
 
@@ -2152,8 +2166,8 @@ execute_update_addresses_taken (void)
 			tree tem = make_ssa_name (TREE_TYPE (TREE_TYPE (var)));
 			gimple *pun
 			  = gimple_build_assign (tem,
-						 build1 (VIEW_CONVERT_EXPR,
-							 TREE_TYPE (tem), val));
+						 build_partial_store_pun
+						   (TREE_TYPE (tem), val));
 			gsi_insert_before (&gsi, pun, GSI_SAME_STMT);
 			val = tem;
 		      }
@@ -2208,8 +2222,8 @@ execute_update_addresses_taken (void)
 			tree tem = make_ssa_name (temtype);
 			gimple *pun
 			  = gimple_build_assign (tem,
-						 build1 (VIEW_CONVERT_EXPR,
-							 TREE_TYPE (tem), val));
+						 build_partial_store_pun
+						   (TREE_TYPE (tem), val));
 			gsi_insert_before (&gsi, pun, GSI_SAME_STMT);
 			val = tem;
 		      }
