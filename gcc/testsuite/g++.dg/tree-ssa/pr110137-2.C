@@ -3,8 +3,10 @@
 // { dg-options "-O2 -fdump-tree-optimized -fassume-sane-operators-new-delete" }
 // { dg-final { scan-tree-dump "j = 2;" "optimized" } } */
 // { dg-final { scan-tree-dump "m = 2;" "optimized" } } */
-// { dg-final { scan-tree-dump-not "q = 2;" "optimized" } } */
-// { dg-final { scan-tree-dump-not "t = 2;" "optimized" } } */
+// A new expression can throw, and a handler further up can read q.  A delete
+// expression isn't known to return, so t has to be in place in front of it too.
+// { dg-final { scan-tree-dump-times "q = 2;" 2 "optimized" } } */
+// { dg-final { scan-tree-dump-times "t = 2;" 2 "optimized" } } */
 // { dg-final { scan-tree-dump-not "k = 1;" "optimized" } } */
 // { dg-final { scan-tree-dump-times "r = 1;" 2 "optimized" } } */
 
