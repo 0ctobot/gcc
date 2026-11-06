@@ -11402,9 +11402,12 @@ ix86_expand_split_stack_prologue (void)
 	     switch to a different calling convention, and we call a
 	     different function: __morestack_large.  We pass the
 	     argument size in the upper 32 bits of r10 and pass the
-	     frame size in the lower 32 bits.  */
-	  gcc_assert ((allocate & HOST_WIDE_INT_C (0xffffffff)) == allocate);
-	  gcc_assert ((args_size & 0xffffffff) == args_size);
+	     frame size in the lower 32 bits, so neither can reach
+	     4 GiB.  */
+	  if ((allocate & HOST_WIDE_INT_C (0xffffffff)) != allocate
+	      || (args_size & 0xffffffff) != args_size)
+	    sorry ("%<-fsplit-stack%> in the large code model does not support "
+		   "stack frames or arguments of 4 GiB or more");
 
 	  argval = ((args_size << 16) << 16) + allocate;
 	  emit_move_insn (reg10, GEN_INT (argval));
