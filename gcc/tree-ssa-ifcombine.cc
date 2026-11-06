@@ -45,6 +45,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "asan.h"
 #include "bitmap.h"
 #include "cfgloop.h"
+#include "tree-ssa-loop-ivopts.h"
 
 #ifndef LOGICAL_OP_NON_SHORT_CIRCUIT
 #define LOGICAL_OP_NON_SHORT_CIRCUIT \
@@ -534,6 +535,14 @@ ifcombine_replace_cond (gcond *inner_cond, bool inner_inv,
 			gcond *outer_cond, bool outer_inv,
 			tree cond, bool must_canon, tree cond2)
 {
+  /* The new condition sits at INNER_COND and may mention names that the
+     original conditions only reached through intermediate statements.  An
+     abnormal name mentioned there can overlap another version of its variable,
+     and such versions must coalesce (PR126947).  */
+  if (contains_abnormal_ssa_name_p (cond)
+      || (cond2 && contains_abnormal_ssa_name_p (cond2)))
+    return false;
+
   bool split_single_cond = false;
   /* Split cond into cond2 if they're contiguous.  ??? We might be able to
      handle ORIF as well, inverting both conditions, but it's not clear that
@@ -596,6 +605,11 @@ ifcombine_replace_cond (gcond *inner_cond, bool inner_inv,
 		    FOR_EACH_SSA_TREE_OPERAND (t, stmt, it, SSA_OP_DEF)
 		      if (bitmap_bit_p (used, SSA_NAME_VERSION (t)))
 			{
+			  /* Moving an abnormal definition up can overlap the
+			     prior version of its variable, which may still be
+			     used in the blocks we'd move it past.  */
+			  if (SSA_NAME_OCCURS_IN_ABNORMAL_PHI (t))
+			    return false;
 			  move = true;
 			  break;
 			}
@@ -632,6 +646,10 @@ ifcombine_replace_cond (gcond *inner_cond, bool inner_inv,
 			gsi_next (&gsi);
 			continue;
 		      }
+
+		    /* Likewise for a definition by a PHI node.  */
+		    if (SSA_NAME_OCCURS_IN_ABNORMAL_PHI (def))
+		      return false;
 
 		    if (stmts.length () < max_stmts)
 		      stmts.quick_push (phi);
@@ -969,8 +987,12 @@ ifcombine_ifandif (basic_block inner_cond_bb, bool inner_inv,
     {
       tree t, t2;
 
-      if (TREE_CODE (name1) == SSA_NAME
-	  && SSA_NAME_OCCURS_IN_ABNORMAL_PHI (name1))
+      if ((TREE_CODE (name1) == SSA_NAME
+	   && SSA_NAME_OCCURS_IN_ABNORMAL_PHI (name1))
+	  || (TREE_CODE (bit1) == SSA_NAME
+	      && SSA_NAME_OCCURS_IN_ABNORMAL_PHI (bit1))
+	  || (TREE_CODE (bit2) == SSA_NAME
+	      && SSA_NAME_OCCURS_IN_ABNORMAL_PHI (bit2)))
 	return false;
 
       /* Do it.  */
