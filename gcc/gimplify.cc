@@ -270,6 +270,10 @@ struct gimplify_ctx
   unsigned save_stack : 1;
   unsigned in_switch_expr : 1;
   unsigned in_handler_expr : 1;
+  /* The state of alloca_tmp_scope.  */
+  unsigned in_full_expr : 1;
+  unsigned stmt_alloca_tmp : 1;
+  unsigned stmt_alloca_long : 1;
 };
 
 enum gimplify_defaultmap_kind
@@ -315,6 +319,7 @@ static hash_map<tree, tree> *oacc_declare_returns;
 static enum gimplify_status gimplify_expr (tree *, gimple_seq *, gimple_seq *,
 					   bool (*) (tree), fallback_t, bool);
 static void prepare_gimple_addressable (tree *, gimple_seq *);
+static void gimplify_vla_decl (tree, gimple_seq *);
 
 /* Shorter alias name for the above function for use in gimplify.cc
    only.  */
@@ -685,6 +690,48 @@ lookup_tmp_var (tree val, bool is_formal, bool not_gimple_reg)
   return ret;
 }
 
+/* Return true if a temporary of type TYPE must be allocated at run time.
+   force_constant_size can only give a variable-sized temporary a fixed stack
+   slot when the type has a known upper bound, which GNU C aggregates with
+   variable-length members don't have.  */
+
+static bool
+tmp_type_needs_alloca_p (tree type)
+{
+  return (type != error_mark_node
+	  && TYPE_SIZE_UNIT (type)
+	  && !tree_fits_poly_uint64_p (TYPE_SIZE_UNIT (type))
+	  && max_int_size_in_bytes (type) < 0);
+}
+
+/* Create a temporary of type TYPE, for which tmp_type_needs_alloca_p is true,
+   adding its allocation to PRE_P.  The alloca_tmp_scope of the enclosing full
+   expression reclaims the space.  Return the MEM_REF that accesses the
+   temporary; since GIMPLE forbids sharing a MEM_REF between statements, the
+   caller must unshare it for each additional use.  */
+
+static tree
+create_alloca_tmp_var (tree type, const char *prefix, gimple_seq *pre_p)
+{
+  /* Drop the qualifiers since the temporary needs to be writable.  */
+  type = TYPE_MAIN_VARIANT (type);
+  tree tmp = create_tmp_var_raw (type, prefix);
+
+  if (!TYPE_SIZES_GIMPLIFIED (type))
+    gimplify_type_sizes (type, pre_p);
+
+  /* Unlike a VLA, this doesn't need to outlive the statement.  */
+  bool old_stmt_alloca_long = gimplify_ctxp->stmt_alloca_long;
+  gimplify_vla_decl (tmp, pre_p);
+  gimplify_ctxp->stmt_alloca_long = old_stmt_alloca_long;
+  gimplify_ctxp->stmt_alloca_tmp = true;
+
+  /* The value expression is an INDIRECT_REF, which isn't valid in GIMPLE.  */
+  tree ref = unshare_expr (DECL_VALUE_EXPR (tmp));
+  gimplify_expr (&ref, pre_p, NULL, is_gimple_lvalue, fb_lvalue);
+  return ref;
+}
+
 /* Helper for get_formal_tmp_var and get_initialized_tmp_var.  */
 
 static tree
@@ -698,9 +745,11 @@ internal_get_tmp_var (tree val, gimple_seq *pre_p, gimple_seq *post_p,
   gimplify_expr (&val, pre_p, post_p, is_gimple_reg_rhs_or_call,
 		 fb_rvalue);
 
-  if (allow_ssa
-      && gimplify_ctxp->into_ssa
-      && is_gimple_reg_type (TREE_TYPE (val)))
+  if (tmp_type_needs_alloca_p (TREE_TYPE (val)))
+    t = create_alloca_tmp_var (TREE_TYPE (val), get_name (val), pre_p);
+  else if (allow_ssa
+	   && gimplify_ctxp->into_ssa
+	   && is_gimple_reg_type (TREE_TYPE (val)))
     {
       t = make_ssa_name (TYPE_MAIN_VARIANT (TREE_TYPE (val)));
       if (! gimple_in_ssa_p (cfun))
@@ -713,7 +762,8 @@ internal_get_tmp_var (tree val, gimple_seq *pre_p, gimple_seq *post_p,
   else
     t = lookup_tmp_var (val, is_formal, not_gimple_reg);
 
-  mod = build2 (INIT_EXPR, TREE_TYPE (t), t, unshare_expr (val));
+  mod = build2 (INIT_EXPR, TREE_TYPE (t), unshare_expr (t),
+		unshare_expr (val));
 
   SET_EXPR_LOCATION (mod, EXPR_LOC_OR_LOC (val, input_location));
 
@@ -1126,6 +1176,231 @@ build_stack_save_restore (gcall **save, gcall **restore)
   *restore
     = gimple_build_call (builtin_decl_implicit (BUILT_IN_STACK_RESTORE),
 			 1, tmp_var);
+}
+
+/* Reclaim the stack space of the variable-sized temporaries allocated by a
+   statement once it finishes.  The storage of such a temporary must last until
+   the end of its full expression, but it can't be left for the enclosing
+   BIND_EXPR to reclaim.  A loop whose body is a single statement doesn't have a
+   BIND_EXPR of its own, so the stack would grow on every iteration.  Plus, a
+   stack save at the start of a BIND_EXPR can be jumped over when there's a
+   label further down, leaving the restore with a garbage stack pointer.
+   FE-declared VLAs are safe from that since the C FE opens a new BIND_EXPR at
+   the declaration, which isn't possible for a temporary.
+
+   The scope wraps the statements gimplified since its creation in a try/finally
+   that restores the stack, so jumping out of them reclaims the space too.  It
+   only does this if a temporary was created, so other code is unaffected.  It
+   can't when something allocated in the scope must outlive it, which is either
+   a user's alloca or a variable-sized object that later statements can read.
+   In that case the allocation is left for the enclosing BIND_EXPR to handle, as
+   it does for VLAs.
+
+   Scopes created inside of a full expression do nothing since the temporaries
+   must stay valid until the outermost scope closes.  */
+
+class alloca_tmp_scope
+{
+public:
+  alloca_tmp_scope (gimple_seq *seq_p);
+  ~alloca_tmp_scope () { close (); }
+
+  bool active_p () const { return m_seq_p != NULL; }
+  bool has_tmp_p (tree pred) const;
+  void close ();
+  void close (tree *val_p);
+
+private:
+  bool will_restore_p () const;
+
+  gimple_seq *m_seq_p;
+  gimple_seq_node m_last;
+  bool m_outer_tmp, m_outer_long, m_outer_keep, m_outer_save;
+};
+
+/* Start a scope for a full expression or statement gimplified onto SEQ_P.  */
+
+alloca_tmp_scope::alloca_tmp_scope (gimple_seq *seq_p)
+  : m_seq_p (gimplify_ctxp->in_full_expr ? NULL : seq_p), m_last (NULL),
+    m_outer_tmp (gimplify_ctxp->stmt_alloca_tmp),
+    m_outer_long (gimplify_ctxp->stmt_alloca_long),
+    m_outer_keep (gimplify_ctxp->keep_stack),
+    m_outer_save (gimplify_ctxp->save_stack)
+{
+  if (!active_p ())
+    return;
+
+  m_last = gimple_seq_last (*seq_p);
+  gimplify_ctxp->stmt_alloca_tmp = false;
+  gimplify_ctxp->stmt_alloca_long = false;
+  gimplify_ctxp->keep_stack = false;
+  gimplify_ctxp->in_full_expr = true;
+}
+
+/* A helper for walk_tree.  Find an expression that isn't an lvalue and would
+   need a variable-sized temporary to hold its value.  */
+
+static tree
+find_alloca_tmp_r (tree *tp, int *walk_subtrees, void *)
+{
+  tree t = *tp;
+
+  if (TYPE_P (t) || DECL_P (t))
+    *walk_subtrees = 0;
+  else if ((EXPR_P (t) || TREE_CODE (t) == CONSTRUCTOR)
+	   && TREE_TYPE (t)
+	   && !handled_component_p (t)
+	   && !INDIRECT_REF_P (t)
+	   && TREE_CODE (t) != MEM_REF
+	   && tmp_type_needs_alloca_p (TREE_TYPE (t)))
+    return t;
+
+  return NULL_TREE;
+}
+
+/* Return true if this active scope has a temporary or if PRED, which is yet to
+   be gimplified in this scope, will create one.  */
+
+bool
+alloca_tmp_scope::has_tmp_p (tree pred) const
+{
+  return (active_p ()
+	  && (gimplify_ctxp->stmt_alloca_tmp
+	      || walk_tree_without_duplicates (&pred, find_alloca_tmp_r,
+					       NULL)));
+}
+
+/* Return true if closing this scope will restore the stack.  */
+
+bool
+alloca_tmp_scope::will_restore_p () const
+{
+  return (active_p ()
+	  && gimplify_ctxp->stmt_alloca_tmp
+	  && !gimplify_ctxp->stmt_alloca_long
+	  && !gimplify_ctxp->keep_stack
+	  && (m_last ? m_last->next : *m_seq_p) != NULL);
+}
+
+/* Finish the scope, reclaiming its temporaries if possible.  */
+
+void
+alloca_tmp_scope::close ()
+{
+  if (!active_p ())
+    return;
+
+  if (will_restore_p ())
+    {
+      gimple_seq body = *m_seq_p;
+      if (m_last)
+	body = gsi_split_seq_after (gsi_for_stmt (m_last, m_seq_p));
+      else
+	*m_seq_p = NULL;
+
+      gcall *stack_save, *stack_restore;
+      build_stack_save_restore (&stack_save, &stack_restore);
+
+      location_t loc = gimple_location (gimple_seq_last_stmt (body));
+      gimple_set_location (stack_save, loc);
+      gimple_set_location (stack_restore, loc);
+
+      gimple_seq cleanup = NULL;
+      gimplify_seq_add_stmt (&cleanup, stack_restore);
+      gimplify_seq_add_stmt (m_seq_p, stack_save);
+      gimplify_seq_add_stmt (m_seq_p,
+			     gimple_build_try (body, cleanup,
+					       GIMPLE_TRY_FINALLY));
+      gimplify_ctxp->save_stack = m_outer_save;
+    }
+
+  gimplify_ctxp->stmt_alloca_tmp = m_outer_tmp;
+  gimplify_ctxp->stmt_alloca_long |= m_outer_long;
+  gimplify_ctxp->keep_stack |= m_outer_keep;
+  gimplify_ctxp->in_full_expr = false;
+  m_seq_p = NULL;
+}
+
+/* Finish the scope for an expression whose value in *VAL_P is used afterward.
+   If the stack gets restored, the value is moved to a variable rather than left
+   in an SSA name.  When a goto leaves the try/finally, tree-eh can choose to
+   have the goto join the normal path at the finally block, and then the SSA
+   name's definition wouldn't dominate its use.  A lone stack restore is cheap
+   enough that tree-eh copies the finally block today, but that's only a cost
+   estimate.  */
+
+void
+alloca_tmp_scope::close (tree *val_p)
+{
+  if (will_restore_p ())
+    *val_p = get_initialized_tmp_var (*val_p, m_seq_p, NULL, false);
+  close ();
+}
+
+/* Callback for walk_tree to find a label that a jump can target from outside of
+   the walked statement.  The labels created for loops can't be targeted.  */
+
+static tree
+find_jump_label_r (tree *tp, int *walk_subtrees, void *)
+{
+  tree t = *tp;
+
+  if (TYPE_P (t) || DECL_P (t))
+    *walk_subtrees = 0;
+  else if (TREE_CODE (t) == CASE_LABEL_EXPR
+	   || (TREE_CODE (t) == LABEL_EXPR
+	       && !DECL_ARTIFICIAL (LABEL_EXPR_LABEL (t))))
+    return t;
+
+  return NULL_TREE;
+}
+
+/* Return true if a jump from outside of STMT can target a label in it.  */
+
+static bool
+stmt_has_label_p (tree stmt)
+{
+  return (stmt
+	  && walk_tree_without_duplicates (&stmt, find_jump_label_r, NULL));
+}
+
+/* Return true if gimplifying STMT, a statement, only gimplifies other
+   statements and expressions that are full expressions in their own right.  */
+
+static bool
+stmt_has_substatements_p (tree stmt)
+{
+  if (!stmt)
+    return false;
+
+  switch (TREE_CODE (stmt))
+    {
+    case STATEMENT_LIST:
+    case BIND_EXPR:
+    case SWITCH_EXPR:
+    case TRY_FINALLY_EXPR:
+    case TRY_CATCH_EXPR:
+      return true;
+    case COND_EXPR:
+      return VOID_TYPE_P (TREE_TYPE (stmt));
+    default:
+      return false;
+    }
+}
+
+/* Like gimplify_stmt, except that STMT_P is a real statement in the source
+   code, as opposed to an expression's side effect that needs to be gimplified
+   on its own, and therefore reclaims its variable-sized temporaries when
+   finished.  */
+
+static bool
+gimplify_full_stmt (tree *stmt_p, gimple_seq *seq_p)
+{
+  alloca_tmp_scope scope (seq_p);
+
+  if (scope.active_p ())
+    gimplify_ctxp->in_full_expr = !stmt_has_substatements_p (*stmt_p);
+  return gimplify_stmt (stmt_p, seq_p);
 }
 
 /* Generate IFN_ASAN_MARK call that poisons shadow memory of the DECL
@@ -1560,9 +1835,16 @@ gimplify_bind_expr (tree *expr_p, gimple_seq *pre_p)
   gimplify_ctxp->keep_stack = false;
   gimplify_ctxp->save_stack = false;
 
-  /* Gimplify the body into the GIMPLE_BIND tuple's body.  */
+  /* Gimplify the body into the GIMPLE_BIND tuple's body.  It contains real
+     statements even when it's a statement expression in a full expression, and
+     the code below handles anything they allocate that outlives them.  */
+  bool old_in_full_expr = gimplify_ctxp->in_full_expr;
+  bool old_stmt_alloca_long = gimplify_ctxp->stmt_alloca_long;
+  gimplify_ctxp->in_full_expr = false;
   body = NULL;
-  gimplify_stmt (&BIND_EXPR_BODY (bind_expr), &body);
+  gimplify_full_stmt (&BIND_EXPR_BODY (bind_expr), &body);
+  gimplify_ctxp->in_full_expr = old_in_full_expr;
+  gimplify_ctxp->stmt_alloca_long = old_stmt_alloca_long;
   gimple_bind_set_body (bind_stmt, body);
 
   /* Source location wise, the cleanup code (stack_restore and clobbers)
@@ -1874,6 +2156,7 @@ gimplify_vla_decl (tree decl, gimple_seq *seq_p)
 			      max_int_size_in_bytes (TREE_TYPE (decl)));
   /* The call has been built for a variable-sized object.  */
   CALL_ALLOCA_FOR_VAR_P (t) = 1;
+  gimplify_ctxp->stmt_alloca_long = true;
   t = fold_convert (ptr_type, t);
   t = build2 (MODIFY_EXPR, TREE_TYPE (addr), addr, t);
 
@@ -2167,7 +2450,7 @@ gimplify_statement_list (tree *expr_p, gimple_seq *pre_p)
 
   while (!tsi_end_p (i))
     {
-      gimplify_stmt (tsi_stmt_ptr (i), pre_p);
+      gimplify_full_stmt (tsi_stmt_ptr (i), pre_p);
       tsi_delink (&i);
     }
 
@@ -2927,10 +3210,14 @@ gimplify_switch_expr (tree *expr_p, gimple_seq *pre_p)
   if (index_type == NULL_TREE)
     index_type = TREE_TYPE (SWITCH_COND (switch_expr));
 
+  /* Reclaim the condition's temporaries here since the jump to a case label
+     would otherwise bypass stack saves and restores in the body.  */
+  alloca_tmp_scope cond_scope (pre_p);
   ret = gimplify_expr (&SWITCH_COND (switch_expr), pre_p, NULL, is_gimple_val,
                        fb_rvalue);
   if (ret == GS_ERROR || ret == GS_UNHANDLED)
     return ret;
+  cond_scope.close (&SWITCH_COND (switch_expr));
 
   if (SWITCH_BODY (switch_expr))
     {
@@ -2956,7 +3243,7 @@ gimplify_switch_expr (tree *expr_p, gimple_seq *pre_p)
       bool old_in_switch_expr = gimplify_ctxp->in_switch_expr;
       gimplify_ctxp->in_switch_expr = true;
 
-      gimplify_stmt (&SWITCH_BODY (switch_expr), &switch_body_seq);
+      gimplify_full_stmt (&SWITCH_BODY (switch_expr), &switch_body_seq);
 
       gimplify_ctxp->in_switch_expr = old_in_switch_expr;
       maybe_warn_switch_unreachable_and_auto_init (switch_body_seq);
@@ -5478,7 +5765,12 @@ gimplify_cond_expr (tree *expr_p, gimple_seq *pre_p, fallback_t fallback)
 	      && !generic_expr_could_trap_p (else_))
 	    return gimplify_pure_cond_expr (expr_p, pre_p);
 
-	  tmp = create_tmp_var (type, "iftmp");
+	  /* Allocate a variable-sized temporary here rather than in the arms
+	     since its address must be valid in both of them and afterward.  */
+	  if (tmp_type_needs_alloca_p (type))
+	    tmp = create_alloca_tmp_var (type, "iftmp", pre_p);
+	  else
+	    tmp = create_tmp_var (type, "iftmp");
 	  result = tmp;
 	}
 
@@ -5503,21 +5795,29 @@ gimplify_cond_expr (tree *expr_p, gimple_seq *pre_p, fallback_t fallback)
       /* Build the new then clause, `tmp = then_;'.  But don't build the
 	 assignment if the value is void; in C++ it can be if it's a throw.  */
       if (!VOID_TYPE_P (TREE_TYPE (then_)))
-	TREE_OPERAND (expr, 1) = build2 (INIT_EXPR, type, tmp, then_);
+	TREE_OPERAND (expr, 1) = build2 (INIT_EXPR, type, unshare_expr (tmp),
+					 then_);
 
       /* Similarly, build the new else clause, `tmp = else_;'.  */
       if (!VOID_TYPE_P (TREE_TYPE (else_)))
-	TREE_OPERAND (expr, 2) = build2 (INIT_EXPR, type, tmp, else_);
+	TREE_OPERAND (expr, 2) = build2 (INIT_EXPR, type, unshare_expr (tmp),
+					 else_);
 
       TREE_TYPE (expr) = void_type_node;
       recalculate_side_effects (expr);
 
-      /* Move the COND_EXPR to the prequeue.  */
+      /* Move the COND_EXPR to the prequeue.  Its arms aren't full expressions,
+	 so its temporaries must stay valid after it finishes.  */
+      bool old_in_full_expr = gimplify_ctxp->in_full_expr;
+      gimplify_ctxp->in_full_expr = true;
       gimplify_stmt (&expr, pre_p);
+      gimplify_ctxp->in_full_expr = old_in_full_expr;
 
       *expr_p = result;
       return GS_ALL_DONE;
     }
+
+  alloca_tmp_scope pred_scope (pre_p);
 
   /* Remove any COMPOUND_EXPR so the following cases will be caught.  */
   STRIP_TYPE_NOPS (TREE_OPERAND (expr, 0));
@@ -5527,22 +5827,26 @@ gimplify_cond_expr (tree *expr_p, gimple_seq *pre_p, fallback_t fallback)
   /* Make sure the condition has BOOLEAN_TYPE.  */
   TREE_OPERAND (expr, 0) = gimple_boolify (TREE_OPERAND (expr, 0));
 
-  /* Break apart && and || conditions.  */
-  if (TREE_CODE (TREE_OPERAND (expr, 0)) == TRUTH_ANDIF_EXPR
-      || TREE_CODE (TREE_OPERAND (expr, 0)) == TRUTH_ORIF_EXPR)
+  /* Break apart && and || conditions.  Keep a predicate with a temporary in one
+     piece since the scope must cover all of it, as one operand can use a
+     pointer into a temporary that was created by another operand.  */
+  if ((TREE_CODE (TREE_OPERAND (expr, 0)) == TRUTH_ANDIF_EXPR
+       || TREE_CODE (TREE_OPERAND (expr, 0)) == TRUTH_ORIF_EXPR)
+      && !pred_scope.has_tmp_p (TREE_OPERAND (expr, 0)))
     {
       expr = shortcut_cond_expr (expr, next_cond_uid ());
 
       if (expr != *expr_p)
 	{
 	  *expr_p = expr;
+	  pred_scope.close ();
 
 	  /* We can't rely on gimplify_expr to re-gimplify the expanded
 	     form properly, as cleanups might cause the target labels to be
 	     wrapped in a TRY_FINALLY_EXPR.  To prevent that, we need to
 	     set up a conditional context.  */
 	  gimple_push_condition ();
-	  gimplify_stmt (expr_p, &seq);
+	  gimplify_full_stmt (expr_p, &seq);
 	  gimple_pop_condition (pre_p);
 	  gimple_seq_add_seq (pre_p, seq);
 
@@ -5558,6 +5862,21 @@ gimplify_cond_expr (tree *expr_p, gimple_seq *pre_p, fallback_t fallback)
   if (ret == GS_ERROR)
     return GS_ERROR;
   gcc_assert (TREE_OPERAND (expr, 0) != NULL_TREE);
+
+  /* A void ?: operator looks the same as an if statement here.  Its arms are in
+     the same full expression as its predicate, so they can use the predicate's
+     temporaries.  Keep the scope open across the arms unless one of them has a
+     label that can be jumped to, which the operator's arms can't have since the
+     C FE rejects jumps into a statement expression.  */
+  if (gimplify_ctxp->stmt_alloca_tmp
+      && (stmt_has_label_p (TREE_OPERAND (expr, 1))
+	  || stmt_has_label_p (TREE_OPERAND (expr, 2))))
+    pred_scope.close (&TREE_OPERAND (expr, 0));
+
+  /* The statements in the arms need scopes of their own when the predicate's
+     scope is still open.  */
+  if (pred_scope.active_p ())
+    gimplify_ctxp->in_full_expr = false;
 
   gimple_push_condition ();
 
@@ -5635,7 +5954,8 @@ gimplify_cond_expr (tree *expr_p, gimple_seq *pre_p, fallback_t fallback)
 	    = (TREE_OPERAND (expr, 1)
 	       && TREE_SIDE_EFFECTS (TREE_OPERAND (expr, 1)));
 	  gimplify_seq_add_stmt (&seq, gimple_build_label (label_true));
-	  have_then_clause_p = gimplify_stmt (&TREE_OPERAND (expr, 1), &seq);
+	  have_then_clause_p = gimplify_full_stmt (&TREE_OPERAND (expr, 1),
+						   &seq);
 	  /* For if (...) { code; } else {} or
 	     if (...) { code; } else goto label; or
 	     if (...) { code; return; } else { ... }
@@ -5681,7 +6001,7 @@ gimplify_cond_expr (tree *expr_p, gimple_seq *pre_p, fallback_t fallback)
 	      || !TREE_SIDE_EFFECTS (TREE_OPERAND (expr, 2))))
 	UNUSED_LABEL_P (label_false) = 1;
       gimplify_seq_add_stmt (&seq, gimple_build_label (label_false));
-      have_else_clause_p = gimplify_stmt (&TREE_OPERAND (expr, 2), &seq);
+      have_else_clause_p = gimplify_full_stmt (&TREE_OPERAND (expr, 2), &seq);
     }
   if (label_cont)
     gimplify_seq_add_stmt (&seq, gimple_build_label (label_cont));
@@ -7477,7 +7797,15 @@ gimplify_modify_expr (tree *expr_p, gimple_seq *pre_p, gimple_seq *post_p,
       SET_DECL_DEBUG_EXPR (*from_p, *to_p);
    }
 
-  if (want_value && TREE_THIS_VOLATILE (*to_p))
+  /* The value of an assignment to a volatile destination normally comes from a
+     temporary so that the destination isn't read back.  Read back a
+     variable-sized value anyway, as the memcpy path above does, rather than
+     copying it twice: a GIMPLE_ASSIGN from the temporary wouldn't have the size
+     of the copy, which can't be found from the type during expansion.  */
+  bool value_in_tmp = (want_value
+		       && TREE_THIS_VOLATILE (*to_p)
+		       && !tmp_type_needs_alloca_p (TREE_TYPE (*from_p)));
+  if (value_in_tmp)
     *from_p = get_initialized_tmp_var (*from_p, pre_p, post_p);
 
   if (TREE_CODE (*from_p) == CALL_EXPR)
@@ -7552,7 +7880,7 @@ gimplify_modify_expr (tree *expr_p, gimple_seq *pre_p, gimple_seq *post_p,
 
   if (want_value)
     {
-      *expr_p = TREE_THIS_VOLATILE (*to_p) ? *from_p : unshare_expr (*to_p);
+      *expr_p = value_in_tmp ? *from_p : unshare_expr (*to_p);
       return GS_OK;
     }
   else
@@ -7716,18 +8044,27 @@ gimplify_save_expr (tree *expr_p, gimple_seq *pre_p, gimple_seq *post_p)
 	  val = NULL;
 	}
       else
-	/* The temporary may not be an SSA name as later abnormal and EH
-	   control flow may invalidate use/def domination.  When in SSA
-	   form then assume there are no such issues and SAVE_EXPRs only
-	   appear via GENERIC foldings.  */
-	val = get_initialized_tmp_var (val, pre_p, post_p,
-				       gimple_in_ssa_p (cfun));
+	{
+	  /* An __auto_type initializer is saved so that a later statement can
+	     read it, so it must outlive the statement.  */
+	  if (tmp_type_needs_alloca_p (TREE_TYPE (val)))
+	    gimplify_ctxp->stmt_alloca_long = true;
+
+	  /* The temporary may not be an SSA name as later abnormal and EH
+	     control flow may invalidate use/def domination.  When in SSA
+	     form then assume there are no such issues and SAVE_EXPRs only
+	     appear via GENERIC foldings.  */
+	  val = get_initialized_tmp_var (val, pre_p, post_p,
+					 gimple_in_ssa_p (cfun));
+	}
 
       TREE_OPERAND (*expr_p, 0) = val;
       SAVE_EXPR_RESOLVED_P (*expr_p) = 1;
     }
 
-  *expr_p = val;
+  /* The resolved value is a MEM_REF for a variable-sized temporary, which
+     cannot be shared between its uses.  */
+  *expr_p = unshare_expr (val);
 
   return ret;
 }
@@ -8593,8 +8930,11 @@ gimplify_target_expr (tree *expr_p, gimple_seq *pre_p, gimple_seq *post_p)
       TARGET_EXPR_INITIAL (targ) = NULL_TREE;
     }
   else
-    /* We should have expanded this before.  */
-    gcc_assert (DECL_SEEN_IN_BIND_EXPR_P (temp));
+    /* We should have expanded this before.  A variable-sized temporary doesn't
+       get added to a BIND_EXPR since gimplify_vla_decl allocates it instead;
+       __auto_type initializers can reference it more than once.  */
+    gcc_assert (DECL_SEEN_IN_BIND_EXPR_P (temp)
+		|| DECL_HAS_VALUE_EXPR_P (temp));
 
   *expr_p = temp;
   return GS_OK;
@@ -19597,7 +19937,8 @@ gimplify_omp_atomic (tree *expr_p, gimple_seq *pre_p)
 static enum gimplify_status
 gimplify_transaction (tree *expr_p, gimple_seq *pre_p)
 {
-  tree expr = *expr_p, temp, tbody = TRANSACTION_EXPR_BODY (expr);
+  tree expr = *expr_p, temp = NULL_TREE, tbody = TRANSACTION_EXPR_BODY (expr);
+  tree type = TREE_TYPE (expr), alloca_tmp = NULL_TREE;
   gimple *body_stmt;
   gtransaction *trans_stmt;
   gimple_seq body = NULL;
@@ -19613,8 +19954,16 @@ gimplify_transaction (tree *expr_p, gimple_seq *pre_p)
       TRANSACTION_EXPR_BODY (expr) = bind;
     }
 
+  /* The transaction's value outlives its body, so a variable-sized temporary
+     holding it must be allocated before the body starts.  */
+  if (type && !VOID_TYPE_P (type) && tmp_type_needs_alloca_p (type))
+    {
+      alloca_tmp = create_alloca_tmp_var (type, "retval", pre_p);
+      temp = build2 (INIT_EXPR, type, unshare_expr (alloca_tmp), NULL_TREE);
+    }
+
   push_gimplify_context ();
-  temp = voidify_wrapper_expr (*expr_p, NULL);
+  temp = voidify_wrapper_expr (*expr_p, temp);
 
   body_stmt = gimplify_and_return_first (TRANSACTION_EXPR_BODY (expr), &body);
   pop_gimplify_context (body_stmt);
@@ -19630,7 +19979,7 @@ gimplify_transaction (tree *expr_p, gimple_seq *pre_p)
 
   if (temp)
     {
-      *expr_p = temp;
+      *expr_p = alloca_tmp ? alloca_tmp : temp;
       return GS_OK;
     }
 
@@ -20921,7 +21270,8 @@ gimplify_expr (tree *expr_p, gimple_seq *pre_p, gimple_seq *post_p,
 	       end of gimplify_expr.  */
 	    input_location = UNKNOWN_LOCATION;
 	    eval = cleanup = NULL;
-	    gimplify_and_add (TREE_OPERAND (*expr_p, 0), &eval);
+	    tree eval_stmt = TREE_OPERAND (*expr_p, 0);
+	    gimplify_full_stmt (&eval_stmt, &eval);
 	    bool save_in_handler_expr = gimplify_ctxp->in_handler_expr;
 	    if (TREE_CODE (*expr_p) == TRY_FINALLY_EXPR
 		&& TREE_CODE (TREE_OPERAND (*expr_p, 1)) == EH_ELSE_EXPR)
