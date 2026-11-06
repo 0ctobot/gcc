@@ -533,7 +533,8 @@ test8 (unsigned cond)
   if (__builtin_object_size (p, 1) != sizeof (y.c) - 8 + cond)
     FAIL ();
 #else
-  if (__builtin_object_size (p, 1) != sizeof (y.c))
+  /* A loop stepping back can leave y.c, so only y itself limits P.  */
+  if (__builtin_object_size (p, 1) != sizeof (y))
     FAIL ();
 #endif
 }
