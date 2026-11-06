@@ -103,6 +103,12 @@ static unsigned todo;
    function's own statements before they're optimized.  */
 static bool object_sizes_early;
 
+/* Answers from object_size_step_repeats_p for the function at hand, by the SSA
+   name version of a step's result: which steps have an answer, and which of
+   those repeat.  */
+static bitmap step_repeats_known;
+static bitmap step_repeats;
+
 /* Return true if VAL represents an initial size for OBJECT_SIZE_TYPE.  */
 
 static inline bool
@@ -2689,6 +2695,9 @@ init_object_sizes (void)
       computed[object_size_type] = BITMAP_ALLOC (NULL);
     }
 
+  step_repeats_known = BITMAP_ALLOC (NULL);
+  step_repeats = BITMAP_ALLOC (NULL);
+
   init_offset_limit ();
 }
 
@@ -2705,6 +2714,9 @@ fini_object_sizes (void)
       object_sizes_release (object_size_type);
       BITMAP_FREE (computed[object_size_type]);
     }
+
+  BITMAP_FREE (step_repeats_known);
+  BITMAP_FREE (step_repeats);
 }
 
 /* Dummy valueize function.  */
@@ -2839,31 +2851,60 @@ object_size_variable_offset_p (tree ptr, bool negative)
 }
 
 /* Return true if the step that gives LHS from BASE repeats, i.e., BASE is
-   computed from LHS.  */
+   computed from LHS.  This walks the chain behind LHS, and the chain's other
+   helpers ask this of each step of the chain for every step of the chain, which
+   is too slow on a long chain unless each step is only walked once.  */
 
 static bool
 object_size_step_repeats_p (tree lhs, tree base)
 {
-  return object_size_walk_steps (base, [lhs] (tree res, tree, tree)
+  unsigned int version = SSA_NAME_VERSION (lhs);
+
+  if (!bitmap_set_bit (step_repeats_known, version))
+    return bitmap_bit_p (step_repeats, version);
+
+  bool repeats = object_size_walk_steps (base, [lhs] (tree res, tree, tree)
     {
       return res == lhs;
+    }, true);
+
+  if (repeats)
+    bitmap_set_bit (step_repeats, version);
+
+  return repeats;
+}
+
+/* Return true if a step in the chain of definitions of PTR repeats.  */
+
+static bool
+object_size_chain_repeats_p (tree ptr)
+{
+  return object_size_walk_steps (ptr, [] (tree lhs, tree base, tree)
+    {
+      return object_size_step_repeats_p (lhs, base);
     }, true);
 }
 
 /* Return true if PTR may be below where its chain of definitions started by an
    amount that nothing in the chain pins down, due to a non-constant offset or
-   a negative constant that repeats on a cycle.  A chain of exact constants
-   doesn't count, since its maximum follows the pointer step by step.  */
+   a negative constant in a chain that also has a step repeating on a cycle.  A
+   chain of exact constants doesn't count, since its maximum follows the pointer
+   step by step, but a cycle makes the maximum stand for the pointer before the
+   cycle's first step only.  */
 
 static bool
 object_size_may_step_back_p (tree ptr)
 {
-  return object_size_walk_steps (ptr, [] (tree lhs, tree base, tree off)
-    {
-      return (TREE_CODE (off) != INTEGER_CST
-	      || (object_size_negative_offset_p (off)
-		  && object_size_step_repeats_p (lhs, base)));
-    }, true);
+  bool negative = false;
+
+  if (object_size_walk_steps (ptr, [&negative] (tree, tree, tree off)
+	{
+	  negative |= object_size_negative_offset_p (off);
+	  return TREE_CODE (off) != INTEGER_CST;
+	}, true))
+    return true;
+
+  return negative && object_size_chain_repeats_p (ptr);
 }
 
 /* Return true if the non-constant offset OFF is computed by subtracting, which
@@ -2907,7 +2948,7 @@ object_size_step_returns_p (tree lhs, tree base, tree off)
     return object_size_negated_offset_p (off);
 
   if (object_size_negative_offset_p (off))
-    return object_size_step_repeats_p (lhs, base);
+    return object_size_chain_repeats_p (base);
 
   return object_size_may_step_back_p (base);
 }
