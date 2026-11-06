@@ -138,6 +138,97 @@ vect_mark_for_runtime_alias_test (ddr_p ddr, loop_vec_info loop_vinfo)
   return opt_result::success ();
 }
 
+/* Return a value that's zero if two lanes of a vector access to DR may share an
+   address, for an access that the caller treats as having a distance of zero
+   from another one.  A zero distance only means that the two accesses meet in
+   the same iteration if no other pair of iterations reaches that address, which
+   takes more than a nonzero step: addresses wrap, so 4 * step is zero when step
+   is 1 << 62.
+
+   We don't know the VF yet and it can even be unknown at compile time, so test
+   for the largest number of lanes that any target could have, which is taken
+   to be 1 << 16.  N * step wraps to zero for some N below that exactly when
+   step << 15 is zero, and that also covers a zero step.  A constant step
+   doesn't come through here since vect_limit_max_vf_for_steps deals with it by
+   limiting the VF.  */
+
+static tree
+vect_lane_collision_indicator (data_reference *dr)
+{
+  const unsigned int lanes_log2 = 16;
+
+  tree indicator = dr_zero_step_indicator (dr);
+  tree step = DR_STEP (dr);
+  if (!indicator || integer_zerop (indicator) || TREE_CODE (step) == INTEGER_CST)
+    return indicator;
+
+  /* The step is often a narrow variable scaled by the access size.  Stick to
+     the simpler test if that bounds the step well below the point of wrapping,
+     where the only way for two lanes to meet is a zero step.  */
+  tree value = step;
+  STRIP_NOPS (value);
+  unsigned int scale_bits = 0;
+  if (TREE_CODE (value) == MULT_EXPR
+      && TREE_CODE (TREE_OPERAND (value, 1)) == INTEGER_CST)
+    {
+      scale_bits = wi::min_precision (wi::to_widest (TREE_OPERAND (value, 1)),
+				      SIGNED);
+      value = TREE_OPERAND (value, 0);
+    }
+  unsigned int value_bits = TYPE_PRECISION (TREE_TYPE (value));
+  if (CONVERT_EXPR_P (value)
+      && INTEGRAL_TYPE_P (TREE_TYPE (TREE_OPERAND (value, 0))))
+    value_bits = MIN (value_bits,
+		      TYPE_PRECISION (TREE_TYPE (TREE_OPERAND (value, 0))));
+  if (value_bits + scale_bits + lanes_log2 < TYPE_PRECISION (ssizetype))
+    return indicator;
+
+  return fold_build2 (LSHIFT_EXPR, sizetype, fold_convert (sizetype, step),
+		      size_int (lanes_log2 - 1));
+}
+
+/* Limit *MAX_VF for accesses DR_INFO_A and DR_INFO_B with constant steps, at
+   least one of which is a write, if a vector iteration could cover enough of
+   the address space for the addresses to wrap.  Dependence analysis works on
+   the steps as if addresses go on forever, so it would miss that lane 0 of one
+   access and lane 2 of the other one meet for a step of (1 << 63) + 8 and an
+   offset of 16 between the accesses, which it reports as no dependence at all.
+
+   Once no lane gets further from the first lane than 1 << (P - 2) for pointer
+   precision P, the offset between lanes of the two accesses stays within what P
+   bits can represent, so such wrapped solutions cannot exist and the regular
+   analysis holds.  */
+
+static void
+vect_limit_max_vf_for_steps (loop_vec_info loop_vinfo, dr_vec_info *dr_info_a,
+			     dr_vec_info *dr_info_b, unsigned int *max_vf)
+{
+  tree step_a = vect_dr_behavior (loop_vinfo, dr_info_a)->step;
+  tree step_b = vect_dr_behavior (loop_vinfo, dr_info_b)->step;
+  if (!step_a || !step_b
+      || TREE_CODE (step_a) != INTEGER_CST
+      || TREE_CODE (step_b) != INTEGER_CST)
+    return;
+
+  widest_int step = wi::max (wi::abs (wi::to_widest (step_a)),
+			     wi::abs (wi::to_widest (step_b)), SIGNED);
+  if (step == 0)
+    return;
+
+  unsigned int prec = TYPE_PRECISION (TREE_TYPE (step_a));
+  widest_int limit = wi::div_trunc (wi::lshift (widest_int (1), prec - 2), step,
+				    SIGNED);
+  if (wi::ltu_p (limit, *max_vf))
+    {
+      *max_vf = MAX (limit.to_uhwi (), 1);
+      if (dump_enabled_p ())
+	dump_printf_loc (MSG_NOTE, vect_location,
+			 "adjusting maximal vectorization factor to %i since "
+			 "the steps of %T and %T could wrap\n", *max_vf,
+			 DR_REF (dr_info_a->dr), DR_REF (dr_info_b->dr));
+    }
+}
+
 /* Record that loop LOOP_VINFO needs to check that VALUE is nonzero.  */
 
 static void
@@ -330,7 +421,7 @@ vect_analyze_possibly_independent_ddr (data_dependence_relation *ddr,
 	 iterations rather than just to one.  */
       if (dist == 0 && loop->safelen < 2)
 	{
-	  tree indicator = dr_zero_step_indicator (DDR_A (ddr));
+	  tree indicator = vect_lane_collision_indicator (DDR_A (ddr));
 	  if (!indicator || integer_zerop (indicator))
 	    return false;
 	  if (TREE_CODE (indicator) != INTEGER_CST)
@@ -399,6 +490,20 @@ vect_analyze_data_ref_dependence (struct data_dependence_relation *ddr,
   if (!STMT_VINFO_VECTORIZABLE (stmtinfo_a)
       || !STMT_VINFO_VECTORIZABLE (stmtinfo_b))
     gcc_unreachable ();
+
+  /* This comes first since it's the verdicts below that it limits the VF for,
+     including the verdict that the accesses are independent.  It only applies
+     to verdicts reached by comparing the steps of accesses from the same base.
+     Accesses from different bases are told apart by alias information, which
+     doesn't depend on the steps, and an unknown dependence goes to the run-time
+     alias check, which already refuses lanes that are too far apart.  */
+  if (dra != drb
+      && (DR_IS_WRITE (dra) || DR_IS_WRITE (drb))
+      && DDR_ARE_DEPENDENT (ddr) != chrec_dont_know
+      && DR_BASE_ADDRESS (dra)
+      && DR_BASE_ADDRESS (drb)
+      && operand_equal_p (DR_BASE_ADDRESS (dra), DR_BASE_ADDRESS (drb), 0))
+    vect_limit_max_vf_for_steps (loop_vinfo, dr_info_a, dr_info_b, max_vf);
 
   /* Independent data accesses.  */
   if (DDR_ARE_DEPENDENT (ddr) == chrec_known)
@@ -519,7 +624,7 @@ vect_analyze_data_ref_dependence (struct data_dependence_relation *ddr,
 
 	  if (loop->safelen < 2)
 	    {
-	      tree indicator = dr_zero_step_indicator (dra);
+	      tree indicator = vect_lane_collision_indicator (dra);
 	      if (!indicator || integer_zerop (indicator))
 		return opt_result::failure_at (stmtinfo_a->stmt,
 					       "access also has a zero step\n");
