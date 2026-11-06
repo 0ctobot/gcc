@@ -10804,6 +10804,37 @@ init_override_side_effects_p (tree old_value)
   return true;
 }
 
+/* Return VALUE, an initializer that several subobjects will share, wrapped so
+   that it's evaluated just once.  save_expr doesn't save a read-only access,
+   and folding removes a SAVE_EXPR around one, since both assume the access
+   reads the same value each time.  A const-qualified access doesn't mean the
+   object can't change, though, so drop the flag from a copy of the access.
+   Only a declared const object is known to stay the same, and a constant
+   initializer can't depend on when it's read.  */
+
+static tree
+save_init_value (tree value)
+{
+  if (require_constant_value)
+    return save_expr (value);
+  /* save_expr looks through a conversion to decide, so the access inside
+     needs saving even if the conversion dropped the qualifier.  */
+  if (CONVERT_EXPR_P (value) || TREE_CODE (value) == NON_LVALUE_EXPR)
+    {
+      tree inner = save_init_value (TREE_OPERAND (value, 0));
+      value = copy_node (value);
+      TREE_OPERAND (value, 0) = inner;
+      TREE_SIDE_EFFECTS (value) = TREE_SIDE_EFFECTS (inner);
+      return value;
+    }
+  if (TREE_READONLY (value) && !DECL_P (value))
+    {
+      value = copy_node (value);
+      TREE_READONLY (value) = 0;
+    }
+  return save_expr (value);
+}
+
 /* Return an expression of the main variant of constructor_type to read the
    parts of the whole initializer VALUE from, which evaluates VALUE only once
    no matter how many parts survive.  A split reference already reads a saved
@@ -10815,7 +10846,7 @@ init_split_base (tree value)
 {
   tree base = strip_init_conversions (value);
   if (!init_split_ref_p (base))
-    base = save_expr (base);
+    base = save_init_value (base);
   if (TYPE_MAIN_VARIANT (TREE_TYPE (base))
       != TYPE_MAIN_VARIANT (constructor_type))
     base = build1 (VIEW_CONVERT_EXPR, TYPE_MAIN_VARIANT (constructor_type),
@@ -13079,7 +13110,7 @@ retry:
 	      semantic_type = TREE_TYPE (value.value);
 	      value.value = TREE_OPERAND (value.value, 0);
 	    }
-	  value.value = save_expr (value.value);
+	  value.value = save_init_value (value.value);
 	  if (semantic_type)
 	    value.value = build1 (EXCESS_PRECISION_EXPR, semantic_type,
 				  value.value);
