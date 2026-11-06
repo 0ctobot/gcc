@@ -1597,6 +1597,10 @@ handle_alias_pairs (void)
 	      node->alias = true;
 	      node->transparent_alias = true;
 	    }
+	  /* The target lives elsewhere and pointers to it can reach this unit,
+	     yet the weakref itself may be static.  */
+	  if (VAR_P (p->decl))
+	    TREE_ADDRESSABLE (p->decl) = 1;
 	  alias_pairs->unordered_remove (i);
 	  continue;
 	}
