@@ -1228,15 +1228,24 @@ expand_vector_condition (gimple_stmt_iterator *gsi)
       tmp_7 = tmp_6 & vbfld_4;
       tmp_8 = ~tmp_6;
       tmp_9 = tmp_8 & vbfld_5;
-      vbfld_1 = tmp_7 | tmp_9;  */
+      vbfld_1 = tmp_7 | tmp_9;
+
+     Build these in a separate sequence since gimple_build then doesn't follow
+     SSA edges out of it.  We don't walk the blocks in dominator order, so
+     tmp_6 can be defined by a comparison that we haven't lowered yet.  Folding
+     through it would insert a new comparison before GSI, where the walk never
+     sees it, and expand cannot handle a comparison the target doesn't
+     support.  */
   if (VECTOR_BOOLEAN_TYPE_P (type)
       && SCALAR_INT_MODE_P (TYPE_MODE (type))
       && useless_type_conversion_p (type, TREE_TYPE (a)))
     {
-      a1 = gimplify_build2 (gsi, BIT_AND_EXPR, type, a, b);
-      a2 = gimplify_build1 (gsi, BIT_NOT_EXPR, type, a);
-      a2 = gimplify_build2 (gsi, BIT_AND_EXPR, type, a2, c);
-      a = gimplify_build2 (gsi, BIT_IOR_EXPR, type, a1, a2);
+      gimple_seq seq = NULL;
+      a1 = gimple_build (&seq, loc, BIT_AND_EXPR, type, a, b);
+      a2 = gimple_build (&seq, loc, BIT_NOT_EXPR, type, a);
+      a2 = gimple_build (&seq, loc, BIT_AND_EXPR, type, a2, c);
+      a = gimple_build (&seq, loc, BIT_IOR_EXPR, type, a1, a2);
+      gsi_insert_seq_before (gsi, seq, GSI_SAME_STMT);
       gimple_assign_set_rhs_from_tree (gsi, a);
       update_stmt (gsi_stmt (*gsi));
       return true;
