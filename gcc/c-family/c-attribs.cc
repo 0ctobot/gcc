@@ -2956,10 +2956,14 @@ handle_weakref_attribute (tree *node, tree name, tree args,
 
   /* We must ignore the attribute when it is associated with
      local-scoped decls, since attribute alias is ignored and many
-     such symbols do not even have a DECL_WEAK field.  */
+     such symbols do not even have a DECL_WEAK field.  A block-scope extern
+     declaration names a public symbol though, and doesn't need an alias when
+     there's no target since the attribute then means the same thing as
+     weak.  */
   if (decl_function_context (*node)
-      || current_function_decl
-      || !VAR_OR_FUNCTION_DECL_P (*node))
+      || !VAR_OR_FUNCTION_DECL_P (*node)
+      || (current_function_decl
+	  && (args || !DECL_EXTERNAL (*node) || !TREE_PUBLIC (*node))))
     {
       warning (OPT_Wattributes, "%qE attribute ignored", name);
       *no_add_attrs = true;
@@ -2994,9 +2998,10 @@ handle_weakref_attribute (tree *node, tree name, tree args,
 		  "%qE attribute must appear before %qs attribute",
 		  name, "alias");
 
-      /* Can't call declare_weak because it wants this to be TREE_PUBLIC,
-	 and that isn't supported; and because it wants to add it to
-	 the list of weak decls, which isn't helpful.  */
+      /* Can't call declare_weak yet because this may turn out to be static
+	 once it's merged with another declaration, or may get an alias
+	 attribute later.  process_common_attributes sorts it out at the end
+	 of the translation unit.  */
       DECL_WEAK (*node) = 1;
     }
 

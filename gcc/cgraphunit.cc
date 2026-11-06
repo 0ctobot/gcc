@@ -818,6 +818,21 @@ process_symver_attribute (symtab_node *n)
     }
 }
 
+/* Return true if DECL has a weakref attribute that means the same thing as a
+   weak attribute, which is the case when there's no target and DECL can be
+   weak.  A static symbol cannot be weak, and the weak attribute refuses inline
+   functions.  */
+
+static bool
+weakref_means_weak_p (tree decl)
+{
+  return (lookup_attribute ("weakref", DECL_ATTRIBUTES (decl))
+	  && !lookup_attribute ("alias", DECL_ATTRIBUTES (decl))
+	  && TREE_PUBLIC (decl)
+	  && !(TREE_CODE (decl) == FUNCTION_DECL
+	       && DECL_DECLARED_INLINE_P (decl)));
+}
+
 /* Process attributes common for vars and functions.  */
 
 static void
@@ -827,10 +842,15 @@ process_common_attributes (symtab_node *node, tree decl)
 
   if (weakref && !lookup_attribute ("alias", DECL_ATTRIBUTES (decl)))
     {
-      warning_at (DECL_SOURCE_LOCATION (decl), OPT_Wattributes,
-		  "%<weakref%> attribute should be accompanied with"
-		  " an %<alias%> attribute");
-      DECL_WEAK (decl) = 0;
+      if (weakref_means_weak_p (decl))
+	declare_weak (decl);
+      else
+	{
+	  warning_at (DECL_SOURCE_LOCATION (decl), OPT_Wattributes,
+		      "%<weakref%> attribute should be accompanied with"
+		      " an %<alias%> attribute");
+	  DECL_WEAK (decl) = 0;
+	}
       DECL_ATTRIBUTES (decl) = remove_attribute ("weakref",
 						 DECL_ATTRIBUTES (decl));
     }
@@ -895,6 +915,7 @@ process_function_and_variable_attributes (cgraph_node *first,
 			" attribute have effect only on public objects");
 	}
       if (lookup_attribute ("weakref", DECL_ATTRIBUTES (decl))
+	  && !weakref_means_weak_p (decl)
 	  && node->definition
 	  && (!node->alias || DECL_INITIAL (decl) != error_mark_node))
 	{
@@ -947,6 +968,7 @@ process_function_and_variable_attributes (cgraph_node *first,
 			" attribute have effect only on public objects");
 	}
       if (lookup_attribute ("weakref", DECL_ATTRIBUTES (decl))
+	  && !weakref_means_weak_p (decl)
 	  && vnode->definition
 	  && DECL_INITIAL (decl))
 	{
