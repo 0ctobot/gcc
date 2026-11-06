@@ -4560,6 +4560,12 @@ create_block_for_bookkeeping (edge e1, edge e2)
 
   gcc_assert (e2->dest == bb);
 
+  /* The split handed NEW_BB the live set BB had before the move, which may
+     be missing a register that the moved insn used to set below this point.
+     Refresh it now since redirecting E1 can create a jump-only block whose
+     live set is computed once from NEW_BB and isn't revisited afterwards.  */
+  update_liveness_on_insn (sel_bb_head (new_bb));
+
   /* Skip block for bookkeeping copy when leaving E1->src.  */
   if (e1->flags & EDGE_FALLTHRU)
     sel_redirect_edge_and_branch_force (e1, new_bb);
