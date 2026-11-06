@@ -192,6 +192,7 @@ clone_inlined_nodes (struct cgraph_edge *e, bool duplicate,
 	      nfunctions_inlined++;
 	    }
 	  duplicate = false;
+	  polymorphic_call_target_inlined (e->callee);
 	  e->callee->externally_visible = false;
 	  profile_count num = e->count;
 	  profile_count den = e->callee->count;
