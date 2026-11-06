@@ -116,6 +116,8 @@ extern void ix86_fixup_binary_operands_no_copy (enum rtx_code, machine_mode,
 						rtx[], bool = false);
 extern void ix86_expand_binary_operator (enum rtx_code, machine_mode,
 					 rtx[], bool = false);
+extern bool ix86_tls_ie_mem_p (const_rtx);
+extern bool ix86_tls_ie_add_p (rtx *);
 extern bool ix86_binary_operator_ok (enum rtx_code, machine_mode,
 				     rtx[3], bool = false);
 extern void ix86_expand_unary_operator (enum rtx_code, machine_mode,

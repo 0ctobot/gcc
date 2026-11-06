@@ -1517,6 +1517,54 @@ ix86_return_pops_args (tree fundecl, tree funtype, poly_int64 size)
   return 0;
 }
 
+/* Return true if X is a memory reference to the GOT slot holding the TP offset
+   of an initial-exec TLS variable.  */
+
+bool
+ix86_tls_ie_mem_p (const_rtx x)
+{
+  if (!MEM_P (x))
+    return false;
+
+  subrtx_iterator::array_type array;
+  FOR_EACH_SUBRTX (iter, array, XEXP (x, 0), ALL)
+    if (GET_CODE (*iter) == UNSPEC)
+      switch (XINT (*iter, 1))
+	{
+	case UNSPEC_GOTTPOFF:
+	case UNSPEC_GOTNTPOFF:
+	case UNSPEC_INDNTPOFF:
+	  return true;
+	default:
+	  break;
+	}
+
+  return false;
+}
+
+/* Return true if an add with sources OPERANDS[1] and OPERANDS[2] reads a TP
+   offset from the GOT.  When the linker relaxes initial-exec to local-exec, it
+   can rewrite such an add into an lea, which doesn't set the flags.  As such,
+   a pattern that relies on the flags set by the add must reject these
+   operands.  */
+
+bool
+ix86_tls_ie_add_p (rtx *operands)
+{
+  return ix86_tls_ie_mem_p (operands[1]) || ix86_tls_ie_mem_p (operands[2]);
+}
+
+/* Implement the TARGET_CANNOT_SUBSTITUTE_MEM_EQUIV_P hook.  LRA doesn't recheck
+   insn conditions when it replaces a spilled pseudo with its memory equivalent,
+   which could otherwise put a TP offset GOT slot into an add whose flags are
+   used.  */
+
+static bool
+ix86_cannot_substitute_mem_equiv_p (rtx mem)
+{
+  return ix86_tls_ie_mem_p (mem);
+}
+
 /* Implement the TARGET_LEGITIMATE_COMBINED_INSN hook.  */
 
 static bool
@@ -29450,6 +29498,9 @@ static const scoped_attribute_specs *const ix86_attribute_table[] =
 
 #undef TARGET_WARN_FUNC_RETURN
 #define TARGET_WARN_FUNC_RETURN ix86_warn_func_return
+
+#undef TARGET_CANNOT_SUBSTITUTE_MEM_EQUIV_P
+#define TARGET_CANNOT_SUBSTITUTE_MEM_EQUIV_P ix86_cannot_substitute_mem_equiv_p
 
 #undef TARGET_LEGITIMATE_COMBINED_INSN
 #define TARGET_LEGITIMATE_COMBINED_INSN ix86_legitimate_combined_insn
