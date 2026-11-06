@@ -2911,7 +2911,11 @@ merge_decls (tree newdecl, tree olddecl, tree newtype, tree oldtype)
   if (TREE_READONLY (newdecl))
     TREE_READONLY (olddecl) = 1;
 
-  if (TREE_THIS_VOLATILE (newdecl))
+  /* A noreturn redeclaration of __builtin_foo can't change the decl the middle
+     end uses for its own calls to the library function.  */
+  if (TREE_THIS_VOLATILE (newdecl)
+      && !(TREE_CODE (olddecl) == FUNCTION_DECL
+	   && explicit_builtin_decl_p (olddecl)))
     TREE_THIS_VOLATILE (olddecl) = 1;
 
   /* Merge deprecatedness.  */
