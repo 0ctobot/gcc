@@ -10561,8 +10561,10 @@ ix86_expand_epilogue (int style)
 		 other reasonable register to use for the CFA.  We don't
 		 bother resetting the CFA to the SP for the duration of
 		 the return insn, unless the control flow instrumentation
-		 is done.  In this case the SP is used later and we have
-		 to reset CFA to SP.  */
+		 is done or the function pops its arguments.  In those cases the
+		 SP is used later and we have to reset CFA to SP.  Popping
+		 arguments can move the return address into ECX first, with CFA
+		 notes that adjust the SP.  */
 	      add_reg_note (insn, REG_CFA_DEF_CFA,
 			    plus_constant (Pmode, sa, UNITS_PER_WORD));
 	      ix86_add_queued_cfa_restore_notes (insn);
@@ -10575,7 +10577,9 @@ ix86_expand_epilogue (int style)
 
 	      pro_epilogue_adjust_stack (stack_pointer_rtx, sa,
 					 const0_rtx, style,
-					 flag_cf_protection & CF_RETURN);
+					 (flag_cf_protection & CF_RETURN)
+					 || (crtl->args.pops_args
+					     && crtl->args.size));
 	    }
 	  else
 	    {
