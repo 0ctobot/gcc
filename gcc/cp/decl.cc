@@ -1690,7 +1690,10 @@ static void
 merge_attribute_bits (tree newdecl, tree olddecl)
 {
   TREE_THIS_VOLATILE (newdecl) |= TREE_THIS_VOLATILE (olddecl);
-  TREE_THIS_VOLATILE (olddecl) |= TREE_THIS_VOLATILE (newdecl);
+  /* A noreturn redeclaration of __builtin_foo can't change the decl the middle
+     end uses for its own calls to the library function.  */
+  if (!explicit_builtin_decl_p (olddecl))
+    TREE_THIS_VOLATILE (olddecl) |= TREE_THIS_VOLATILE (newdecl);
   TREE_NOTHROW (newdecl) |= TREE_NOTHROW (olddecl);
   TREE_NOTHROW (olddecl) |= TREE_NOTHROW (newdecl);
   TREE_READONLY (newdecl) |= TREE_READONLY (olddecl);
