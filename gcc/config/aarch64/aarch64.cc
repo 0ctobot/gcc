@@ -9419,6 +9419,13 @@ aarch64_pushwb_single_reg (machine_mode mode, unsigned regno,
 
   rtx_insn *insn = emit_move_insn (mem, reg);
   RTX_FRAME_RELATED_P (insn) = 1;
+
+  /* Without a note, dwarf2cfi would describe the save as well as the stack
+     adjustment.  */
+  if (!aarch64_emit_cfi_for_reg_p (regno))
+    add_reg_note (insn, REG_FRAME_RELATED_EXPR,
+		  gen_rtx_SET (base_rtx,
+			       plus_constant (Pmode, base_rtx, -adjustment)));
 }
 
 /* Generate and return an instruction to store the pair of registers
@@ -9457,8 +9464,10 @@ aarch64_push_regs (unsigned regno1, unsigned regno2, HOST_WIDE_INT adjustment)
 
   insn = emit_insn (aarch64_gen_storewb_pair (mode, stack_pointer_rtx, reg1,
 					      reg2, adjustment));
-  RTX_FRAME_RELATED_P (XVECEXP (PATTERN (insn), 0, 2)) = 1;
-  RTX_FRAME_RELATED_P (XVECEXP (PATTERN (insn), 0, 1)) = 1;
+  if (aarch64_emit_cfi_for_reg_p (regno2))
+    RTX_FRAME_RELATED_P (XVECEXP (PATTERN (insn), 0, 2)) = 1;
+  if (aarch64_emit_cfi_for_reg_p (regno1))
+    RTX_FRAME_RELATED_P (XVECEXP (PATTERN (insn), 0, 1)) = 1;
   RTX_FRAME_RELATED_P (insn) = 1;
 }
 
@@ -9491,7 +9500,8 @@ aarch64_pop_regs (unsigned regno1, unsigned regno2, HOST_WIDE_INT adjustment,
   machine_mode mode = aarch64_reg_save_mode (regno1);
   rtx reg1 = gen_rtx_REG (mode, regno1);
 
-  *cfi_ops = alloc_reg_note (REG_CFA_RESTORE, reg1, *cfi_ops);
+  if (aarch64_emit_cfi_for_reg_p (regno1))
+    *cfi_ops = alloc_reg_note (REG_CFA_RESTORE, reg1, *cfi_ops);
 
   if (regno2 == INVALID_REGNUM)
     {
@@ -9502,7 +9512,8 @@ aarch64_pop_regs (unsigned regno1, unsigned regno2, HOST_WIDE_INT adjustment,
   else
     {
       rtx reg2 = gen_rtx_REG (mode, regno2);
-      *cfi_ops = alloc_reg_note (REG_CFA_RESTORE, reg2, *cfi_ops);
+      if (aarch64_emit_cfi_for_reg_p (regno2))
+	*cfi_ops = alloc_reg_note (REG_CFA_RESTORE, reg2, *cfi_ops);
       emit_insn (aarch64_gen_loadwb_pair (mode, stack_pointer_rtx, reg1,
 					  reg2, adjustment));
     }
@@ -9959,7 +9970,8 @@ aarch64_restore_callee_saves (poly_int64 bytes_below_sp,
 	  offset += GET_MODE_SIZE (mode);
 	  emit_insn (aarch64_gen_load_pair (reg, reg2, mem));
 
-	  *cfi_ops = alloc_reg_note (REG_CFA_RESTORE, reg2, *cfi_ops);
+	  if (aarch64_emit_cfi_for_reg_p (regno2))
+	    *cfi_ops = alloc_reg_note (REG_CFA_RESTORE, reg2, *cfi_ops);
 	  regno = regno2;
 	  ++i;
 	}
@@ -11206,7 +11218,9 @@ aarch64_expand_epilogue (rtx_call_insn *sibcall)
      defined in terms of the stack pointer since the end of the prologue.  */
   gcc_assert (cfi_ops || !frame_pointer_needed);
 
-  if (cfi_ops && (callee_adjust != 0 || maybe_gt (initial_adjust, 65536)))
+  /* The pop has to reset the CFA even if the popped registers need no
+     restore notes.  */
+  if (callee_adjust != 0 || (cfi_ops && maybe_gt (initial_adjust, 65536)))
     {
       /* Emit delayed restores and set the CFA to be SP + initial_adjust.  */
       insn = get_last_insn ();
