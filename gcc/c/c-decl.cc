@@ -34,6 +34,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "timevar.h"
 #include "stringpool.h"
 #include "cgraph.h"
+#include "tree-nested.h"
 #include "intl.h"
 #include "print-tree.h"
 #include "stor-layout.h"
@@ -11741,8 +11742,10 @@ finish_function (location_t end_loc)
 	{
 	  /* Register this function with cgraph just far enough to get it
 	    added to our parent's nested function list.  Handy, since the
-	    C front end doesn't have such a list.  */
-	  (void) cgraph_node::get_create (fndecl);
+	    C front end doesn't have such a list.  Note that the node can
+	    exist already without being on that list, since an attribute
+	    such as section creates it before pushdecl sets DECL_CONTEXT.  */
+	  maybe_record_nested_function (cgraph_node::get_create (fndecl));
 	}
     }
 
