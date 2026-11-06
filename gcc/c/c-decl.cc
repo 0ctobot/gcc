@@ -5763,6 +5763,27 @@ c_decl_attributes (tree *node, tree attributes, int flags)
 }
 
 
+/* Arrange for the size expression EXPR of a declaration to be evaluated.  It's
+   normally evaluated at this point, in the enclosing statement list.  Old-style
+   parameter declarations are parsed before the function has a statement list
+   and their sizes must be evaluated on entry to the function, so queue EXPR
+   with the sizes from a parameter list for store_parm_decls to emit.  */
+
+void
+add_size_expr (tree expr)
+{
+  expr = fold_convert (void_type_node, expr);
+  if (current_scope->parm_flag)
+    {
+      tree *pending = &current_function_arg_info->pending_sizes;
+      *pending = (*pending
+		  ? build2 (COMPOUND_EXPR, void_type_node, *pending, expr)
+		  : expr);
+    }
+  else
+    add_stmt (expr);
+}
+
 /* Decode a declarator in an ordinary declaration or data definition.
    This is called as soon as the type information and variable name
    have been parsed, before parsing the initializer if any.
@@ -5813,9 +5834,9 @@ start_decl (struct c_declarator *declarator, struct c_declspecs *declspecs,
     if (lastdecl != error_mark_node)
       *lastloc = DECL_SOURCE_LOCATION (lastdecl);
 
-  /* Make sure the size expression is evaluated at this point.  */
-  if (expr && !current_scope->parm_flag)
-    add_stmt (fold_convert (void_type_node, expr));
+  /* Make sure the size expression is evaluated.  */
+  if (expr)
+    add_size_expr (expr);
 
   if (TREE_CODE (decl) != FUNCTION_DECL && MAIN_NAME_P (DECL_NAME (decl))
       && TREE_PUBLIC (decl))
