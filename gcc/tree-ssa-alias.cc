@@ -266,7 +266,7 @@ ptr_deref_may_alias_auto_p (tree ptr)
    The caller is responsible for applying TBAA to see if PTR
    may access DECL at all.  */
 
-static bool
+bool
 ptr_deref_may_alias_decl_p (tree ptr, tree decl)
 {
   const pt_solution *pt;
