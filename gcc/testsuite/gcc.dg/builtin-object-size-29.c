@@ -41,6 +41,26 @@ index_other_member (struct s *b, long i)
 }
 
 __attribute__ ((noinline)) void
+walk_back_global (long n)
+{
+  struct s *e = tbl + 3;
+  while (n--)
+    e--;
+  char *p = e->name + 5;
+  CHECK (p, 19);
+}
+
+__attribute__ ((noinline)) void
+walk_back_param (struct s *b, long n)
+{
+  struct s *e = b + 3;
+  while (n--)
+    e--;
+  char *p = e->name + 5;
+  CHECK (p, 19);
+}
+
+__attribute__ ((noinline)) void
 from_header (char *buf, long n)
 {
   char *pos = buf + n;
@@ -55,6 +75,8 @@ main (void)
   index_global (v1);
   index_param (heap, v1);
   index_other_member (heap, v1);
+  walk_back_global (v1);
+  walk_back_param (heap, v1);
   from_header ((char *) heap, sizeof (struct s) * v1);
   return 0;
 }
