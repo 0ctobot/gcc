@@ -658,6 +658,95 @@ empty_eh_cleanup (basic_block bb, int *eh_has_tsan_func_exit, int cnt)
 static live_vars_map *live_vars;
 static vec<bitmap_head> live_vars_vec;
 
+/* Return true if the type of VAL isn't known to be smaller than a pointer.  */
+
+static bool
+value_as_wide_as_pointer_p (tree val)
+{
+  tree size = TYPE_SIZE (TREE_TYPE (val));
+  return !tree_fits_uhwi_p (size) || tree_to_uhwi (size) >= POINTER_SIZE;
+}
+
+/* Return true if VAL, whose type is smaller than a pointer, may hold a piece of
+   the address of the local variable VAR.  Such a value gets a piece of the
+   address by being computed from something holding all of it, so walk the
+   definitions leading to VAL looking for the address itself, a pointer that may
+   point to VAR, or a value that's as wide as a pointer.  Memory and the results
+   of calls can hold anything.  A parameter's value on entry cannot, since it
+   was computed before this frame existed, and neither can an uninitialized
+   variable.  Give up and say yes when the walk gets too long.  */
+
+static bool
+narrow_value_may_hold_address_p (tree val, tree var)
+{
+  auto_vec<tree, 16> worklist;
+  auto_bitmap visited;
+  unsigned int limit = param_ssa_name_def_chain_limit;
+
+  worklist.safe_push (val);
+  while (!worklist.is_empty ())
+    {
+      tree op = worklist.pop ();
+      if (CONSTANT_CLASS_P (op))
+	continue;
+
+      if (TREE_CODE (op) == ADDR_EXPR)
+	{
+	  tree base = get_base_address (TREE_OPERAND (op, 0));
+	  if (base == var
+	      || !base
+	      || (TREE_CODE (base) == MEM_REF
+		  && ptr_deref_may_alias_decl_p (TREE_OPERAND (base, 0), var)))
+	    return true;
+	  continue;
+	}
+
+      if (TREE_CODE (op) != SSA_NAME)
+	return true;
+
+      if (!bitmap_set_bit (visited, SSA_NAME_VERSION (op)))
+	continue;
+
+      if (!limit--)
+	return true;
+
+      if (SSA_NAME_IS_DEFAULT_DEF (op))
+	{
+	  tree name = SSA_NAME_VAR (op);
+	  if (name && (TREE_CODE (name) == PARM_DECL || VAR_P (name)))
+	    continue;
+	  return true;
+	}
+
+      if (POINTER_TYPE_P (TREE_TYPE (op)))
+	{
+	  if (ptr_deref_may_alias_decl_p (op, var))
+	    return true;
+	  continue;
+	}
+
+      if (value_as_wide_as_pointer_p (op))
+	return true;
+
+      gimple *def = SSA_NAME_DEF_STMT (op);
+      if (gphi *phi = dyn_cast <gphi *> (def))
+	{
+	  for (unsigned int i = 0; i < gimple_phi_num_args (phi); i++)
+	    worklist.safe_push (gimple_phi_arg_def (phi, i));
+	  continue;
+	}
+
+      /* Stop at anything reading memory, which a value with a VUSE does.  */
+      if (!is_gimple_assign (def) || gimple_vuse (def))
+	return true;
+
+      for (unsigned int i = 1; i < gimple_num_ops (def); i++)
+	if (tree rhs = gimple_op (def, i))
+	  worklist.safe_push (rhs);
+    }
+  return false;
+}
+
 /* Return true if the tail call CALL may be able to see the address of the local
    variable VAR, even if it never accesses VAR through that address.  The call
    starts on top of the frame holding VAR once it's a tail call, or reuses that
@@ -684,8 +773,12 @@ call_may_see_address_p (gcall *call, tree var)
 
       /* Points-to information only exists for pointers, so assume any other
 	 value that's large enough can hide an address.  */
-      return (!tree_fits_uhwi_p (TYPE_SIZE (type))
-	      || tree_to_uhwi (TYPE_SIZE (type)) >= POINTER_SIZE);
+      if (value_as_wide_as_pointer_p (val))
+	return true;
+
+      /* A smaller value can still carry a piece of one, so look at where it
+	 came from.  */
+      return narrow_value_may_hold_address_p (val, var);
     };
 
   for (unsigned int i = 0; i < gimple_call_num_args (call); i++)
