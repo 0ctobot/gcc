@@ -477,7 +477,7 @@ test7 (void)
   struct T { char buf[10]; char buf2[10]; } t;
   char *p = &t.buf2[-4];
   char *q = &t.buf2[0];
-  if (__builtin_object_size (p, 1) != 0)
+  if (__builtin_object_size (p, 1) != sizeof (t) - 6)
     FAIL ();
   if (__builtin_object_size (q, 1) != sizeof (t.buf2))
     FAIL ();
