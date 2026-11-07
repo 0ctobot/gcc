@@ -1542,6 +1542,58 @@ cheap_array_ref_low_bound (tree ref)
     return integer_zero_node;
 }
 
+/* Return true if the elements at the differing constant indices INDEX1 and
+   INDEX2 of arrays whose elements are SIZE bytes, or of an unknown size if
+   SIZE is null, may be far enough apart for their distance to wrap the
+   address.  With an 8-byte element, indices that are (1L << 61) + 1 apart
+   select neighboring elements.
+
+   This follows dr_dim_offset_may_wrap_p() in tree-data-ref.cc: the distance
+   in bytes is held below 1 << (precision - 2), and without a known SIZE, only
+   neighboring elements can be said not to wrap.  The indices are taken modulo
+   the precision of sizetype, the way the address computation converts them,
+   so indices that differ only by a multiple of that select the same
+   element.  */
+
+static bool
+array_index_distance_may_wrap_p (tree index1, tree index2, tree size)
+{
+  const unsigned int precision = TYPE_PRECISION (sizetype);
+  widest_int diff = wi::sext (wi::to_widest (index1) - wi::to_widest (index2),
+			      precision);
+  if (diff == 0)
+    return true;
+  if (!size || TREE_CODE (size) != INTEGER_CST)
+    return wi::gts_p (wi::abs (diff), 1);
+
+  widest_int bytes = wi::abs (diff * wi::to_widest (size));
+  return wi::min_precision (bytes, UNSIGNED) + 2 > precision;
+}
+
+/* Return true if the types of the indices INDEX1 and INDEX2 alone keep the
+   elements they select, of arrays with the same low bound whose elements are
+   SIZE bytes, too close together for their distance to wrap the address.
+
+   The address computation subtracts the low bound from an index in the type
+   of the index before it converts the result to sizetype, so each index
+   contributes a value of its own type.  Two values of types that are at most
+   P bits wide are less than 1 << (P + 1) apart, which is what holds the
+   distance in bytes below the bound of array_index_distance_may_wrap_p().
+   With int indices and 24-byte elements, that distance is less than 1 << 38
+   bytes.  */
+
+static bool
+array_index_types_keep_distance_p (tree index1, tree index2, tree size)
+{
+  if (!size || !tree_fits_uhwi_p (size))
+    return false;
+
+  unsigned int index_precision = MAX (TYPE_PRECISION (TREE_TYPE (index1)),
+				      TYPE_PRECISION (TREE_TYPE (index2)));
+  return (index_precision + 1 + ceil_log2 (tree_to_uhwi (size)) + 2
+	  <= TYPE_PRECISION (sizetype));
+}
+
 /* REF1 and REF2 are ARRAY_REFs with either same base address or which are
    completely disjoint.
 
@@ -1590,22 +1642,37 @@ nonoverlapping_array_refs_p (tree ref1, tree ref2)
 	return -1;
     }
 
-  /* Since we know that type sizes are the same, there is no need to return
-     -1 after this point. Partial overlap can not be introduced.  */
+  /* Since we know that type sizes are the same, the distance between the two
+     elements is a multiple of that size, so they either coincide or don't
+     overlap at all.  When pointers can wrap, that multiple is only known
+     modulo the size of the address space, which a size that isn't a power of
+     two doesn't divide.  Elements whose indices may differ can then overlap
+     partially, like those of a 24-byte type whose indices are
+     ((1L << 61) + 1) / 3 apart and 8 bytes apart in memory.  */
+  tree size = TREE_OPERAND (ref1, 3) ? NULL_TREE : TYPE_SIZE_UNIT (elmt_type1);
+  int overlap = flag_wrapv_pointer && !(size && integer_pow2p (size)) ? -1 : 0;
 
   /* We may need to fold trees in this case.
      TODO: Handle integer constant case at least.  */
   if (!operand_equal_p (low_bound1, low_bound2, 0))
-    return 0;
+    return overlap;
 
   if (TREE_CODE (index1) == INTEGER_CST && TREE_CODE (index2) == INTEGER_CST)
     {
       if (tree_int_cst_equal (index1, index2))
 	return 0;
+      if (flag_wrapv_pointer
+	  && array_index_distance_may_wrap_p (index1, index2, size))
+	return overlap;
       return 1;
     }
   /* TODO: We can use VRP to further disambiguate here. */
-  return 0;
+  if (operand_equal_p (index1, index2, 0))
+    return 0;
+  /* Indices of types like int can't be far enough apart to wrap.  */
+  if (overlap < 0 && array_index_types_keep_distance_p (index1, index2, size))
+    return 0;
+  return overlap;
 }
 
 /* Try to disambiguate REF1 and REF2 under the assumption that MATCH1 and
