@@ -843,10 +843,14 @@ only_branched_on_or_returned_p (tree name, bitmap visited)
    A result that's a pointer or that's only branched on doesn't expose the
    variable right away, since most such calls are a lookup or a check followed
    by an early return, and refusing every tail call in their callers would be
-   costly.  It's followed through REVEALED_NAMES instead.  */
+   costly.  It's followed through REVEALED_NAMES instead.  That's done for any
+   of ALL_VARS, including the ones already moved out of VARS, since a leaf
+   builtin doesn't care whether the address is exposed, only whether it can get
+   the address.  */
 
 static void
-mark_call_exposed_vars (gcall *stmt, vec<tree> &vars)
+mark_call_exposed_vars (gcall *stmt, vec<tree> &vars,
+			const vec<tree> &all_vars)
 {
   tree lhs = gimple_call_lhs (stmt);
   if (!lhs
@@ -866,7 +870,7 @@ mark_call_exposed_vars (gcall *stmt, vec<tree> &vars)
   auto mark_val = [&] (tree val)
     {
       if (follow_p)
-	mark_revealed_vars (val, lhs, vars);
+	mark_revealed_vars (val, lhs, all_vars);
       else
 	mark_exposed_vars (val, vars);
     };
@@ -1077,17 +1081,21 @@ compute_exposed_vars (void)
   for (var = DECL_ARGUMENTS (cfun->decl); var; var = DECL_CHAIN (var))
     if (may_be_aliased (var))
       vars.safe_push (var);
+  if (vars.is_empty ())
+    return;
+  auto_vec<tree> all_vars;
+  all_vars.safe_splice (vars);
 
   basic_block bb;
   FOR_EACH_BB_FN (bb, cfun)
-    for (gimple_stmt_iterator gsi = gsi_start_bb (bb);
-	 !gsi_end_p (gsi) && !vars.is_empty (); gsi_next (&gsi))
+    for (gimple_stmt_iterator gsi = gsi_start_bb (bb); !gsi_end_p (gsi);
+	 gsi_next (&gsi))
       {
 	gimple *stmt = gsi_stmt (gsi);
 	if (gassign *assign = dyn_cast <gassign *> (stmt))
 	  mark_assign_exposed_vars (assign, vars);
 	else if (gcall *call = dyn_cast <gcall *> (stmt))
-	  mark_call_exposed_vars (call, vars);
+	  mark_call_exposed_vars (call, vars, all_vars);
 	else if (gcond *cond = dyn_cast <gcond *> (stmt))
 	  {
 	    tree lhs = gimple_cond_lhs (cond), rhs = gimple_cond_rhs (cond);
@@ -1149,17 +1157,24 @@ call_may_see_address_p (gcall *call, tree var)
 /* Return true if the address of VAR, as learned from the result of an earlier
    call, may reach the tail call CALL.  That takes an operand depending on such
    a result that's as wide as a pointer, or memory depending on it that the
-   callee can read.  A value computed from what was available before the
-   earlier call, such as a parameter, isn't taken to carry the address unless
-   that result picked it, so tail calls following something like a failed
-   lookup stay.  This misses a lone guess of the address that the earlier call
-   merely confirmed, as well as a narrower piece of the address.  */
+   callee can read.  A value computed from what was available before the earlier
+   call, such as a parameter, isn't taken to carry the address unless that
+   result picked it, so tail calls following something like a failed lookup
+   stay.  A leaf builtin such as memcpy () runs none of our code and only
+   follows the operands it's handed, so for one of those an address left in
+   memory doesn't count, and a const one is left alone.  An integer operand such
+   as the length handed to memcpy () counts like a pointer, since it decides how
+   far past its pointer the builtin reads.  This misses a lone guess of the
+   address that the earlier call merely confirmed, as well as a narrower piece
+   of the address.  */
 
 static bool
 call_may_get_revealed_address_p (gcall *call, tree var)
 {
-  if (gimple_call_builtin_p (call, BUILT_IN_NORMAL)
-      && (gimple_call_flags (call) & ECF_LEAF))
+  int flags = gimple_call_flags (call);
+  bool leaf_builtin = (gimple_call_builtin_p (call, BUILT_IN_NORMAL)
+		       && (flags & ECF_LEAF));
+  if (leaf_builtin && (flags & ECF_CONST))
     return false;
 
   if (!exposed_vars)
@@ -1173,6 +1188,8 @@ call_may_get_revealed_address_p (gcall *call, tree var)
   FOR_EACH_SSA_TREE_OPERAND (use, call, iter, SSA_OP_ALL_USES)
     if (bitmap_bit_p (revealed_names, SSA_NAME_VERSION (use)))
       {
+	if (leaf_builtin && virtual_operand_p (use))
+	  continue;
 	tree size = TYPE_SIZE (TREE_TYPE (use));
 	if (virtual_operand_p (use)
 	    || !tree_fits_uhwi_p (size)
