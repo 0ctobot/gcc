@@ -6678,6 +6678,34 @@ type_or_builtin_type (tree expr, tree *bltin = NULL)
   return type;
 }
 
+/* Return the address, converted to PTR_TYPE, of a temporary holding the
+   value of OP, an operand at LOC of a conditional expression.  */
+
+static tree
+cond_operand_temp_addr (location_t loc, tree op, tree ptr_type)
+{
+  /* Fold OP now, since c_fully_fold won't look inside the TARGET_EXPR
+     holding it when the conditional expression is folded later.  */
+  op = c_fully_fold (op, false, NULL);
+  if (TREE_CODE (op) != TARGET_EXPR)
+    {
+      /* Copy OP the way c_finish_stmt_expr copies the value of a statement
+	 expression.  OP can be another such conditional expression, whose
+	 sizes aren't computed until one of its operands has run, and the
+	 gimplifier only waits for that before allocating the temporary when
+	 the temporary is assigned at the end of a BIND_EXPR.  */
+      tree type = TREE_TYPE (op);
+      tree tmp = create_tmp_var_raw (type);
+      tree body = build2 (MODIFY_EXPR, void_type_node, tmp, op);
+      SET_EXPR_LOCATION (body, loc);
+      body = build3 (BIND_EXPR, void_type_node, NULL_TREE, body, NULL_TREE);
+      TREE_SIDE_EFFECTS (body) = 1;
+      op = build4 (TARGET_EXPR, type, tmp, body, NULL_TREE, NULL_TREE);
+      TREE_SIDE_EFFECTS (op) = 1;
+    }
+  return fold_convert_loc (loc, ptr_type, build_fold_addr_expr_loc (loc, op));
+}
+
 /* Build and return a conditional expression IFEXP ? OP1 : OP2.  If
    IFEXP_BCP then the condition is a call to __builtin_constant_p, and
    if folded to an integer constant then the unselected half may
@@ -6696,6 +6724,9 @@ build_conditional_expr (location_t colon_loc, tree ifexp, bool ifexp_bcp,
   tree orig_op1 = op1, orig_op2 = op2;
   bool int_const, op1_int_operands, op2_int_operands, int_operands;
   bool ifexp_int_operands;
+  /* Whether to select between the addresses of the operands, rather than
+     their values.  */
+  bool by_ref = false;
   tree ret;
 
   op1_int_operands = EXPR_INT_CONST_OPERANDS (orig_op1);
@@ -7035,8 +7066,27 @@ build_conditional_expr (location_t colon_loc, tree ifexp, bool ifexp_bcp,
   else if (RECORD_OR_UNION_TYPE_P (type1) && RECORD_OR_UNION_TYPE_P (type2)
 	   && comptypes (TYPE_MAIN_VARIANT (type1),
 			 TYPE_MAIN_VARIANT (type2)))
-    result_type = composite_type (TYPE_MAIN_VARIANT (type1),
-				  TYPE_MAIN_VARIANT (type2));
+    {
+      tree t1 = TYPE_MAIN_VARIANT (type1);
+      tree t2 = TYPE_MAIN_VARIANT (type2);
+
+      /* Two declarations of a variably modified structure or union can
+	 have sizes that are only computed when the operand declaring it
+	 runs, as with two statement expressions that each declare it.
+	 Only the operand that the condition selects has its sizes
+	 computed, so take the sizes from that operand, as for pointers to
+	 variably modified types.  */
+      if (t1 != t2
+	  && (c_type_variably_modified_p (t1)
+	      || c_type_variably_modified_p (t2)))
+	{
+	  ifexp = save_expr (ifexp);
+	  result_type = composite_type_cond (t1, t2, ifexp);
+	  by_ref = C_TYPE_VARIABLE_SIZE (result_type);
+	}
+      else
+	result_type = composite_type (t1, t2);
+    }
 
   if (!result_type)
     {
@@ -7096,6 +7146,21 @@ build_conditional_expr (location_t colon_loc, tree ifexp, bool ifexp_bcp,
 
   if (int_const || (ifexp_bcp && TREE_CODE (ifexp) == INTEGER_CST))
     ret = fold_build3_loc (colon_loc, COND_EXPR, result_type, ifexp, op1, op2);
+  else if (by_ref)
+    {
+      /* The size of RESULT_TYPE depends on which operand runs, but the
+	 temporary holding the value of a conditional expression is
+	 allocated before either operand.  Give each operand a temporary of
+	 its own type instead, and select the address of one of them.  An
+	 operand that isn't already a temporary is copied, since the result
+	 is a value that mustn't change with the operand's object.  */
+      tree ptr_type = c_build_pointer_type (result_type);
+      op1 = cond_operand_temp_addr (op1_loc, op1, ptr_type);
+      op2 = cond_operand_temp_addr (op2_loc, op2, ptr_type);
+      ret = build3 (COND_EXPR, ptr_type, ifexp, op1, op2);
+      ret = build_indirect_ref (colon_loc, ret, RO_NULL);
+      ret = non_lvalue_loc (colon_loc, ret);
+    }
   else
     {
       if (int_operands)
