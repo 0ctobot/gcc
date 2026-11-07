@@ -5445,13 +5445,7 @@ cse_insn (rtx_insn *insn)
 		       || insn_nothrow_p (insn))
 		   /* We can only remove the later store if the earlier aliases
 		      at least all accesses the later one.  */
-		   && (!MEM_P (trial)
-		       || ((MEM_ALIAS_SET (dest) == MEM_ALIAS_SET (trial)
-			    || alias_set_subset_of (MEM_ALIAS_SET (dest),
-						    MEM_ALIAS_SET (trial)))
-			    && (!MEM_EXPR (trial)
-				|| refs_same_for_tbaa_p (MEM_EXPR (trial),
-							 MEM_EXPR (dest))))))
+		   && (!MEM_P (trial) || mems_same_for_tbaa_p (trial, dest)))
 	    {
 	      SET_SRC (sets[i].rtl) = trial;
 	      noop_insn = true;

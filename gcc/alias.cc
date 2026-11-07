@@ -365,15 +365,10 @@ refs_same_for_tbaa_p (tree earlier, tree later)
   ao_ref earlier_ref, later_ref;
   ao_ref_init (&earlier_ref, earlier);
   ao_ref_init (&later_ref, later);
-  alias_set_type earlier_set = ao_ref_alias_set (&earlier_ref);
-  alias_set_type later_set = ao_ref_alias_set (&later_ref);
-  if (!(earlier_set == later_set
-	|| alias_set_subset_of (later_set, earlier_set)))
-    return false;
-  alias_set_type later_base_set = ao_ref_base_alias_set (&later_ref);
-  alias_set_type earlier_base_set = ao_ref_base_alias_set (&earlier_ref);
-  return (earlier_base_set == later_base_set
-	  || alias_set_subset_of (later_base_set, earlier_base_set));
+  return alias_sets_cover_p (ao_ref_alias_set (&earlier_ref),
+			     ao_ref_base_alias_set (&earlier_ref),
+			     ao_ref_alias_set (&later_ref),
+			     ao_ref_base_alias_set (&later_ref));
 }
 
 /* Similar to refs_same_for_tbaa_p() but for use on MEM rtxs.  */
@@ -383,11 +378,19 @@ mems_same_for_tbaa_p (rtx earlier, rtx later)
   gcc_assert (MEM_P (earlier));
   gcc_assert (MEM_P (later));
 
-  return ((MEM_ALIAS_SET (earlier) == MEM_ALIAS_SET (later)
-	   || alias_set_subset_of (MEM_ALIAS_SET (later),
-				   MEM_ALIAS_SET (earlier)))
-	  && (!MEM_EXPR (earlier)
-	      || refs_same_for_tbaa_p (MEM_EXPR (earlier), MEM_EXPR (later))));
+  alias_set_type earlier_set = MEM_ALIAS_SET (earlier);
+  alias_set_type later_set = MEM_ALIAS_SET (later);
+
+  /* Without a MEM_EXPR there's no base alias set to limit an access with alias
+     set zero, which means a member with alias set zero in EARLIER_SET doesn't
+     cover it.  */
+  if (!MEM_EXPR (earlier))
+    return (earlier_set == later_set
+	    || alias_set_exact_subset_of (later_set, earlier_set));
+
+  /* refs_same_for_tbaa_p tests the base alias sets.  */
+  return (alias_sets_cover_p (earlier_set, 0, later_set, 0)
+	  && refs_same_for_tbaa_p (MEM_EXPR (earlier), MEM_EXPR (later)));
 }
 
 /* Returns a pointer to the alias set entry for ALIAS_SET, if there is
@@ -410,10 +413,12 @@ mems_in_disjoint_alias_sets_p (const_rtx mem1, const_rtx mem2)
 				      MEM_ALIAS_SET (mem2)));
 }
 
-/* Return true if the first alias set is a subset of the second.  */
+/* Return true if the first alias set is a subset of the second, going only by
+   the children recorded for the second.  A member with alias set zero doesn't
+   stand in for every other set here, which matches alias_sets_conflict_p.  */
 
 bool
-alias_set_subset_of (alias_set_type set1, alias_set_type set2)
+alias_set_exact_subset_of (alias_set_type set1, alias_set_type set2)
 {
   alias_set_entry *ase2;
 
@@ -428,8 +433,7 @@ alias_set_subset_of (alias_set_type set1, alias_set_type set2)
   /* Check if set1 is a subset of set2.  */
   ase2 = get_alias_set_entry (set2);
   if (ase2 != 0
-      && (ase2->has_zero_child
-	  || (ase2->children && ase2->children->get (set1))))
+      && ase2->children && ase2->children->get (set1))
     return true;
 
   /* As a special case we consider alias set of "void *" to be both subset
@@ -472,6 +476,48 @@ alias_set_subset_of (alias_set_type set1, alias_set_type set2)
 	}
     }
   return false;
+}
+
+/* Return true if the first alias set is a subset of the second, or if the
+   second has a member with alias set zero.  This is the conservative answer to
+   whether an object with the second set may hold one with the first.  Removing
+   an access in favor of another needs alias_sets_cover_p instead.  */
+
+bool
+alias_set_subset_of (alias_set_type set1, alias_set_type set2)
+{
+  if (alias_set_exact_subset_of (set1, set2))
+    return true;
+
+  alias_set_entry *ase2 = get_alias_set_entry (set2);
+  return ase2 != 0 && ase2->has_zero_child;
+}
+
+/* Return true if an access with alias set EARLIER_SET and base alias set
+   EARLIER_BASE_SET conflicts with everything that an access with alias set SET
+   and base alias set BASE_SET conflicts with.  An access can only be removed or
+   replaced in favor of an earlier one when this holds, since anything that had
+   to see the removed access would otherwise get disambiguated from the one left
+   behind.
+
+   A member with alias set zero says nothing about base sets, because
+   alias_sets_conflict_p doesn't look at it.  Accesses to the char members of
+   two unrelated structs get disambiguated through their base sets despite both
+   structs having such a member.  The exception is a reference with alias set
+   zero under an earlier reference whose set has such a member, since that's an
+   access to the member and its own base set still gets tested.  */
+
+bool
+alias_sets_cover_p (alias_set_type earlier_set, alias_set_type earlier_base_set,
+		    alias_set_type set, alias_set_type base_set)
+{
+  if (earlier_set != set
+      && !alias_set_exact_subset_of (set, earlier_set)
+      && !(set == 0 && alias_set_subset_of (0, earlier_set)))
+    return false;
+
+  return (earlier_base_set == base_set
+	  || alias_set_exact_subset_of (base_set, earlier_base_set));
 }
 
 /* Return true if the two specified alias sets may conflict.  */
