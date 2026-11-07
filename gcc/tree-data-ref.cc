@@ -3619,8 +3619,69 @@ dr_dim_scale (tree ref, const vec<tree> &access_fns, unsigned int dim,
   return NULL_TREE;
 }
 
-/* Return true if a constant step of the access function FN, whose unit is SCALE
-   bytes, may wrap the address.
+/* Return true if value ranges bound the step of the access function CHREC when
+   it isn't constant, storing the largest magnitude it can have in *MAG and
+   whether it can't be zero in *NONZERO_P.  The step doesn't change in the loop
+   of CHREC, so it gets the range it has on the loop's preheader edge, which
+   takes the conditions guarding the loop into account.  An unsigned step is
+   read as a signed value, like a constant one is.  */
+
+static bool
+dr_step_bounds (tree chrec, widest_int *mag, bool *nonzero_p)
+{
+  tree step = CHREC_RIGHT (chrec);
+  tree type = TREE_TYPE (step);
+  if (!INTEGRAL_TYPE_P (type) || !cfun)
+    return false;
+
+  int_range_max r;
+  range_query *query = get_range_query (cfun);
+  class loop *loop = (current_loops
+		      ? get_loop (cfun, CHREC_VARIABLE (chrec)) : NULL);
+  bool known;
+  if (loop
+      && loops_state_satisfies_p (LOOPS_HAVE_PREHEADERS)
+      && !loops_state_satisfies_p (LOOPS_MAY_HAVE_MULTIPLE_LATCHES))
+    known = query->range_on_edge (r, loop_preheader_edge (loop), step);
+  else
+    known = query->range_of_expr (r, step);
+  if (!known || r.undefined_p ())
+    return false;
+  if (TYPE_UNSIGNED (type))
+    {
+      range_cast (r, signed_type_for (type));
+      if (r.undefined_p ())
+	return false;
+    }
+  *mag = wi::smax (wi::abs (widest_int::from (r.lower_bound (), SIGNED)),
+		   wi::abs (widest_int::from (r.upper_bound (), SIGNED)));
+  *nonzero_p = !r.contains_p (wi::zero (TYPE_PRECISION (r.type ())));
+  return true;
+}
+
+/* Return true if a step of a dimension whose access functions are the same in
+   two references may make that dimension select the same element in two
+   different iterations, which is the case for a step that isn't constant and
+   may be zero.  The subscript tests take the references to meet in the same
+   iteration only, which a zero step makes false.  */
+
+static bool
+dr_same_dim_step_may_be_zero_p (tree fn)
+{
+  for (; TREE_CODE (fn) == POLYNOMIAL_CHREC; fn = CHREC_LEFT (fn))
+    {
+      tree step = CHREC_RIGHT (fn);
+      widest_int mag;
+      bool nonzero_p;
+      if (TREE_CODE (step) != INTEGER_CST
+	  && (!dr_step_bounds (fn, &mag, &nonzero_p) || !nonzero_p))
+	return true;
+    }
+  return false;
+}
+
+/* Return true if a step of the access function FN, whose unit is SCALE bytes,
+   may wrap the address.
 
    The access functions count elements, whereas the address moves by the step
    times the size of an element modulo the size of the address space.  What the
@@ -3631,11 +3692,13 @@ dr_dim_scale (tree ref, const vec<tree> &access_fns, unsigned int dim,
    truncated, and it's held to the limit that dr_classify_stride uses to stay
    below wrapping within 1 << 16 steps.
 
-   A step that isn't constant is left alone since the subscript tests don't get
-   a proof out of it in the first place.  */
+   A step that isn't constant only gets checked when VARIABLE_P is true, which
+   the caller sets for a dimension whose access functions are the same in both
+   references.  That's the only place the subscript tests get a proof out of
+   such a step, and value ranges then have to bound it like a constant one.  */
 
 static bool
-dr_dim_stride_may_wrap_p (tree fn, tree scale)
+dr_dim_stride_may_wrap_p (tree fn, tree scale, bool variable_p)
 {
   const unsigned int lanes_log2 = 16;
   const unsigned int precision = TYPE_PRECISION (sizetype);
@@ -3643,20 +3706,24 @@ dr_dim_stride_may_wrap_p (tree fn, tree scale)
   for (; TREE_CODE (fn) == POLYNOMIAL_CHREC; fn = CHREC_LEFT (fn))
     {
       tree step = CHREC_RIGHT (fn);
-      if (TREE_CODE (step) != INTEGER_CST)
+      widest_int mag;
+      bool nonzero_p;
+      if (TREE_CODE (step) == INTEGER_CST)
+	mag = wi::abs (widest_int::from (wi::to_wide (step), SIGNED));
+      else if (!variable_p)
 	continue;
+      else if (!dr_step_bounds (fn, &mag, &nonzero_p))
+	return true;
       /* Moving by a single element of an array can't wrap by itself.  Without a
 	 known size, nothing else can be said about a step.  */
       if (TREE_CODE (scale) != INTEGER_CST)
 	{
-	  if (!integer_onep (step) && !integer_minus_onep (step))
+	  if (wi::gtu_p (mag, 1))
 	    return true;
 	  continue;
 	}
-      widest_int stride = (widest_int::from (wi::to_wide (step), SIGNED)
-			   * wi::to_widest (scale));
-      if (wi::min_precision (wi::abs (stride), UNSIGNED) + lanes_log2 + 2
-	  > precision)
+      widest_int stride = mag * wi::to_widest (scale);
+      if (wi::min_precision (stride, UNSIGNED) + lanes_log2 + 2 > precision)
 	return true;
     }
   return false;
@@ -3707,10 +3774,10 @@ dr_dim_offset_may_wrap_p (tree fn_a, tree fn_b, tree scale)
    aliasing isn't in effect, since a stride smaller than the object then just
    makes the objects of different iterations overlap, or when pointers can wrap,
    since a stride of sizeof (struct) * K can wrap around to any smaller
-   value.  When pointers can wrap, each of the LENGTH dimensions whose access
-   functions differ also needs steps that can't wrap and initial values that
-   aren't far enough apart to wrap, since otherwise what the subscript tests say
-   about its elements doesn't hold for their addresses.  */
+   value.  When pointers can wrap, each of the LENGTH dimensions also needs steps
+   that can't wrap, and each one whose access functions differ also needs
+   initial values that aren't far enough apart to wrap, since otherwise what the
+   subscript tests say about its elements doesn't hold for their addresses.  */
 
 static bool
 dr_access_fns_separate_p (struct data_reference *a, struct data_reference *b,
@@ -3726,30 +3793,40 @@ dr_access_fns_separate_p (struct data_reference *a, struct data_reference *b,
     if (!eq_evolutions_p (indices_a->access_fns[start_a + i],
 			  indices_b->access_fns[start_b + i]))
       break;
-  if (i == length)
-    return true;
 
   /* The subscript tests can prove independence from any of these dimensions,
-     not just the innermost one that differs.  */
+     not just the innermost one that differs.  That includes a dimension whose
+     access functions are the same, from which they take two iterations to
+     select the same element only if they're the same iteration.  That only
+     holds for the addresses if the step can't wrap: with rows of four longs,
+     f->d[(1L << 59) * j] is the same row for every J.  That goes for a step
+     that's only known at run time too, unless all of the dimensions are the
+     same, in which case the vectorizer checks at run time that the step can't
+     bring two lanes to the same address.  */
   if (flag_wrapv_pointer)
-    for (unsigned int j = i; j < length; ++j)
+    for (unsigned int j = 0; j < length; ++j)
       {
 	tree fn_a = indices_a->access_fns[start_a + j];
 	tree fn_b = indices_b->access_fns[start_b + j];
-	if (eq_evolutions_p (fn_a, fn_b))
-	  continue;
+	bool same_p = j < i || eq_evolutions_p (fn_a, fn_b);
+	bool variable_p = same_p && i < length;
 	tree scale_a = dr_dim_scale (DR_REF (a), indices_a->access_fns,
 				     start_a + j, indices_a->unconstrained_base);
 	tree scale_b = dr_dim_scale (DR_REF (b), indices_b->access_fns,
 				     start_b + j, indices_b->unconstrained_base);
 	if ((scale_a
-	     && (dr_dim_stride_may_wrap_p (fn_a, scale_a)
-		 || dr_dim_offset_may_wrap_p (fn_a, fn_b, scale_a)))
+	     && (dr_dim_stride_may_wrap_p (fn_a, scale_a, variable_p)
+		 || (!same_p
+		     && dr_dim_offset_may_wrap_p (fn_a, fn_b, scale_a))))
 	    || (scale_b
-		&& (dr_dim_stride_may_wrap_p (fn_b, scale_b)
-		    || dr_dim_offset_may_wrap_p (fn_a, fn_b, scale_b))))
+		&& (dr_dim_stride_may_wrap_p (fn_b, scale_b, variable_p)
+		    || (!same_p
+			&& dr_dim_offset_may_wrap_p (fn_a, fn_b, scale_b)))))
 	  return false;
       }
+
+  if (i == length)
+    return true;
 
   /* The decision is about the two references together, so that each dimension
      from there outwards needs one rule that both of them satisfy.  */
@@ -5697,6 +5774,9 @@ analyze_miv_subscript (tree chrec_a,
    Remark: For an integer k >= 0, the following equality is true:
 
    CHREC_A (OVERLAP_ITERATIONS_A (k)) == CHREC_B (OVERLAP_ITERATIONS_B (k)).
+
+   ALL_SAME_P says whether every subscript of the dependence relation has the
+   same access functions in both references.
 */
 
 static void
@@ -5704,7 +5784,8 @@ analyze_overlapping_iterations (tree chrec_a,
 				tree chrec_b,
 				conflict_function **overlap_iterations_a,
 				conflict_function **overlap_iterations_b,
-				tree *last_conflicts, class loop *loop_nest)
+				tree *last_conflicts, class loop *loop_nest,
+				bool all_same_p)
 {
   unsigned int lnn = loop_nest->num;
 
@@ -5727,6 +5808,21 @@ analyze_overlapping_iterations (tree chrec_a,
     {
       dependence_stats.num_subscript_undetermined++;
 
+      *overlap_iterations_a = conflict_fn_not_known ();
+      *overlap_iterations_b = conflict_fn_not_known ();
+    }
+
+  /* Two of the same chrec that are affine overlap in the same iteration, but
+     with a step that may be zero, they overlap in every pair of iterations.
+     The distance of zero would then conflict with what another subscript
+     says, which proves nothing.  When every subscript is the same, a zero
+     distance is all there is, and it's up to the user of the relation to
+     deal with a zero step, like the vectorizer does with a run-time check.  */
+  else if (!all_same_p
+	   && eq_evolutions_p (chrec_a, chrec_b)
+	   && dr_same_dim_step_may_be_zero_p (chrec_a))
+    {
+      dependence_stats.num_subscript_undetermined++;
       *overlap_iterations_a = conflict_fn_not_known ();
       *overlap_iterations_b = conflict_fn_not_known ();
     }
@@ -6300,6 +6396,15 @@ subscript_dependence_tester_1 (struct data_dependence_relation *ddr,
   tree last_conflicts;
   struct subscript *subscript;
   tree res = NULL_TREE;
+  bool all_same_p = true;
+
+  for (i = 0; DDR_SUBSCRIPTS (ddr).iterate (i, &subscript); i++)
+    if (!eq_evolutions_p (SUB_ACCESS_FN (subscript, a_index),
+			  SUB_ACCESS_FN (subscript, b_index)))
+      {
+	all_same_p = false;
+	break;
+      }
 
   for (i = 0; DDR_SUBSCRIPTS (ddr).iterate (i, &subscript); i++)
     {
@@ -6308,7 +6413,7 @@ subscript_dependence_tester_1 (struct data_dependence_relation *ddr,
       analyze_overlapping_iterations (SUB_ACCESS_FN (subscript, a_index),
 				      SUB_ACCESS_FN (subscript, b_index),
 				      &overlaps_a, &overlaps_b,
-				      &last_conflicts, loop_nest);
+				      &last_conflicts, loop_nest, all_same_p);
 
       if (SUB_CONFLICTS_IN_A (subscript))
 	free_conflict_function (SUB_CONFLICTS_IN_A (subscript));
