@@ -2475,7 +2475,24 @@ struct reinit_read_walk
 {
   tree decl;
   hash_set<tree> visited;
+  /* The labels in the initializer, and the artificial labels it jumps to that
+     can be in the block of the variable.  */
+  hash_set<tree> labels;
+  auto_vec<tree> jumps;
 };
+
+/* Return true if LABEL, an artificial label, comes after the end of the block
+   of DECL, so that a jump to it ends the lifetime of DECL.  */
+
+static bool
+reinit_label_past_block_p (tree decl, tree label)
+{
+  if (!reinit_bounds)
+    return false;
+  unsigned *end = reinit_bounds->get (decl);
+  unsigned *place = reinit_bounds->get (label);
+  return end && place && *place > *end;
+}
 
 /* Callback for walk_tree from reinit_needs_tmp_p.  DATA is the walk state.
    Find what can make the old value of the variable visible while its
@@ -2502,11 +2519,23 @@ find_reinit_read_r (tree *tp, int *, void *data)
   switch (TREE_CODE (t))
     {
     case GOTO_EXPR:
-      /* An artificial label is the control flow of something like a loop, and
-	 a break out of the initializer leaves the block of the variable.  */
+      /* An artificial label is the control flow of something like a loop.
+	 A break out of the initializer usually leaves the block of the
+	 variable, but not in C90 when the initializer is that of a compound
+	 literal in the body of a loop or a switch, since the body isn't a
+	 block there and the literal belongs to the block around the loop or
+	 the switch.  A label in the initializer itself, like one of a loop in
+	 a statement expression, doesn't abandon it, which only shows once the
+	 walk has seen all the labels of the initializer.  */
       if (TREE_CODE (GOTO_DESTINATION (t)) != LABEL_DECL
 	  || !DECL_ARTIFICIAL (GOTO_DESTINATION (t)))
 	return t;
+      if (!reinit_label_past_block_p (w->decl, GOTO_DESTINATION (t)))
+	w->jumps.safe_push (GOTO_DESTINATION (t));
+      break;
+
+    case LABEL_EXPR:
+      w->labels.add (LABEL_EXPR_LABEL (t));
       break;
 
     case ASM_EXPR:
@@ -2573,7 +2602,12 @@ reinit_needs_tmp_p (tree decl, tree val)
 
   reinit_read_walk w;
   w.decl = decl;
-  return walk_tree (&val, find_reinit_read_r, &w, &w.visited) != NULL_TREE;
+  if (walk_tree (&val, find_reinit_read_r, &w, &w.visited))
+    return true;
+  for (tree label : w.jumps)
+    if (!w.labels.contains (label))
+      return true;
+  return false;
 }
 
 /* Callback for walk_gimple_seq from reinit_zero_padding_p.  */
@@ -2792,9 +2826,10 @@ gimplify_decl_expr (tree *stmt_p, gimple_seq *seq_p)
 		 the address of DECL.  Only a user label before the declaration
 		 with a jump back from further down, or a loop around a compound
 		 literal in the loop's own condition or increment allows this,
-		 since a loop body is a block of its own.  The read takes a DECL
-		 with its address taken, or one that a nested function reads
-		 through its static chain.  */
+		 since a loop body is a block of its own.  In C90 it isn't, so a
+		 compound literal in the body of a loop counts too.  The read
+		 takes a DECL with its address taken, or one that a nested
+		 function reads through its static chain.  */
 	      tree old_reinit_decl = gimplify_ctxp->reinit_decl;
 	      bool clear_padding = false;
 	      gimplify_ctxp->reinit_decl = NULL_TREE;
@@ -22978,26 +23013,29 @@ find_back_jump_labels_r (tree *tp, int *walk_subtrees, void *data)
 /* Record in PLACES where the variables with an initializer in FNDECL are, and
    where the last jump is to each label that a jump can come back to from
    further down, as numbers that grow in the order those get gimplified.
-   Running the initializer of a declaration again within its lifetime takes a
-   jump from its statement or below to a label above it.  That can be the jump
-   back of a loop to its artificial label, since a compound literal in the
-   condition or the increment of a loop belongs to the block of the iteration
-   statement, and that block holds both the label and the jump.  Nothing else
-   can go up without leaving the block of the variable, since a loop around a
-   declaration, or around a compound literal in its body, has that block inside
-   of it.  A label above a declaration thus only counts for that declaration if
-   the last jump to the label comes later than the declaration, which leaves out
-   a retry loop above it.  The usual forward goto to a label at the end of a
-   block can't run anything twice.  Return true if FNDECL has a computed goto,
-   which can go back to any user label with its address taken, since every user
-   label has to count then.  Only taking the address doesn't make a label a
-   target, as in the kernel's _THIS_IP_.  Record in BOUNDS where each label is
-   and where the block of each variable with an initializer ends, in the same
-   numbering.  Record in BYPASS where the named variables with an initializer
-   are and where each jump comes from, with a case label jumped to from its
-   switch.  A computed goto can reach any label with its address taken, and a
-   nested function can jump to any label that it inherits from FNDECL, so every
-   user label gets jumped to from outside of every block then.  */
+   Record in BOUNDS where each label is and where the block of each variable
+   with an initializer ends, in the same numbering.  Running the initializer of
+   a declaration again within its lifetime takes a jump from its statement or
+   below to a label above it.  That can be the jump back of a loop to its
+   artificial label, since a compound literal in the condition or the increment
+   of a loop belongs to the block of the iteration statement, and that block
+   holds both the label and the jump.  In C90 neither the iteration statement
+   nor its body is a block, so the block around the loop holds the label and
+   the jump for a compound literal in the body as well.  Nothing else can go up
+   without leaving the block of the variable, since a loop around a
+   declaration, or around a compound literal in a body that is a block, has
+   that block inside of it.  A label above a declaration thus only counts for
+   that declaration if the last jump to the label comes later than the
+   declaration, which leaves out a retry loop above it.  The usual forward goto
+   to a label at the end of a block can't run anything twice.  Return true if
+   FNDECL has a computed goto, which can go back to any user label with its
+   address taken, since every user label has to count then.  Only taking the
+   address doesn't make a label a target, as in the Linux kernel's _THIS_IP_.
+   Record in BYPASS where the named variables with an initializer are and where
+   each jump comes from, with a case label jumped to from its switch.  A
+   computed goto can reach any label with its address taken, and a nested
+   function can jump to any label that it inherits from FNDECL, so every user
+   label gets jumped to from outside of every block then.  */
 
 static bool
 find_back_jump_labels (tree fndecl, hash_map<tree, unsigned> *places,
