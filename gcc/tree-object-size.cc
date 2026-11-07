@@ -39,6 +39,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "gimplify-me.h"
 #include "gimplify.h"
 #include "tree-ssa-dce.h"
+#include "gimple-range.h"
 
 struct object_size_info
 {
@@ -72,6 +73,7 @@ static bool plus_stmt_object_size (struct object_size_info *, tree, gimple *);
 static bool object_size_variable_offset_p (tree, bool = false);
 static bool object_size_may_step_back_p (tree);
 static bool object_size_step_returns_p (tree, tree, tree);
+static bool object_size_offset_steps_back_p (tree, bool);
 static bool cond_expr_object_size (struct object_size_info *, tree, gimple *);
 static void init_offset_limit (void);
 static void check_for_plus_in_loops (struct object_size_info *, tree);
@@ -109,6 +111,18 @@ static bool object_sizes_early;
    those repeat.  */
 static bitmap step_repeats_known;
 static bitmap step_repeats;
+
+/* The statement computing the address whose size the objsz pass is working out
+   for one of its calls, or NULL at any other time.  An index in that address
+   only needs to be in the range it has at this statement.  */
+static gimple *object_size_stmt;
+
+/* A ranger to look up indexes at OBJECT_SIZE_STMT, created on first use and
+   kept until the pass is done with the function.  The pass only replaces the
+   result of an object size call with a value that the call could have returned
+   and folds the statements using it, so a range cached before that still
+   covers every value the index can have afterwards.  */
+static gimple_ranger *object_size_ranger;
 
 /* Return true if VAL represents an initial size for OBJECT_SIZE_TYPE.  */
 
@@ -793,6 +807,86 @@ object_size_index_below_p (tree var, const_tree pt_var)
   return false;
 }
 
+/* Return true if the range of the index IDX shows that it isn't negative as an
+   offset.  An unsigned index as wide as an offset is negative as one when its
+   top bit is set.  An index wider than an offset is truncated to one, which
+   can turn it negative whatever its sign, unless its range fits in the
+   non-negative half of an offset.  The objsz pass looks up the range at the
+   statement computing the address, where it also reflects the conditions that
+   statement is under, such as a bounds check on the index.  Elsewhere only the
+   range that IDX has everywhere is known.  */
+
+static bool
+object_size_index_nonnegative_p (tree idx)
+{
+  tree type = TREE_TYPE (idx);
+  if (!INTEGRAL_TYPE_P (type))
+    return false;
+
+  wide_int lo, hi;
+  if (TREE_CODE (idx) == INTEGER_CST)
+    lo = hi = wi::to_wide (idx);
+  else if (TREE_CODE (idx) == SSA_NAME)
+    {
+      int_range_max r;
+      bool known;
+      if (object_size_stmt)
+	{
+	  if (!object_size_ranger)
+	    object_size_ranger = new gimple_ranger;
+	  known = object_size_ranger->range_of_expr (r, idx, object_size_stmt);
+	}
+      else
+	known = get_range_query (cfun)->range_of_expr (r, idx);
+      if (!known || r.undefined_p ())
+	return false;
+      lo = r.lower_bound ();
+      hi = r.upper_bound ();
+    }
+  else
+    return false;
+
+  if (TYPE_PRECISION (type) > TYPE_PRECISION (sizetype))
+    return (!wi::neg_p (lo, TYPE_SIGN (type))
+	    && wi::le_p (hi, wi::uhwi (offset_limit, TYPE_PRECISION (type)),
+			 TYPE_SIGN (type)));
+  if (TYPE_UNSIGNED (type))
+    return !wi::neg_p (hi, SIGNED);
+  return !wi::neg_p (lo, SIGNED);
+}
+
+/* Return true if an index on the way from REF down to VAR may take the address
+   below the start of VAR at run time.  An index of an unsigned type narrower
+   than an offset can't, since it's zero extended, and neither can an index
+   whose range shows it isn't negative.  The way an index is computed only
+   tells that much when it's built from values that can't be negative, which
+   leaves out an ordinary int index that a condition or a loop bound keeps from
+   going negative.  It tells nothing about an index wider than an offset, since
+   even an unsigned one can turn negative when it's truncated to an offset.  */
+
+static bool
+object_size_index_may_go_below_p (tree ref, const_tree var)
+{
+  for (tree v = ref; v != var && handled_component_p (v);
+       v = TREE_OPERAND (v, 0))
+    if (TREE_CODE (v) == ARRAY_REF)
+      {
+	tree idx = TREE_OPERAND (v, 1);
+	tree type = TREE_TYPE (idx);
+	if (!integer_zerop (array_ref_low_bound (v)))
+	  return true;
+	if (INTEGRAL_TYPE_P (type)
+	    && TYPE_UNSIGNED (type)
+	    && TYPE_PRECISION (type) < TYPE_PRECISION (sizetype))
+	  continue;
+	if ((TYPE_PRECISION (type) > TYPE_PRECISION (sizetype)
+	     || object_size_offset_steps_back_p (idx, false))
+	    && !object_size_index_nonnegative_p (idx))
+	  return true;
+      }
+  return false;
+}
+
 /* Compute __builtin_object_size for PTR, which is a ADDR_EXPR.
    OBJECT_SIZE_TYPE is the second argument from __builtin_object_size.
    If unknown, return size_unknown (object_size_type).  */
@@ -1047,46 +1141,117 @@ addr_object_size (struct object_size_info *osi, const_tree ptr,
 	return false;
       else
 	var_size = pt_var_size;
-      bytes = compute_object_offset (TREE_OPERAND (ptr, 0), var);
-      if (bytes != error_mark_node)
+      /* Compute what's left from PTR in V, which is VAR or PT_VAR, of size
+	 VSIZE.  */
+      auto size_from = [&] (tree v, tree vsize)
 	{
-	  /* An index can also go below what a MEM_REF's pointer points to, which
-	     may be the middle of an object.  Work out the net offset from the
-	     whole object, going easy on a static maximum that may have been
-	     overestimated, the same as for the MEM_REF's own offset above.  */
-	  if (var == pt_var
+	  tree off = compute_object_offset (TREE_OPERAND (ptr, 0), v);
+	  if (off == error_mark_node)
+	    return size_unknown (object_size_type);
+
+	  /* An index can also go below what a MEM_REF's pointer points to,
+	     which may be the middle of an object.  Work out the net offset
+	     from the whole object, going easy on a static maximum that may
+	     have been overestimated, the same as for the MEM_REF's own offset
+	     above.  A dynamic size does so for any offset that isn't
+	     constant, since it may turn out to be negative only at run time,
+	     and the net offset gives the same size for one that doesn't.  */
+	  tree sz;
+	  if (v == pt_var
 	      && TREE_CODE (pt_var) == MEM_REF
 	      && !(object_size_type & OST_MINIMUM)
-	      && object_size_negative_offset_p (bytes))
+	      && (object_size_negative_offset_p (off)
+		  || ((object_size_type & OST_DYNAMIC)
+		      && TREE_CODE (off) != INTEGER_CST)))
 	    {
 	      tree base = TREE_OPERAND (pt_var, 0);
 	      bool strict = ((object_size_type & OST_DYNAMIC)
 			     || (!object_size_merged_p (base)
 				 && !object_size_variable_offset_p (base)));
-	      bytes = size_for_offset (var_size, bytes,
-				       wholesize_for_offset (base,
-							     pt_var_wholesize,
-							     object_size_type),
-				       strict);
+	      sz = size_for_offset (vsize, off,
+				    wholesize_for_offset (base,
+							  pt_var_wholesize,
+							  object_size_type),
+				    strict);
 	    }
 	  else
-	    bytes = size_for_offset (var_size, bytes);
-	  if (var != pt_var && pt_var_size && TREE_CODE (pt_var) == MEM_REF)
+	    sz = size_for_offset (vsize, off);
+	  if (v != pt_var && pt_var_size && TREE_CODE (pt_var) == MEM_REF)
 	    {
-	      tree bytes2 = compute_object_offset (TREE_OPERAND (ptr, 0),
-						   pt_var);
-	      if (bytes2 != error_mark_node)
+	      tree sz2 = compute_object_offset (TREE_OPERAND (ptr, 0), pt_var);
+	      if (sz2 != error_mark_node)
 		{
-		  bytes2 = size_for_offset (pt_var_size, bytes2);
-		  bytes = size_binop (MIN_EXPR, bytes, bytes2);
+		  sz2 = size_for_offset (pt_var_size, sz2);
+		  sz = size_binop (MIN_EXPR, sz, sz2);
 		}
 	    }
-	}
-      else
-	bytes = size_unknown (object_size_type);
+	  return sz;
+	};
 
+      bytes = size_from (var, var_size);
       wholebytes
 	= object_size_type & OST_SUBOBJECT ? var_size : pt_var_wholesize;
+
+      /* A variable index can leave the subobject the same way a constant index
+	 below its start does above, only at run time, so a dynamic size checks
+	 the offset from the subobject then.  If that offset is negative, the
+	 size is what's left in the enclosing object as it is for a constant
+	 offset.  When the size of that object isn't known, the size is one
+	 that no later offset can make too small, as described below.  */
+      if (var != pt_var
+	  && (object_size_type & OST_DYNAMIC)
+	  && !(object_size_type & OST_MINIMUM)
+	  && !size_unknown_p (bytes, object_size_type))
+	{
+	  tree off = compute_object_offset (TREE_OPERAND (ptr, 0), var);
+	  if (off != error_mark_node
+	      && TREE_CODE (off) != INTEGER_CST
+	      && object_size_index_may_go_below_p (TREE_OPERAND (ptr, 0), var))
+	    {
+	      tree below = fold_build2 (GT_EXPR, boolean_type_node,
+					fold_convert (sizetype, off),
+					build_int_cstu (sizetype,
+							offset_limit));
+	      tree whole = (pt_var_size
+			    ? size_from (pt_var, pt_var_size)
+			    : size_unknown (object_size_type));
+	      if (!size_unknown_p (whole, object_size_type))
+		{
+		  bytes = fold_build3 (COND_EXPR, sizetype, below, whole,
+				       bytes);
+		  wholebytes = fold_build3 (COND_EXPR, sizetype,
+					    unshare_expr (below),
+					    unshare_expr (pt_var_size),
+					    wholebytes);
+		}
+	      /* Behind a pointer whose object isn't known, as in
+		 &p->a[2].x[n], a negative index leaves nothing that bounds the
+		 pointer, so the size has to be unknown then, and stay unknown
+		 through later offsets.  A later offset works out
+		 MAX (WHOLE, SIZE) + OFF - SIZE, which turns a size and whole
+		 size of (size_t) -1 into a tiny size for a negative OFF.  A
+		 negative index therefore gives a size of offset_limit in a
+		 whole size of (size_t) -1 instead, which puts the pointer in
+		 the middle of an object of unlimited size, where any valid
+		 offset still leaves more than any object can have.  A
+		 non-negative index keeps the member's size, which is never
+		 above offset_limit, so the larger of the two makes the choice
+		 without a branch.  */
+	      else if (!pt_var_size)
+		{
+		  tree neg = fold_convert (sizetype, below);
+		  tree big = size_binop (MULT_EXPR, neg,
+					 build_int_cstu (sizetype,
+							 offset_limit));
+		  tree all = size_binop (MULT_EXPR, unshare_expr (neg),
+					 size_unknown (object_size_type));
+		  bytes = size_binop (MAX_EXPR, bytes, big);
+		  wholebytes = size_binop (MAX_EXPR, wholebytes, all);
+		}
+	      else
+		return false;
+	    }
+	}
     }
   else if (!pt_var_size)
     return false;
@@ -2488,6 +2653,13 @@ collect_object_sizes_for (struct object_size_info *osi, tree var)
   stmt = SSA_NAME_DEF_STMT (var);
   reexamine = false;
 
+  /* Look up the indexes of an address that STMT computes at STMT.  The range
+     an index has there holds wherever VAR is used, and so does the size that
+     gets recorded for VAR.  */
+  gimple *outer_stmt = object_size_stmt;
+  if (outer_stmt)
+    object_size_stmt = gimple_bb (stmt) ? stmt : NULL;
+
   switch (gimple_code (stmt))
     {
     case GIMPLE_ASSIGN:
@@ -2572,6 +2744,8 @@ collect_object_sizes_for (struct object_size_info *osi, tree var)
     default:
       gcc_unreachable ();
     }
+
+  object_size_stmt = outer_stmt;
 
   /* Dynamic sizes use placeholder temps to return an answer, so it is always
      safe to set COMPUTED for them.  */
@@ -3582,6 +3756,7 @@ object_sizes_execute (function *fun, bool early)
 	    continue;
 
 	  init_object_sizes ();
+	  object_size_stmt = call;
 
 	  /* If early, only attempt to fold
 	     __builtin_object_size (x, 1) and __builtin_object_size (x, 3),
@@ -3619,6 +3794,11 @@ object_sizes_execute (function *fun, bool early)
 	    }
 
 	  result = gimple_fold_stmt_to_constant (call, do_valueize);
+
+	  /* Folding the statements that use the result can work out the size
+	     for another call, where the range an index has at CALL may not
+	     hold.  */
+	  object_size_stmt = NULL;
 	  if (!result)
 	    {
 	      tree ost = gimple_call_arg (call, 1);
@@ -3661,6 +3841,9 @@ object_sizes_execute (function *fun, bool early)
 	}
     }
 
+  object_size_stmt = NULL;
+  delete object_size_ranger;
+  object_size_ranger = NULL;
   fini_object_sizes ();
   object_sizes_early = false;
   simple_dce_from_worklist (sdce_worklist);
