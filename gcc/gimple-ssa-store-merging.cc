@@ -5294,7 +5294,13 @@ pass_store_merging::process_store (gimple *stmt)
   if (known_eq (bitsize, 0U))
     return false;
 
+  /* The merged stores are emitted at the last store in the group, and a split
+     store covering exactly one original store reuses that store's value there.
+     An abnormal SSA name can't be used that far down since it could then
+     overlap another version of its variable, so don't track such a store.  */
   bool invalid = (base_addr == NULL_TREE
+		  || (TREE_CODE (rhs) == SSA_NAME
+		      && SSA_NAME_OCCURS_IN_ABNORMAL_PHI (rhs))
 		  || (maybe_gt (bitsize,
 				(unsigned int) MAX_BITSIZE_MODE_ANY_INT)
 		      && TREE_CODE (rhs) != INTEGER_CST
@@ -5405,16 +5411,14 @@ pass_store_merging::process_store (gimple *stmt)
 	    }
 	}
 
-      /* The value of a bit-field store is used at the last store as well, so
-	 keep abnormal SSA names out of it for the reason given above.  */
       if (invalid
-	  && !SSA_NAME_OCCURS_IN_ABNORMAL_PHI (rhs)
 	  && bitsize.is_constant (&const_bitsize)
 	  && ((const_bitsize % BITS_PER_UNIT) != 0
 	      || !multiple_p (bitpos, BITS_PER_UNIT))
 	  && const_bitsize <= MAX_FIXED_MODE_SIZE)
 	{
-	  /* Bypass a conversion to the bit-field type.  */
+	  /* Bypass a conversion to the bit-field type, unless that would use
+	     an abnormal SSA name at the last store.  */
 	  if (!bit_not_p
 	      && is_gimple_assign (def_stmt)
 	      && CONVERT_EXPR_CODE_P (rhs_code))
