@@ -2435,6 +2435,8 @@ struct reinit_read_walk
    a call that isn't const can read memory, and a pure one or a builtin like
    strlen has no side effects to tell us so.  A va_arg reads memory too,
    through the pointer in its va_list, which can point into the variable.
+   A call that isn't const can also reach a nested function that reads the
+   variable through the static chain, which needs no address to be taken.
    Other side effects, like an increment or a volatile read, can't do any of
    this.  */
 
@@ -2461,6 +2463,7 @@ find_reinit_read_r (tree *tp, int *, void *data)
       /* We can't tell what an asm does, so it counts as a call.  */
       if (ASM_LABELS (t)
 	  || TREE_ADDRESSABLE (w->decl)
+	  || DECL_NONLOCAL (w->decl)
 	  || gimplify_ctxp->has_reinit_receiver)
 	return t;
       break;
@@ -2473,7 +2476,8 @@ find_reinit_read_r (tree *tp, int *, void *data)
       break;
 
     case CALL_EXPR:
-      if (TREE_ADDRESSABLE (w->decl) && !(call_expr_flags (t) & ECF_CONST))
+      if ((TREE_ADDRESSABLE (w->decl) || DECL_NONLOCAL (w->decl))
+	  && !(call_expr_flags (t) & ECF_CONST))
 	return t;
       if (gimplify_ctxp->has_reinit_receiver
 	  && !(call_expr_flags (t) & (ECF_CONST | ECF_PURE)))
