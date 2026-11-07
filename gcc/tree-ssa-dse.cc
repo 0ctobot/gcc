@@ -932,23 +932,16 @@ dse_optimize_redundant_stores (gimple *stmt)
 		{
 		  ao_ref lhs_ref;
 		  ao_ref_init (&lhs_ref, gimple_assign_lhs (use_stmt));
-		  if ((earlier_set == ao_ref_alias_set (&lhs_ref)
-		       || alias_set_subset_of (ao_ref_alias_set (&lhs_ref),
-					       earlier_set))
-		      && (earlier_base_set == ao_ref_base_alias_set (&lhs_ref)
-			  || alias_set_subset_of
-			       (ao_ref_base_alias_set (&lhs_ref),
-						  earlier_base_set)))
+		  if (alias_sets_cover_p (earlier_set, earlier_base_set,
+					  ao_ref_alias_set (&lhs_ref),
+					  ao_ref_base_alias_set (&lhs_ref)))
 		    delete_dead_or_redundant_assignment (&gsi, "redundant",
 							 need_eh_cleanup,
 							 need_ab_cleanup);
 		}
 	      else if (is_gimple_call (use_stmt))
 		{
-		  if ((earlier_set == 0
-		       || alias_set_subset_of (0, earlier_set))
-		      && (earlier_base_set == 0
-			  || alias_set_subset_of (0, earlier_base_set)))
+		  if (alias_sets_cover_p (earlier_set, earlier_base_set, 0, 0))
 		  delete_dead_or_redundant_call (&gsi, "redundant");
 		}
 	      else

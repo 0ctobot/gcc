@@ -6332,10 +6332,8 @@ visit_reference_op_store (tree lhs, tree op, gimple *stmt)
 	  ao_ref_init (&lhs_ref, lhs);
 	  alias_set_type set = ao_ref_alias_set (&lhs_ref);
 	  alias_set_type base_set = ao_ref_base_alias_set (&lhs_ref);
-	  if ((vnresult->set != set
-	       && ! alias_set_subset_of (set, vnresult->set))
-	      || (vnresult->base_set != base_set
-		  && ! alias_set_subset_of (base_set, vnresult->base_set)))
+	  if (! alias_sets_cover_p (vnresult->set, vnresult->base_set,
+				    set, base_set))
 	    resultsame = false;
 	}
     }
@@ -7563,10 +7561,8 @@ eliminate_dom_walker::eliminate_stmt (basic_block b, gimple_stmt_iterator *gsi)
 	  alias_set_type set = ao_ref_alias_set (&lhs_ref);
 	  alias_set_type base_set = ao_ref_base_alias_set (&lhs_ref);
 	  if (! vnresult
-	      || ((vnresult->set == set
-		   || alias_set_subset_of (set, vnresult->set))
-		  && (vnresult->base_set == base_set
-		      || alias_set_subset_of (base_set, vnresult->base_set))))
+	      || alias_sets_cover_p (vnresult->set, vnresult->base_set,
+				     set, base_set))
 	    {
 	      if (dump_file && (dump_flags & TDF_DETAILS))
 		{
