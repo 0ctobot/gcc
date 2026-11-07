@@ -62,6 +62,8 @@ BACK (mask_int, (int n, int m), char *p = L + (n & (m - 1)))
 BACK (and_sum, (int n, int k), char *p = L + ((n + 5) & k))
 BACK (and_sum_swap, (int n, int k), char *p = L + (k & (n + 5)))
 BACK (and_sum_long, (long n, long k), char *p = L + ((n + 5) & k))
+BACK (and_phi, (int n, int k, int c),
+      int off = n; if (c) off = n + 5; char *p = L + (off & k))
 
 int
 main (void)
@@ -83,5 +85,6 @@ main (void)
   and_sum (-10, -1);
   and_sum_swap (-10, -1);
   and_sum_long (-10, -1);
+  and_phi (-10, -1, 1);
   return 0;
 }
