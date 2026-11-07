@@ -770,6 +770,29 @@ decl_init_size (tree decl, bool min)
   return size;
 }
 
+/* Return true if a constant index below the start of its array is on the
+   way from VAR down to PT_VAR.  An unsigned index that's negative as an
+   offset, like (size_t) -1, counts too, since the address wraps around to
+   below the array just as it does for -1.  */
+
+static bool
+object_size_index_below_p (tree var, const_tree pt_var)
+{
+  for (tree v = var; v != pt_var && handled_component_p (v);
+       v = TREE_OPERAND (v, 0))
+    if (TREE_CODE (v) == ARRAY_REF
+	&& TREE_CODE (TREE_OPERAND (v, 1)) == INTEGER_CST)
+      {
+	tree idx = TREE_OPERAND (v, 1);
+	tree low = array_ref_low_bound (v);
+	if (TREE_CODE (low) == INTEGER_CST
+	    && (tree_int_cst_lt (idx, low)
+		|| object_size_negative_offset_p (idx)))
+	  return true;
+      }
+  return false;
+}
+
 /* Compute __builtin_object_size for PTR, which is a ADDR_EXPR.
    OBJECT_SIZE_TYPE is the second argument from __builtin_object_size.
    If unknown, return size_unknown (object_size_type).  */
@@ -1000,12 +1023,16 @@ addr_object_size (struct object_size_info *osi, const_tree ptr,
 	 size says nothing about what's left from there.  This is the same
 	 pointer that subtracting from the subobject's address gives, which may
 	 still be inside the enclosing object, so go by that object as we do for
-	 the subtraction.  A minimum only needs to be a lower bound, so zero
-	 stays correct for those.  */
+	 the subtraction.  Go by it as well when a constant index below the
+	 start of an array selected the subobject or one containing it, as in
+	 &s.m[-1][3] or &s.a[-1].x[1], since the subobject is then outside of
+	 that array.  A minimum only needs to be a lower bound, so zero stays
+	 correct for those.  */
       if (!(object_size_type & OST_MINIMUM)
 	  && var != pt_var
-	  && object_size_negative_offset_p
-	       (compute_object_offset (TREE_OPERAND (ptr, 0), var)))
+	  && (object_size_negative_offset_p
+		(compute_object_offset (TREE_OPERAND (ptr, 0), var))
+	      || object_size_index_below_p (var, pt_var)))
 	var = pt_var;
 
       if (var != pt_var)
