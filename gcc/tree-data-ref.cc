@@ -3600,18 +3600,77 @@ dr_outer_dims_disjoint_p (const dr_outer_dim &a, const dr_outer_dim &b)
 	      <= TYPE_PRECISION (sizetype)));
 }
 
+/* Return true if a constant step in dimension DIM of the access functions
+   ACCESS_FNS of the reference REF may wrap the address.  UNCONSTRAINED_BASE says
+   whether the last dimension is the evolution of a pointer, which counts bytes.
+
+   The access functions count elements, whereas the address moves by the step
+   times the size of an element modulo the size of the address space.  What the
+   subscript tests prove about elements, like a step of K never covering an index
+   difference that K doesn't divide, only holds for addresses as long as that
+   product doesn't wrap: with an 8-byte element, a K of (1L << 61) + 1 moves the
+   address by 8 bytes.  The step is read as a signed value, the product isn't
+   truncated, and it's held to the limit that dr_classify_stride uses to stay
+   below wrapping within 1 << 16 steps.
+
+   A step that isn't constant is left alone since the subscript tests don't get
+   a proof out of it in the first place.  */
+
+static bool
+dr_dim_stride_may_wrap_p (tree ref, const vec<tree> &access_fns,
+			  unsigned int dim, bool unconstrained_base)
+{
+  const unsigned int lanes_log2 = 16;
+  const unsigned int precision = TYPE_PRECISION (sizetype);
+
+  for (unsigned int i = 0; i < dim && handled_component_p (ref); ++i)
+    ref = TREE_OPERAND (ref, 0);
+
+  tree scale;
+  if (unconstrained_base && dim + 1 == access_fns.length ())
+    scale = size_one_node;
+  else if (TREE_CODE (ref) == ARRAY_REF)
+    scale = array_ref_element_size (ref);
+  else
+    return false;
+
+  for (tree fn = access_fns[dim]; TREE_CODE (fn) == POLYNOMIAL_CHREC;
+       fn = CHREC_LEFT (fn))
+    {
+      tree step = CHREC_RIGHT (fn);
+      if (TREE_CODE (step) != INTEGER_CST)
+	continue;
+      /* Moving by a single element of an array can't wrap by itself.  Without a
+	 known size, nothing else can be said about a step.  */
+      if (TREE_CODE (scale) != INTEGER_CST)
+	{
+	  if (!integer_onep (step) && !integer_minus_onep (step))
+	    return true;
+	  continue;
+	}
+      widest_int stride = (widest_int::from (wi::to_wide (step), SIGNED)
+			   * wi::to_widest (scale));
+      if (wi::min_precision (wi::abs (stride), UNSIGNED) + lanes_log2 + 2
+	  > precision)
+	return true;
+    }
+  return false;
+}
+
 /* An access function describes which subobject of an enclosing object gets
    used, and differing values for a dimension are taken as proof of independence
    provided that the enclosing objects either coincide or are fully disjoint.
    Return true if that holds for A and B, which share LENGTH dimensions starting
    at START_A in A and START_B in B.
 
-   That proof is only needed for what's outside of the innermost dimension whose
+   That proof is needed for what's outside of the innermost dimension whose
    access functions differ.  It doesn't follow from the types when strict
    aliasing isn't in effect, since a stride smaller than the object then just
    makes the objects of different iterations overlap, or when pointers can wrap,
    since a stride of sizeof (struct) * K can wrap around to any smaller
-   value.  */
+   value.  When pointers can wrap, the innermost dimension that differs needs a
+   stride that doesn't wrap as well, since otherwise what it says about elements
+   doesn't hold for their addresses.  */
 
 static bool
 dr_access_fns_separate_p (struct data_reference *a, struct data_reference *b,
@@ -3629,6 +3688,14 @@ dr_access_fns_separate_p (struct data_reference *a, struct data_reference *b,
       break;
   if (i == length)
     return true;
+
+  if (flag_wrapv_pointer
+      && (dr_dim_stride_may_wrap_p (DR_REF (a), indices_a->access_fns,
+				    start_a + i, indices_a->unconstrained_base)
+	  || dr_dim_stride_may_wrap_p (DR_REF (b), indices_b->access_fns,
+				       start_b + i,
+				       indices_b->unconstrained_base)))
+    return false;
 
   /* The decision is about the two references together, so that each dimension
      from there outwards needs one rule that both of them satisfy.  */
