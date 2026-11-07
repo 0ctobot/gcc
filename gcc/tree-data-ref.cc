@@ -5509,6 +5509,50 @@ analyze_miv_subscript (tree chrec_a,
     fprintf (dump_file, ")\n");
 }
 
+/* Return true if the step of the access function CHREC, which isn't constant,
+   may be zero.  The step doesn't change in the loop of CHREC, so it gets the
+   range it has on the loop's preheader edge, which takes the conditions
+   guarding the loop into account.  */
+
+static bool
+dr_step_may_be_zero_p (tree chrec)
+{
+  tree step = CHREC_RIGHT (chrec);
+  if (!INTEGRAL_TYPE_P (TREE_TYPE (step)) || !cfun)
+    return true;
+
+  int_range_max r;
+  range_query *query = get_range_query (cfun);
+  class loop *loop = (current_loops
+		      ? get_loop (cfun, CHREC_VARIABLE (chrec)) : NULL);
+  bool known;
+  if (loop
+      && loops_state_satisfies_p (LOOPS_HAVE_PREHEADERS)
+      && !loops_state_satisfies_p (LOOPS_MAY_HAVE_MULTIPLE_LATCHES))
+    known = query->range_on_edge (r, loop_preheader_edge (loop), step);
+  else
+    known = query->range_of_expr (r, step);
+  return (!known
+	  || r.undefined_p ()
+	  || r.contains_p (wi::zero (TYPE_PRECISION (r.type ()))));
+}
+
+/* Return true if a step of a dimension whose access functions are the same in
+   two references may make that dimension select the same element in two
+   different iterations, which is the case for a step that isn't constant and
+   may be zero.  The subscript tests take the references to meet in the same
+   iteration only, which a zero step makes false.  */
+
+static bool
+dr_same_dim_step_may_be_zero_p (tree fn)
+{
+  for (; TREE_CODE (fn) == POLYNOMIAL_CHREC; fn = CHREC_LEFT (fn))
+    if (TREE_CODE (CHREC_RIGHT (fn)) != INTEGER_CST
+	&& dr_step_may_be_zero_p (fn))
+      return true;
+  return false;
+}
+
 /* Determines the iterations for which CHREC_A is equal to CHREC_B in
    with respect to LOOP_NEST.  OVERLAP_ITERATIONS_A and
    OVERLAP_ITERATIONS_B are initialized with two functions that
@@ -5517,6 +5561,9 @@ analyze_miv_subscript (tree chrec_a,
    Remark: For an integer k >= 0, the following equality is true:
 
    CHREC_A (OVERLAP_ITERATIONS_A (k)) == CHREC_B (OVERLAP_ITERATIONS_B (k)).
+
+   ALL_SAME_P says whether every subscript of the dependence relation has the
+   same access functions in both references.
 */
 
 static void
@@ -5524,7 +5571,8 @@ analyze_overlapping_iterations (tree chrec_a,
 				tree chrec_b,
 				conflict_function **overlap_iterations_a,
 				conflict_function **overlap_iterations_b,
-				tree *last_conflicts, class loop *loop_nest)
+				tree *last_conflicts, class loop *loop_nest,
+				bool all_same_p)
 {
   unsigned int lnn = loop_nest->num;
 
@@ -5547,6 +5595,21 @@ analyze_overlapping_iterations (tree chrec_a,
     {
       dependence_stats.num_subscript_undetermined++;
 
+      *overlap_iterations_a = conflict_fn_not_known ();
+      *overlap_iterations_b = conflict_fn_not_known ();
+    }
+
+  /* Two of the same chrec that are affine overlap in the same iteration, but
+     with a step that may be zero, they overlap in every pair of iterations.
+     The distance of zero would then conflict with what another subscript
+     says, which proves nothing.  When every subscript is the same, a zero
+     distance is all there is, and it's up to the user of the relation to
+     deal with a zero step, like the vectorizer does with a run-time check.  */
+  else if (!all_same_p
+	   && eq_evolutions_p (chrec_a, chrec_b)
+	   && dr_same_dim_step_may_be_zero_p (chrec_a))
+    {
+      dependence_stats.num_subscript_undetermined++;
       *overlap_iterations_a = conflict_fn_not_known ();
       *overlap_iterations_b = conflict_fn_not_known ();
     }
@@ -6120,6 +6183,15 @@ subscript_dependence_tester_1 (struct data_dependence_relation *ddr,
   tree last_conflicts;
   struct subscript *subscript;
   tree res = NULL_TREE;
+  bool all_same_p = true;
+
+  for (i = 0; DDR_SUBSCRIPTS (ddr).iterate (i, &subscript); i++)
+    if (!eq_evolutions_p (SUB_ACCESS_FN (subscript, a_index),
+			  SUB_ACCESS_FN (subscript, b_index)))
+      {
+	all_same_p = false;
+	break;
+      }
 
   for (i = 0; DDR_SUBSCRIPTS (ddr).iterate (i, &subscript); i++)
     {
@@ -6128,7 +6200,7 @@ subscript_dependence_tester_1 (struct data_dependence_relation *ddr,
       analyze_overlapping_iterations (SUB_ACCESS_FN (subscript, a_index),
 				      SUB_ACCESS_FN (subscript, b_index),
 				      &overlaps_a, &overlaps_b,
-				      &last_conflicts, loop_nest);
+				      &last_conflicts, loop_nest, all_same_p);
 
       if (SUB_CONFLICTS_IN_A (subscript))
 	free_conflict_function (SUB_CONFLICTS_IN_A (subscript));
