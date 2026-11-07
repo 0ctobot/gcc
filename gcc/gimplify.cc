@@ -130,6 +130,11 @@ static hash_set<tree> *asan_poisoned_variables = NULL;
    find_back_jump_labels.  */
 static hash_map<tree, unsigned> *reinit_places;
 
+/* Where each artificial label is and where the block of each variable with an
+   initializer ends, in the same numbering as reinit_places, or NULL along with
+   reinit_places.  See find_reinit_read_r.  */
+static hash_map<tree, unsigned> *reinit_bounds;
+
 /* True if every user label in the function being gimplified has to count as one
    that a jump can come back to, since a computed goto or a nested function can
    reach it from anywhere.  Neither of those can reach an artificial label, so
@@ -2423,7 +2428,24 @@ struct reinit_read_walk
 {
   tree decl;
   hash_set<tree> visited;
+  /* The labels in the initializer, and the artificial labels it jumps to that
+     can be in the block of the variable.  */
+  hash_set<tree> labels;
+  auto_vec<tree> jumps;
 };
+
+/* Return true if LABEL, an artificial label, comes after the end of the block
+   of DECL, so that a jump to it ends the lifetime of DECL.  */
+
+static bool
+reinit_label_past_block_p (tree decl, tree label)
+{
+  if (!reinit_bounds)
+    return false;
+  unsigned *end = reinit_bounds->get (decl);
+  unsigned *place = reinit_bounds->get (label);
+  return end && place && *place > *end;
+}
 
 /* Callback for walk_tree from reinit_needs_tmp_p.  DATA is the walk state.
    Find what can make the old value of the variable visible while its
@@ -2452,11 +2474,23 @@ find_reinit_read_r (tree *tp, int *, void *data)
   switch (TREE_CODE (t))
     {
     case GOTO_EXPR:
-      /* An artificial label is the control flow of something like a loop, and
-	 a break out of the initializer leaves the block of the variable.  */
+      /* An artificial label is the control flow of something like a loop.
+	 A break out of the initializer usually leaves the block of the
+	 variable, but not in C90 when the initializer is that of a compound
+	 literal in the body of a loop or a switch, since the body isn't a
+	 block there and the literal belongs to the block around the loop or
+	 the switch.  A label in the initializer itself, like one of a loop in
+	 a statement expression, doesn't abandon it, which only shows once the
+	 walk has seen all the labels of the initializer.  */
       if (TREE_CODE (GOTO_DESTINATION (t)) != LABEL_DECL
 	  || !DECL_ARTIFICIAL (GOTO_DESTINATION (t)))
 	return t;
+      if (!reinit_label_past_block_p (w->decl, GOTO_DESTINATION (t)))
+	w->jumps.safe_push (GOTO_DESTINATION (t));
+      break;
+
+    case LABEL_EXPR:
+      w->labels.add (LABEL_EXPR_LABEL (t));
       break;
 
     case ASM_EXPR:
@@ -2527,7 +2561,12 @@ reinit_needs_tmp_p (tree decl, tree val)
 
   reinit_read_walk w;
   w.decl = decl;
-  return walk_tree (&val, find_reinit_read_r, &w, &w.visited) != NULL_TREE;
+  if (walk_tree (&val, find_reinit_read_r, &w, &w.visited))
+    return true;
+  for (tree label : w.jumps)
+    if (!w.labels.contains (label))
+      return true;
+  return false;
 }
 
 /* Return true if control can come back to a place above the declaration of DECL
@@ -2644,10 +2683,11 @@ gimplify_decl_expr (tree *stmt_p, gimple_seq *seq_p)
 		 setjmp before the declaration, a user label before it with a
 		 jump back from further down, or a loop around a compound
 		 literal in the loop's own condition or increment allows this,
-		 since a loop body is a block of its own.  The read takes a DECL
-		 with its address taken.  The longjmp only matters if something
-		 in this function can regain control after it, since otherwise
-		 it ends this frame and DECL along with it.  */
+		 since a loop body is a block of its own.  In C90 it isn't, so
+		 a compound literal in the body of a loop counts too.  The read
+		 takes a DECL with its address taken.  The longjmp only matters
+		 if something in this function can regain control after it,
+		 since otherwise it ends this frame and DECL along with it.  */
 	      tree old_reinit_decl = gimplify_ctxp->reinit_decl;
 	      bool init_in_tmp = false;
 	      gimplify_ctxp->reinit_decl = NULL_TREE;
@@ -22662,6 +22702,9 @@ struct back_jump_walk
   /* The labels walked so far.  */
   hash_set<tree> seen;
   hash_map<tree, unsigned> *places;
+  /* Where the artificial labels are and where the blocks of the variables with
+     an initializer end.  */
+  hash_map<tree, unsigned> *bounds;
   /* The last place handed out, which only grows as the walk goes on.  */
   unsigned place;
   /* The place of the statement being walked in the innermost BIND_EXPR.  */
@@ -22689,6 +22732,8 @@ find_back_jump_labels_r (tree *tp, int *walk_subtrees, void *data)
     {
     case LABEL_EXPR:
       w->seen.add (LABEL_EXPR_LABEL (t));
+      if (DECL_ARTIFICIAL (LABEL_EXPR_LABEL (t)))
+	w->bounds->put (LABEL_EXPR_LABEL (t), ++w->place);
       break;
 
     case GOTO_EXPR:
@@ -22726,6 +22771,9 @@ find_back_jump_labels_r (tree *tp, int *walk_subtrees, void *data)
 		       &w->visited);
 	  }
 	w->stmt_place = old_stmt_place;
+	for (tree decl = BIND_EXPR_VARS (t); decl; decl = DECL_CHAIN (decl))
+	  if (VAR_P (decl) && DECL_INITIAL (decl))
+	    w->bounds->put (decl, w->place);
 	return NULL_TREE;
       }
 
@@ -22753,14 +22801,18 @@ find_back_jump_labels_r (tree *tp, int *walk_subtrees, void *data)
 /* Record in PLACES where the variables with an initializer in FNDECL are, and
    where the last jump is to each label that a jump can come back to from
    further down, as numbers that grow in the order those get gimplified.
-   Running the initializer of a declaration again within its lifetime takes a
-   jump from its statement or below to a label above it.  That can be the jump
-   back of a loop to its artificial label, since a compound literal in the
-   condition or the increment of a loop belongs to the block of the iteration
-   statement, and that block holds both the label and the jump.  Nothing else
+   Record in BOUNDS where each artificial label is and where the block of each
+   variable with an initializer ends, in the same numbering.  Running the
+   initializer of a declaration again within its lifetime takes a jump from its
+   statement or below to a label above it.  That can be the jump back of a loop
+   to its artificial label, since a compound literal in the condition or the
+   increment of a loop belongs to the block of the iteration statement, and
+   that block holds both the label and the jump.  In C90 neither the iteration
+   statement nor its body is a block, so the block around the loop holds the
+   label and the jump for a compound literal in the body as well.  Nothing else
    can go up without leaving the block of the variable, since a loop around a
-   declaration, or around a compound literal in its body, has that block inside
-   of it.  A label above a declaration thus only counts for that declaration if
+   declaration, or around a compound literal in a body that is a block, has
+   that block inside of it.  A label above a declaration thus only counts for that declaration if
    the last jump to the label comes later than the declaration, which leaves out
    a retry loop above it.  The usual forward goto to a label at the end of a
    block can't run anything twice.  Return true if FNDECL has a computed goto,
@@ -22769,10 +22821,12 @@ find_back_jump_labels_r (tree *tp, int *walk_subtrees, void *data)
    target, as in the kernel's _THIS_IP_.  */
 
 static bool
-find_back_jump_labels (tree fndecl, hash_map<tree, unsigned> *places)
+find_back_jump_labels (tree fndecl, hash_map<tree, unsigned> *places,
+		       hash_map<tree, unsigned> *bounds)
 {
   back_jump_walk w;
   w.places = places;
+  w.bounds = bounds;
   w.place = 0;
   w.stmt_place = 0;
   w.computed_goto = false;
@@ -22821,7 +22875,7 @@ gimplify_body (tree fndecl, bool do_parms)
   /* This must come before gimplification takes the body apart.  C++ ends the
      lifetime of a variable on a jump back past its declaration and needs copy
      elision, so re-run initializations only exist in C and Objective-C.  */
-  hash_map<tree, unsigned> places;
+  hash_map<tree, unsigned> places, bounds;
   hash_map<tree, tree> auto_init_vars;
   if (lang_GNU_C () || lang_GNU_OBJC ())
     {
@@ -22830,10 +22884,11 @@ gimplify_body (tree fndecl, bool do_parms)
 
       /* A nested function can jump to any user label of FNDECL.  */
       cgraph_node *cgn = cgraph_node::get (fndecl);
-      reinit_all_labels = find_back_jump_labels (fndecl, &places);
+      reinit_all_labels = find_back_jump_labels (fndecl, &places, &bounds);
       if (cgn && first_nested_function (cgn))
 	reinit_all_labels = true;
       reinit_places = &places;
+      reinit_bounds = &bounds;
       reinit_auto_init_vars = &auto_init_vars;
     }
 
@@ -22926,6 +22981,7 @@ gimplify_body (tree fndecl, bool do_parms)
     }
 
   reinit_places = NULL;
+  reinit_bounds = NULL;
   reinit_auto_init_vars = NULL;
   pop_gimplify_context (outer_bind);
   gcc_assert (gimplify_ctxp == NULL);

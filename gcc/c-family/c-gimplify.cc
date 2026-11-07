@@ -766,6 +766,41 @@ c_genericize_control_r (tree *stmt_p, int *walk_subtrees, void *data)
       && is_gimple_reg (TREE_OPERAND (TREE_OPERAND (stmt, 0), 0)))
     DECL_NOT_GIMPLE_REG_P (TREE_OPERAND (TREE_OPERAND (stmt, 0), 0)) = 1;
 
+  hash_set<tree> *pset = static_cast<hash_set<tree> *> (data);
+  switch (TREE_CODE (stmt))
+    {
+    case BIND_EXPR:
+      /* walk_tree would visit the initializers of the variables here ahead of
+	 the body, but a compound literal has its initializer run where the
+	 literal is.  In C90 that can be in a loop or a switch inside this
+	 block, since their bodies aren't blocks of their own, and a break or a
+	 continue in the initializer has to see the labels of that loop or
+	 switch.  Walk the body first so the initializer of a compound literal
+	 is walked at the literal, and those of the other variables, which see
+	 the same labels here as at their declarations, after it.  */
+      walk_tree_1 (&BIND_EXPR_BODY (stmt), c_genericize_control_r, data, pset,
+		   NULL);
+      for (tree decl = BIND_EXPR_VARS (stmt); decl; decl = DECL_CHAIN (decl))
+	{
+	  walk_tree_1 (&DECL_INITIAL (decl), c_genericize_control_r, data, pset,
+		       NULL);
+	  walk_tree_1 (&DECL_SIZE (decl), c_genericize_control_r, data, pset,
+		       NULL);
+	  walk_tree_1 (&DECL_SIZE_UNIT (decl), c_genericize_control_r, data,
+		       pset, NULL);
+	}
+      *walk_subtrees = 0;
+      return NULL;
+
+    case COMPOUND_LITERAL_EXPR:
+      walk_tree_1 (&DECL_INITIAL (COMPOUND_LITERAL_EXPR_DECL (stmt)),
+		   c_genericize_control_r, data, pset, NULL);
+      return NULL;
+
+    default:
+      break;
+    }
+
   c_genericize_control_stmt (stmt_p, walk_subtrees, data,
 			     c_genericize_control_r, NULL);
   return NULL;
