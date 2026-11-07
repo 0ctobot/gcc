@@ -59,6 +59,7 @@ struct GTY(()) object_size
 };
 
 static tree compute_object_offset (tree, const_tree);
+static bool object_size_negative_offset_p (tree);
 static bool addr_object_size (struct object_size_info *,
 			      const_tree, int, tree *, tree *t = NULL);
 static tree alloc_object_size (const gcall *, int);
@@ -995,6 +996,18 @@ addr_object_size (struct object_size_info *osi, const_tree ptr,
       else
 	var = pt_var;
 
+      /* An index below the start of a subobject leaves that subobject, so its
+	 size says nothing about what's left from there.  This is the same
+	 pointer that subtracting from the subobject's address gives, which may
+	 still be inside the enclosing object, so go by that object as we do for
+	 the subtraction.  A minimum only needs to be a lower bound, so zero
+	 stays correct for those.  */
+      if (!(object_size_type & OST_MINIMUM)
+	  && var != pt_var
+	  && object_size_negative_offset_p
+	       (compute_object_offset (TREE_OPERAND (ptr, 0), var)))
+	var = pt_var;
+
       if (var != pt_var)
 	{
 	  var_size = TYPE_SIZE_UNIT (TREE_TYPE (var));
@@ -1010,7 +1023,27 @@ addr_object_size (struct object_size_info *osi, const_tree ptr,
       bytes = compute_object_offset (TREE_OPERAND (ptr, 0), var);
       if (bytes != error_mark_node)
 	{
-	  bytes = size_for_offset (var_size, bytes);
+	  /* An index can also go below what a MEM_REF's pointer points to, which
+	     may be the middle of an object.  Work out the net offset from the
+	     whole object, going easy on a static maximum that may have been
+	     overestimated, the same as for the MEM_REF's own offset above.  */
+	  if (var == pt_var
+	      && TREE_CODE (pt_var) == MEM_REF
+	      && !(object_size_type & OST_MINIMUM)
+	      && object_size_negative_offset_p (bytes))
+	    {
+	      tree base = TREE_OPERAND (pt_var, 0);
+	      bool strict = ((object_size_type & OST_DYNAMIC)
+			     || (!object_size_merged_p (base)
+				 && !object_size_variable_offset_p (base)));
+	      bytes = size_for_offset (var_size, bytes,
+				       wholesize_for_offset (base,
+							     pt_var_wholesize,
+							     object_size_type),
+				       strict);
+	    }
+	  else
+	    bytes = size_for_offset (var_size, bytes);
 	  if (var != pt_var && pt_var_size && TREE_CODE (pt_var) == MEM_REF)
 	    {
 	      tree bytes2 = compute_object_offset (TREE_OPERAND (ptr, 0),
