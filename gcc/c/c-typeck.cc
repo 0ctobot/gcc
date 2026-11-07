@@ -130,6 +130,7 @@ static void output_init_element (location_t, tree, tree, bool, tree, tree, bool,
 				 bool, struct obstack *);
 static void output_pending_init_elements (int, struct obstack *);
 static int init_field_decl_cmp (tree, tree);
+static tree init_field_of_type (tree, tree);
 static bool set_designator (location_t, bool, struct obstack *);
 static void push_range_stack (tree, struct obstack *);
 static void add_pending_init (location_t, tree, tree, tree, bool,
@@ -11012,6 +11013,11 @@ static tree
 init_literal_braced_list (tree value)
 {
   value = strip_init_conversions (value);
+  /* init_split_base converts a saved literal of a compatible C23 type of the
+     same tag to the type being initialized.  */
+  if (TREE_CODE (value) == VIEW_CONVERT_EXPR
+      && TREE_CODE (TREE_OPERAND (value, 0)) == SAVE_EXPR)
+    value = TREE_OPERAND (value, 0);
   if (TREE_CODE (value) == SAVE_EXPR)
     value = strip_init_conversions (TREE_OPERAND (value, 0));
   if (TREE_CODE (value) == CONSTRUCTOR)
@@ -11044,6 +11050,10 @@ init_literal_braced_list (tree value)
   if (!ctor)
     return NULL_TREE;
   tree part = TREE_OPERAND (value, 1);
+  /* A literal of a compatible C23 type of the same tag has fields of its
+     own.  */
+  if (TREE_CODE (value) == COMPONENT_REF)
+    part = init_field_of_type (part, TREE_TYPE (ctor));
   unsigned HOST_WIDE_INT ix;
   tree index, elt;
   FOR_EACH_CONSTRUCTOR_ELT (CONSTRUCTOR_ELTS (ctor), ix, index, elt)
@@ -11114,8 +11124,8 @@ whole_init_as_constructor (tree value)
       if (init
 	  && (TREE_CODE (inner) == COMPOUND_LITERAL_EXPR
 	      || (!TREE_SIDE_EFFECTS (init)
-		  && (TYPE_MAIN_VARIANT (TREE_TYPE (init))
-		      == TYPE_MAIN_VARIANT (constructor_type)))))
+		  && comptypes (TYPE_MAIN_VARIANT (TREE_TYPE (init)),
+				TYPE_MAIN_VARIANT (constructor_type)))))
 	inner = init;
     }
   if (!vector_p && TREE_CODE (inner) == CONSTRUCTOR)
@@ -12353,10 +12363,10 @@ add_pending_init (location_t loc, tree purpose, tree value, tree origtype,
     }
 }
 
-/* Since C23, a struct type is compatible with a struct type of the same tag
+/* Since C23, a struct or union type is compatible with a type of the same tag
    declared in another scope, which has its own FIELD_DECLs for the same members
-   in the same order.  Return the field of the struct type TYPE at the place
-   that FIELD has in its own type.  */
+   in the same order.  Return the field of the struct or union type TYPE at the
+   place that FIELD has in its own type.  */
 
 static tree
 init_field_of_type (tree field, tree type)
@@ -12553,17 +12563,17 @@ find_init_member (tree field, struct obstack * braced_init_obstack)
     }
   else if (TREE_CODE (constructor_type) == UNION_TYPE)
     {
-      if (!vec_safe_is_empty (constructor_elements)
-	  && (constructor_elements->last ().index == field))
-	return constructor_elements->last ().value;
+      if (vec_safe_is_empty (constructor_elements))
+	return NULL_TREE;
+      tree index = constructor_elements->last ().index;
+      tree value = constructor_elements->last ().value;
       /* A null index marks a whole initializer that hasn't been replaced yet,
 	 see whole_init_as_constructor.  */
-      if (!vec_safe_is_empty (constructor_elements)
-	  && !constructor_elements->last ().index)
-	{
-	  tree whole = constructor_elements->last ().value;
-	  return build_init_member_ref (init_split_base (whole), field);
-	}
+      if (!index)
+	return build_init_member_ref (init_split_base (value), field);
+      /* A same-tag literal holds a field from its own type.  */
+      if (init_field_of_type (index, constructor_type) == field)
+	return value;
     }
   return NULL_TREE;
 }
