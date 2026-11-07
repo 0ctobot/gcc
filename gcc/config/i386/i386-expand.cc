@@ -11384,6 +11384,24 @@ construct_plt_address (rtx symbol)
   return tmp;
 }
 
+/* Return true if the function called through the SYMBOL_REF ADDR uses the
+   preserve_none calling convention.  The decl is resolved the same way
+   init_cumulative_args resolves it to pick the argument registers.  */
+
+static bool
+ix86_preserve_none_callee_p (rtx addr)
+{
+  tree decl = SYMBOL_REF_DECL (addr);
+  if (!decl || TREE_CODE (decl) != FUNCTION_DECL)
+    return false;
+
+  if (cgraph_node *node = cgraph_node::get (decl))
+    decl = node->function_symbol ()->decl;
+
+  return lookup_attribute ("preserve_none",
+			   TYPE_ATTRIBUTES (TREE_TYPE (decl))) != nullptr;
+}
+
 rtx_insn *
 ix86_expand_call (rtx retval, rtx fnaddr, rtx callarg1,
 		  rtx callarg2,
@@ -11426,7 +11444,13 @@ ix86_expand_call (rtx retval, rtx fnaddr, rtx callarg1,
     {
       /* Static functions and indirect calls don't need the pic register.  Also,
 	 check if PLT was explicitly avoided via no-plt or "noplt" attribute, making
-	 it an indirect call.  */
+	 it an indirect call.
+
+	 A large PIC call through the PLT needs the GOT address in R15, which
+	 is loaded below after the arguments are already in their registers.
+	 The preserve_none convention passes the fourth integer argument in
+	 R15, so a preserve_none function is called through its GOT slot
+	 instead, which doesn't need R15.  */
       if (flag_pic
 	  && SYMBOL_REF_P (addr)
 	  && ix86_call_use_plt_p (addr))
@@ -11434,7 +11458,12 @@ ix86_expand_call (rtx retval, rtx fnaddr, rtx callarg1,
 	  if (flag_plt
 	      && (SYMBOL_REF_DECL (addr) == NULL_TREE
 		  || !lookup_attribute ("noplt",
-					DECL_ATTRIBUTES (SYMBOL_REF_DECL (addr)))))
+					DECL_ATTRIBUTES
+					  (SYMBOL_REF_DECL (addr))))
+	      && !(TARGET_64BIT
+		   && ix86_cmodel == CM_LARGE_PIC
+		   && DEFAULT_ABI != MS_ABI
+		   && ix86_preserve_none_callee_p (addr)))
 	    {
 	      if (!TARGET_64BIT
 		  || (ix86_cmodel == CM_LARGE_PIC
