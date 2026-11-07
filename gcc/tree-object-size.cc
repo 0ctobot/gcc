@@ -3229,7 +3229,7 @@ object_size_align_base (tree val, tree m)
   return NULL_TREE;
 }
 
-/* Return true if the value of the integer VAL is known to fit in the signed
+/* Return true if the value of the integer VAL is known to fit in the integer
    type TYPE, going by how VAL is computed.  */
 
 static bool
@@ -3319,14 +3319,15 @@ object_size_induction_step (tree val, tree res, unsigned *prec)
 /* Return true if the integer OFF, part of the offset of a pointer, can take the
    pointer below where it was, going by how OFF is computed.  Subtracting always
    counts, and so does anything done to a subtracted value that leaves it
-   negative.  A value that's zero extended or masked down to something small
-   doesn't count no matter what it was before.
+   negative, as does narrowing a value that may not fit to an unsigned type as
+   wide as an offset.  A value that's zero extended or masked down to something
+   small doesn't count no matter what it was before.
 
    Without INDEX, OFF is being added to something, so a value of a signed type
    that may simply be negative counts as well, as does a conversion that can
    turn a non-negative value into a negative one.  An unsigned value that wasn't
-   subtracted doesn't count, since it's an index that goes forward, or an index
-   so large that using it is undefined.
+   subtracted or narrowed from a wider type doesn't count, since it's an index
+   that goes forward, or an index so large that using it is undefined.
 
    With INDEX, OFF is all there is to the step, so a value of a signed type that
    may be negative doesn't count unless it's added to something.  That's what two
@@ -3556,6 +3557,24 @@ object_size_offset_steps_back_1 (tree off, bool index, int &limit)
 			    && TYPE_UNSIGNED (rhs_type))))
 		  {
 		    if (object_size_value_fits_p (rhs1, type))
+		      continue;
+		    return true;
+		  }
+
+		/* Narrowing to an unsigned type that's as wide as an offset keeps
+		   only the low bits of the value, which can leave the top bit of
+		   the offset set the same way a subtraction can, so it counts
+		   unless the value is known to fit or the result is known to
+		   have that bit clear, as it is under a check of the value that
+		   the walk doesn't see.  A narrower result can only set that bit
+		   by way of a signed type, as above.  */
+		if (TYPE_UNSIGNED (type)
+		    && INTEGRAL_TYPE_P (rhs_type)
+		    && TYPE_PRECISION (type) < TYPE_PRECISION (rhs_type)
+		    && TYPE_PRECISION (type) >= TYPE_PRECISION (sizetype))
+		  {
+		    if (object_size_value_fits_p (rhs1, type)
+			|| !wi::neg_p (get_nonzero_bits (off)))
 		      continue;
 		    return true;
 		  }
