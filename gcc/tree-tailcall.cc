@@ -1641,11 +1641,13 @@ find_tail_calls (basic_block bb, edge esucc, struct tailcall **ret,
 	  /* A parameter forwarded as itself doesn't get copied, so the next
 	     activation shares its storage instead of having a copy of its own.
 	     That can't be told apart unless the address of the parameter may
-	     reach that activation.  A musttail call asks for the frame to be
+	     reach that activation, directly or through what the result of an
+	     earlier call revealed.  A musttail call asks for the frame to be
 	     reused regardless.  */
 	  else if (may_be_aliased (param)
 		   && !gimple_call_must_tail_p (call)
-		   && call_may_see_address_p (call, param))
+		   && (call_may_see_address_p (call, param)
+		       || call_may_get_revealed_address_p (call, param)))
 	    break;
 	}
       if (idx == gimple_call_num_args (call) && !param)

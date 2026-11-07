@@ -1,15 +1,18 @@
 /* PR tree-optimization/114206 */
 /* A branch on what a callee returned can only tell a tail call which way it
    went if more than one of its successors leads to that call.  An early return
-   nested in an arm or a loop leaves just one, so these tail calls stay, while a
-   loop that keeps going on the result still decides what the call can see.  */
+   nested in an arm or a loop leaves just one, so these tail calls and tail
+   recursive calls stay, while a loop that keeps going on the result still
+   decides what the call can see.  */
 /* { dg-do compile } */
-/* { dg-options "-O2 -fdump-tree-tailc-details" } */
+/* { dg-options "-O2 -fdump-tree-tailr1-details -fdump-tree-tailc-details" } */
 
 struct key { long a; long b; };
 struct dev { long a; long b; struct dev *next; };
+struct pack { long v[4]; };
 
 extern long val;
+extern long sink;
 extern long kept (struct dev *);
 extern long kept_too (struct dev *);
 extern long refused (struct dev *);
@@ -20,6 +23,13 @@ helper (struct key *k, long i)
 {
   k->b = i;
   return val != k->a;
+}
+
+__attribute__ ((noinline, noclone)) int
+check (struct pack *p, long i)
+{
+  sink = i;
+  return p->v[1] < 0;
 }
 
 /* Only one arm of the outer branch calls the helper.  */
@@ -102,5 +112,32 @@ retry (struct dev *dev)
   return refused (dev);
 }
 
+/* The parameter forwarded to the next activation only goes to the check.  */
+long
+recurse_arm (struct pack p, long n, int flag)
+{
+  if (flag)
+    {
+      if (check (&p, n))
+	return -1;
+      sink++;
+    }
+  if (!n)
+    return p.v[0];
+  return recurse_arm (p, n - 1, flag);
+}
+
+long
+recurse_loop (struct pack p, long n)
+{
+  for (long i = 0; i < 3; i++)
+    if (check (&p, i))
+      return -1;
+  if (!n)
+    return p.v[0];
+  return recurse_loop (p, n - 1);
+}
+
+/* { dg-final { scan-tree-dump-times "Eliminated tail recursion" 2 "tailr1" } } */
 /* { dg-final { scan-tree-dump-times "Found tail call \[^\n\]*kept" 6 "tailc" } } */
 /* { dg-final { scan-tree-dump-not "Found tail call \[^\n\]*refused" "tailc" } } */
