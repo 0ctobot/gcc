@@ -13285,7 +13285,9 @@ legitimize_tls_address (rtx x, enum tls_model model, bool for_mov)
 	{
 	  base = get_thread_pointer (tp_mode,
 				     for_mov || !TARGET_TLS_DIRECT_SEG_REFS);
-	  off = force_reg (tp_mode, off);
+	  rtx off_reg = gen_reg_rtx (tp_mode);
+	  emit_insn (gen_tls_ie_load (tp_mode, off_reg, off));
+	  off = off_reg;
 	  dest = gen_rtx_PLUS (tp_mode, base, off);
 	  if (tp_mode != Pmode)
 	    dest = convert_to_mode (Pmode, dest, 1);
@@ -24190,6 +24192,9 @@ ix86_rtx_costs (rtx x, machine_mode mode, int outer_code_i, int opno,
       switch (XINT (x, 1))
 	{
 	case UNSPEC_TP:
+	/* Only the cost of the memory operand inside remains, which keeps the
+	   load and the add priced the same as they'd be with a plain MEM.  */
+	case UNSPEC_TLS_IE_LOAD:
 	  *total = 0;
 	  break;
 
