@@ -887,6 +887,77 @@ object_size_index_may_go_below_p (tree ref, const_tree var)
   return false;
 }
 
+/* Return the largest of the offsets, in sizetype, of the indexes on the way
+   from VAR down to PT_VAR that may be negative at run time, each from the
+   array it indexes, or NULL_TREE if none of them may be.  A negative offset
+   is above offset_limit in sizetype, so the result is above it when any of
+   those indexes is negative.  Such an index selects a subobject before the
+   start of its array, as N does in &s.m[n][3], which puts VAR outside of that
+   array.  An index into PT_VAR itself is left out when PT_VAR is a
+   declaration, since a negative index there takes the pointer out of the
+   object, where going by the object could only give a smaller size than going
+   by VAR.  */
+
+static tree
+object_size_outer_index_offset (tree var, const_tree pt_var)
+{
+  tree max_off = NULL_TREE;
+  for (tree v = var; v != pt_var && handled_component_p (v);
+       v = TREE_OPERAND (v, 0))
+    {
+      if (TREE_CODE (v) != ARRAY_REF
+	  || (TREE_OPERAND (v, 0) == pt_var && TREE_CODE (pt_var) != MEM_REF)
+	  || !object_size_index_may_go_below_p (v, TREE_OPERAND (v, 0)))
+	continue;
+
+      tree off = compute_object_offset (v, TREE_OPERAND (v, 0));
+      if (off == error_mark_node || TREE_CODE (off) == INTEGER_CST)
+	continue;
+
+      off = fold_convert (sizetype, off);
+      max_off = max_off ? size_binop (MAX_EXPR, max_off, off) : off;
+    }
+  return max_off;
+}
+
+/* Return true if PTR, an address or an SSA name set to one, goes through a
+   pointer to an array of structures with a variable index that may be
+   negative, as i does in &p->a[i].x.  The static maximum for that address
+   goes by the member when the pointer's object isn't known, which says
+   nothing about what's left from there when the index is negative.  */
+
+static bool
+object_size_pointer_index_may_go_below_p (tree ptr)
+{
+  if (TREE_CODE (ptr) == SSA_NAME)
+    {
+      gimple *def = SSA_NAME_DEF_STMT (ptr);
+      if (!gimple_assign_single_p (def))
+	return false;
+      ptr = gimple_assign_rhs1 (def);
+    }
+  if (TREE_CODE (ptr) != ADDR_EXPR)
+    return false;
+
+  tree ref = TREE_OPERAND (ptr, 0);
+  tree base = get_base_address (ref);
+  if (!base || TREE_CODE (base) != MEM_REF)
+    return false;
+
+  for (tree v = ref; v != base && handled_component_p (v);
+       v = TREE_OPERAND (v, 0))
+    {
+      if (TREE_CODE (v) != ARRAY_REF
+	  || !object_size_index_may_go_below_p (v, TREE_OPERAND (v, 0)))
+	continue;
+
+      tree off = compute_object_offset (v, TREE_OPERAND (v, 0));
+      if (off != error_mark_node && TREE_CODE (off) != INTEGER_CST)
+	return true;
+    }
+  return false;
+}
+
 /* Compute __builtin_object_size for PTR, which is a ADDR_EXPR.
    OBJECT_SIZE_TYPE is the second argument from __builtin_object_size.
    If unknown, return size_unknown (object_size_type).  */
@@ -1120,13 +1191,24 @@ addr_object_size (struct object_size_info *osi, const_tree ptr,
 	 the subtraction.  Go by it as well when a constant index below the
 	 start of an array selected the subobject or one containing it, as in
 	 &s.m[-1][3] or &s.a[-1].x[1], since the subobject is then outside of
-	 that array.  A minimum only needs to be a lower bound, so zero stays
-	 correct for those.  */
+	 that array.  A static maximum also goes by it when a variable index
+	 there may be negative, as in &s.m[n][3], since only the run time can
+	 tell.  The early objsz pass caps a dynamic maximum with the static one,
+	 so this is also what lets the dynamic size below choose at run time.
+	 When the size of the enclosing object isn't known, as for
+	 &p->a[i].x[1] with a pointer P, the subobject stays, since going by
+	 the enclosing object would lose the size of the member for every such
+	 index.  The early pass leaves a dynamic maximum for such an address
+	 uncapped, so the dynamic size can still choose.  A minimum only needs to be a lower bound, so
+	 zero or the subobject's size stays correct for those.  */
       if (!(object_size_type & OST_MINIMUM)
 	  && var != pt_var
 	  && (object_size_negative_offset_p
 		(compute_object_offset (TREE_OPERAND (ptr, 0), var))
-	      || object_size_index_below_p (var, pt_var)))
+	      || object_size_index_below_p (var, pt_var)
+	      || (!(object_size_type & OST_DYNAMIC)
+		  && pt_var_size
+		  && object_size_outer_index_offset (var, pt_var))))
 	var = pt_var;
 
       if (var != pt_var)
@@ -1197,21 +1279,33 @@ addr_object_size (struct object_size_info *osi, const_tree ptr,
 	 the offset from the subobject then.  If that offset is negative, the
 	 size is what's left in the enclosing object as it is for a constant
 	 offset.  When the size of that object isn't known, the size is one
-	 that no later offset can make too small, as described below.  */
+	 that no later offset can make too small, as described below.  A
+	 negative index that selected the subobject or one containing it, as in
+	 &s.m[n][3], leaves the subobject as well, so the offsets of those
+	 indexes count too.  The largest of all the offsets in sizetype is
+	 above offset_limit when any of them is negative, so a single
+	 comparison covers them.  */
       if (var != pt_var
 	  && (object_size_type & OST_DYNAMIC)
 	  && !(object_size_type & OST_MINIMUM)
 	  && !size_unknown_p (bytes, object_size_type))
 	{
+	  tree below_off = NULL_TREE;
 	  tree off = compute_object_offset (TREE_OPERAND (ptr, 0), var);
 	  if (off != error_mark_node
 	      && TREE_CODE (off) != INTEGER_CST
 	      && object_size_index_may_go_below_p (TREE_OPERAND (ptr, 0), var))
+	    below_off = fold_convert (sizetype, off);
+	  tree outer_off = object_size_outer_index_offset (var, pt_var);
+	  if (below_off || outer_off)
 	    {
-	      tree below = fold_build2 (GT_EXPR, boolean_type_node,
-					fold_convert (sizetype, off),
-					build_int_cstu (sizetype,
-							offset_limit));
+	      tree all_off = below_off;
+	      if (outer_off)
+		all_off = (below_off
+			   ? size_binop (MAX_EXPR, below_off, outer_off)
+			   : outer_off);
+	      tree below = fold_build2 (GT_EXPR, boolean_type_node, all_off,
+					build_int_cstu (sizetype, offset_limit));
 	      tree whole = (pt_var_size
 			    ? size_from (pt_var, pt_var_size)
 			    : size_unknown (object_size_type));
@@ -1224,10 +1318,10 @@ addr_object_size (struct object_size_info *osi, const_tree ptr,
 					    unshare_expr (pt_var_size),
 					    wholebytes);
 		}
-	      /* Behind a pointer whose object isn't known, as in
-		 &p->a[2].x[n], a negative index leaves nothing that bounds the
-		 pointer, so the size has to be unknown then, and stay unknown
-		 through later offsets.  A later offset works out
+	      /* Behind a pointer whose object isn't known, as in &p->a[i].x
+		 or &p->a[2].x[n], a negative index leaves nothing that bounds
+		 the pointer, so the size has to be unknown then, and stay
+		 unknown through later offsets.  A later offset works out
 		 MAX (WHOLE, SIZE) + OFF - SIZE, which turns a size and whole
 		 size of (size_t) -1 into a tiny size for a negative OFF.  A
 		 negative index therefore gives a size of offset_limit in a
@@ -1248,7 +1342,7 @@ addr_object_size (struct object_size_info *osi, const_tree ptr,
 		  bytes = size_binop (MAX_EXPR, bytes, big);
 		  wholebytes = size_binop (MAX_EXPR, wholebytes, all);
 		}
-	      else
+	      else if (below_off)
 		return false;
 	    }
 	}
@@ -3691,10 +3785,14 @@ early_object_sizes_execute_one (gimple_stmt_iterator *i, gimple *call)
   /* The static estimate for a non-constant offset or a pointer stepped back in
      a loop presumes that the pointer stays in the subobject.
      __builtin_dynamic_object_size can see where the pointer actually goes when
-     it's expanded later, so don't let the estimate cap it.  */
+     it's expanded later, so don't let the estimate cap it.  The same goes for
+     an address that indexes an array of structures behind a pointer with an
+     index that may be negative, as in &p->a[i].x, where the estimate is the
+     size of the member, while the dynamic size checks the index.  */
   if (object_size_type == 1
       && gimple_call_builtin_p (call, BUILT_IN_DYNAMIC_OBJECT_SIZE)
-      && object_size_may_step_back_p (ptr))
+      && (object_size_may_step_back_p (ptr)
+	  || object_size_pointer_index_may_go_below_p (ptr)))
     return;
 
   tree type = TREE_TYPE (lhs);
