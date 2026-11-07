@@ -76,7 +76,7 @@ static bool plus_stmt_object_size (struct object_size_info *, tree, gimple *);
 static bool object_size_variable_offset_p (tree, bool = false);
 static bool object_size_may_step_back_p (tree);
 static bool object_size_step_returns_p (tree, tree, tree);
-static bool object_size_offset_steps_back_p (tree);
+static bool object_size_offset_steps_back_p (tree, bool);
 static bool cond_expr_object_size (struct object_size_info *, tree, gimple *);
 static void init_offset_limit (void);
 static void check_for_plus_in_loops (struct object_size_info *, tree);
@@ -2917,6 +2917,7 @@ enum object_size_chain_query
 {
   CHAIN_MAY_STEP_BACK,
   CHAIN_REPEATS,
+  CHAIN_STEPS_BACK,
   CHAIN_END
 };
 
@@ -3136,7 +3137,7 @@ object_size_variable_offset_p (tree ptr, bool negative)
       if (TREE_CODE (off) == INTEGER_CST)
 	return negative && object_size_negative_offset_p (off);
 
-      return !negative || object_size_offset_steps_back_p (off);
+      return !negative || object_size_offset_steps_back_p (off, false);
     });
 }
 
@@ -3203,7 +3204,7 @@ object_size_may_step_back_1 (tree ptr)
 	{
 	  negative |= object_size_negative_offset_p (off);
 	  return (TREE_CODE (off) != INTEGER_CST
-		  && object_size_offset_steps_back_p (off));
+		  && object_size_offset_steps_back_p (off, false));
 	}, true))
     return true;
 
@@ -3346,24 +3347,33 @@ object_size_value_fits_p (tree val, tree type)
    negative.  A value that's zero extended or masked down to something small
    doesn't count no matter what it was before.
 
-   A value of a signed type that may simply be negative counts as well, as does
-   a conversion that can turn a non-negative value into a negative one.  An
-   unsigned value that wasn't subtracted doesn't count, since it's an index that
-   goes forward, or an index so large that using it is undefined.
+   Without INDEX, OFF is being added to something, so a value of a signed type
+   that may simply be negative counts as well, as does a conversion that can
+   turn a non-negative value into a negative one.  An unsigned value that wasn't
+   subtracted doesn't count, since it's an index that goes forward, or an index
+   so large that using it is undefined.
+
+   With INDEX, OFF is all there is to the step, so a value of a signed type that
+   may be negative doesn't count unless it's added to something.  That's what
+   two steps LABEL + N + C look like once they're folded into one, with N going
+   below LABEL and C coming back, whereas LABEL + N on its own merely uses N as
+   an index.
 
    LIMIT is the number of definitions left to walk, shared with the walks of
    the operands of a bitwise AND, and running out counts as stepping back.  */
 
 static bool
-object_size_offset_steps_back_1 (tree off, int &limit)
+object_size_offset_steps_back_1 (tree off, bool index, int &limit)
 {
   auto_bitmap visited;
-  auto_vec<tree, 8> worklist;
+  auto_vec<std::pair<tree, bool>, 8> worklist;
 
-  worklist.safe_push (off);
+  worklist.safe_push (std::make_pair (off, index));
   while (!worklist.is_empty ())
     {
-      off = worklist.pop ();
+      std::pair<tree, bool> item = worklist.pop ();
+      off = item.first;
+      index = item.second;
       if (TREE_CODE (off) == INTEGER_CST)
 	{
 	  if (object_size_negative_constant_p (off))
@@ -3372,8 +3382,12 @@ object_size_offset_steps_back_1 (tree off, int &limit)
 	}
 
       if (TREE_CODE (off) != SSA_NAME || !INTEGRAL_TYPE_P (TREE_TYPE (off)))
-	return true;
-      if (!bitmap_set_bit (visited, SSA_NAME_VERSION (off)))
+	{
+	  if (!index)
+	    return true;
+	  continue;
+	}
+      if (!bitmap_set_bit (visited, 2 * SSA_NAME_VERSION (off) + index))
 	continue;
       if (limit-- <= 0)
 	return true;
@@ -3381,8 +3395,10 @@ object_size_offset_steps_back_1 (tree off, int &limit)
       gimple *stmt = SSA_NAME_DEF_STMT (off);
       if (gimple_code (stmt) == GIMPLE_PHI)
 	{
-	  for (unsigned i = 0; i < gimple_phi_num_args (stmt); i++)
-	    worklist.safe_push (gimple_phi_arg_def (stmt, i));
+	  if (!index)
+	    for (unsigned i = 0; i < gimple_phi_num_args (stmt); i++)
+	      worklist.safe_push (std::make_pair (gimple_phi_arg_def (stmt, i),
+						  false));
 	  continue;
 	}
 
@@ -3402,6 +3418,12 @@ object_size_offset_steps_back_1 (tree off, int &limit)
 	    case BIT_NOT_EXPR:
 	      return true;
 	    case PLUS_EXPR:
+	      if (index)
+		{
+		  worklist.safe_push (std::make_pair (off, false));
+		  continue;
+		}
+	      /* FALLTHRU */
 	    case MULT_EXPR:
 	    case LSHIFT_EXPR:
 	      /* A signed sum or product that wraps around on overflow, as it
@@ -3409,7 +3431,8 @@ object_size_offset_steps_back_1 (tree off, int &limit)
 		 so can a signed shift to the left, which GCC defines the same
 		 way.  The operands only tell the sign of the result when the
 		 type doesn't wrap.  */
-	      if (!TYPE_UNSIGNED (type)
+	      if (!index
+		  && !TYPE_UNSIGNED (type)
 		  && (code == LSHIFT_EXPR || TYPE_OVERFLOW_WRAPS (type))
 		  && !tree_expr_nonnegative_p (off))
 		return true;
@@ -3429,19 +3452,28 @@ object_size_offset_steps_back_1 (tree off, int &limit)
 		  y = object_size_align_base (rhs2, m);
 		if (y)
 		  {
-		    worklist.safe_push (y);
-		    worklist.safe_push (m);
+		    worklist.safe_push (std::make_pair (y, false));
+		    worklist.safe_push (std::make_pair (m, false));
 		    continue;
 		  }
 
 		/* The result can't be negative unless both operands are, and
 		   it can't be above an operand that isn't, so it goes forward
-		   if either operand can't be negative.  When neither operand
-		   bounds the result, it may step back.  */
-		if (!object_size_offset_steps_back_1 (rhs2, limit)
-		    || !object_size_offset_steps_back_1 (rhs1, limit))
+		   if either operand can't be negative.  Ask that of each
+		   operand as a value added to something, since with INDEX a
+		   signed value that may be negative doesn't count on its own,
+		   yet (N + 5) & K is N + 5 for K = -1.  When neither operand
+		   bounds the result, it may step back, and with INDEX both
+		   operands are followed, so N & K of two signed indexes is
+		   still taken as an index like N or K alone.  */
+		if (!object_size_offset_steps_back_1 (rhs2, false, limit)
+		    || !object_size_offset_steps_back_1 (rhs1, false, limit))
 		  continue;
-		return true;
+		if (!index)
+		  return true;
+		if (TREE_CODE (rhs2) == INTEGER_CST)
+		  follow_rhs2 = false;
+		break;
 	      }
 	    case MIN_EXPR:
 	    case MAX_EXPR:
@@ -3480,7 +3512,8 @@ object_size_offset_steps_back_1 (tree off, int &limit)
 
 		/* A non-negative value can come out of a conversion to a signed
 		   type as a negative one, if it doesn't fit.  */
-		if (!TYPE_UNSIGNED (type)
+		if (!index
+		    && !TYPE_UNSIGNED (type)
 		    && (TYPE_PRECISION (type) < TYPE_PRECISION (rhs_type)
 			|| (TYPE_PRECISION (type) == TYPE_PRECISION (rhs_type)
 			    && TYPE_UNSIGNED (rhs_type))))
@@ -3496,14 +3529,14 @@ object_size_offset_steps_back_1 (tree off, int &limit)
 	      goto fallback;
 	    }
 
-	  worklist.safe_push (rhs1);
+	  worklist.safe_push (std::make_pair (rhs1, index));
 	  if (follow_rhs2)
-	    worklist.safe_push (rhs2);
+	    worklist.safe_push (std::make_pair (rhs2, index));
 	  continue;
 	}
 
     fallback:
-      if (!tree_expr_nonnegative_p (off))
+      if (!index && !tree_expr_nonnegative_p (off))
 	return true;
     }
 
@@ -3514,148 +3547,59 @@ object_size_offset_steps_back_1 (tree off, int &limit)
    says, walking no more than a fixed number of definitions.  */
 
 static bool
-object_size_offset_steps_back_p (tree off)
+object_size_offset_steps_back_p (tree off, bool index)
 {
   int limit = param_ssa_name_def_chain_limit;
-  return object_size_offset_steps_back_1 (off, limit);
+  return object_size_offset_steps_back_1 (off, index, limit);
 }
 
-/* Return true if the integer OFF, part of the offset of a pointer, may be
-   negative.  An unsigned value only counts if it's the result of subtracting,
-   since it's otherwise an index that goes forward, or an index so large that
-   using it is undefined.  */
+/* Return true if the chain of definitions of PTR has a step that may have taken
+   it below where it started, going by that step alone.  A non-constant offset
+   counts if it may be negative, whether or not it's on a cycle.  */
 
 static bool
-object_size_offset_may_be_negative_p (tree off)
+object_size_chain_steps_back_1 (tree ptr)
 {
-  auto_bitmap visited;
-  auto_vec<tree, 8> worklist;
-  int limit = param_ssa_name_def_chain_limit;
-
-  worklist.safe_push (off);
-  while (!worklist.is_empty ())
+  return object_size_walk_steps (ptr, [] (tree, tree, tree off)
     {
-      off = worklist.pop ();
       if (TREE_CODE (off) == INTEGER_CST)
-	{
-	  if (tree_int_cst_sgn (off) < 0 || object_size_negative_offset_p (off))
-	    return true;
-	  continue;
-	}
+	return object_size_negative_offset_p (off);
 
-      if (TREE_CODE (off) != SSA_NAME || !INTEGRAL_TYPE_P (TREE_TYPE (off)))
-	return true;
-      if (!bitmap_set_bit (visited, SSA_NAME_VERSION (off)))
-	continue;
-      if (limit-- == 0)
-	return true;
-
-      gimple *stmt = SSA_NAME_DEF_STMT (off);
-      if (gimple_code (stmt) == GIMPLE_PHI)
-	{
-	  for (unsigned i = 0; i < gimple_phi_num_args (stmt); i++)
-	    worklist.safe_push (gimple_phi_arg_def (stmt, i));
-	  continue;
-	}
-
-      if (is_gimple_assign (stmt))
-	switch (gimple_assign_rhs_code (stmt))
-	  {
-	  case NEGATE_EXPR:
-	  case MINUS_EXPR:
-	    return true;
-	  case PLUS_EXPR:
-	  case MULT_EXPR:
-	    worklist.safe_push (gimple_assign_rhs1 (stmt));
-	    worklist.safe_push (gimple_assign_rhs2 (stmt));
-	    continue;
-	  CASE_CONVERT:
-	    {
-	      /* A non-negative value of an unsigned type can come out of a
-		 conversion to a signed type as a negative one.  */
-	      tree type = TREE_TYPE (off);
-	      tree rhs = gimple_assign_rhs1 (stmt);
-	      if (!TYPE_UNSIGNED (type)
-		  && TYPE_UNSIGNED (TREE_TYPE (rhs))
-		  && TYPE_PRECISION (type) <= TYPE_PRECISION (TREE_TYPE (rhs)))
-		return true;
-	      /* A zero extension is never negative.  */
-	      if (TYPE_UNSIGNED (TREE_TYPE (rhs))
-		  && TYPE_PRECISION (TREE_TYPE (rhs)) < TYPE_PRECISION (type))
-		continue;
-	      worklist.safe_push (rhs);
-	      continue;
-	    }
-	  default:
-	    break;
-	  }
-
-      if (!tree_expr_nonnegative_p (off))
-	return true;
-    }
-
-  return false;
+      return object_size_offset_steps_back_p (off, false);
+    }, true);
 }
 
-/* Return true if the non-constant offset OFF is computed in a way that can step
-   back, which is different from an index that merely might be negative.  That's
-   the case for subtracting, and for adding to an index with something that may
-   be negative, or to one that may be negative itself.  The last case is what
-   two steps LABEL + N + C look like once they're folded into one, with N going
-   below LABEL and C coming back.  */
+/* Return object_size_chain_steps_back_1 (PTR), asking it once for each
+   SSA name.  */
 
 static bool
-object_size_negated_offset_p (tree off)
+object_size_chain_steps_back_p (tree ptr)
 {
-  while (TREE_CODE (off) == SSA_NAME)
-    {
-      gimple *stmt = SSA_NAME_DEF_STMT (off);
-      if (!is_gimple_assign (stmt))
-	return false;
-
-      switch (gimple_assign_rhs_code (stmt))
-	{
-	case NEGATE_EXPR:
-	case MINUS_EXPR:
-	  return true;
-	case PLUS_EXPR:
-	  return object_size_offset_may_be_negative_p (off);
-	case MULT_EXPR:
-	  if (object_size_negative_offset_p (gimple_assign_rhs2 (stmt)))
-	    return true;
-	  off = gimple_assign_rhs1 (stmt);
-	  break;
-	CASE_CONVERT:
-	  {
-	    /* A zero extension can't give a step backward.  */
-	    tree rhs = gimple_assign_rhs1 (stmt);
-	    if (TYPE_UNSIGNED (TREE_TYPE (rhs))
-		&& (TYPE_PRECISION (TREE_TYPE (rhs))
-		    < TYPE_PRECISION (TREE_TYPE (off))))
-	      return false;
-	    off = rhs;
-	    break;
-	  }
-	default:
-	  return false;
-	}
-    }
-
-  return false;
+  return object_size_chain_memo (CHAIN_STEPS_BACK, ptr,
+				 object_size_chain_steps_back_1);
 }
 
 /* Return true if the step LHS = BASE + OFF gives a pointer that may have come
    back from below its subobject, or that may be there still.  A non-constant
-   offset applied in a cycle doesn't count unless it's a step backward in
-   itself: that's an ordinary walk through the subobject.  */
+   offset applied in a cycle counts if it may be negative, since the steps on
+   the cycle can then take the pointer below the subobject and later ones bring
+   it back, as can a step backward in itself anywhere.  The cycle otherwise
+   counts if the chain leading to it may be below the subobject already.  */
 
 static bool
 object_size_step_returns_p (tree lhs, tree base, tree off)
 {
   if (TREE_CODE (off) != INTEGER_CST)
-    return (object_size_negated_offset_p (off)
-	    || (!object_size_step_repeats_p (lhs, base)
-		&& object_size_may_step_back_p (base)));
+    {
+      bool repeats = object_size_step_repeats_p (lhs, base);
+      if (object_size_offset_steps_back_p (off, !repeats))
+	return true;
+
+      if (repeats)
+	return object_size_chain_steps_back_p (base);
+
+      return object_size_may_step_back_p (base);
+    }
 
   if (object_size_negative_offset_p (off))
     return object_size_chain_repeats_p (base);
