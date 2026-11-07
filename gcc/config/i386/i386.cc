@@ -8239,6 +8239,48 @@ drap_reg_usable_p (unsigned int regno, const_hard_reg_set live_at_exit)
       && regno == REGNO (ix86_static_chain (cfun->decl, false)))
     return false;
 
+  /* Without -mfentry, the profiler is called after the prologue loads the
+     DRAP register and before the body copies it out.  mcount has to preserve
+     the registers that can carry an argument, but it may clobber the other
+     call-used ones like any other function.  final.cc saves the static chain
+     around the profiler call for the same reason.  A function without
+     caller-saved registers clears call_used_regs, but that doesn't change
+     what mcount may clobber, so look up the function's ABI in
+     CALL_USED_REGISTERS instead.  */
+  if (crtl->profile
+      && !ix86_profile_before_prologue ()
+      && !ix86_function_arg_regno_p (regno))
+    {
+      bool clobbered = call_used_or_fixed_reg_p (regno);
+      if (cfun->machine->call_saved_registers
+	  == TYPE_NO_CALLER_SAVED_REGISTERS)
+	{
+	  static const char abi_call_used_regs[] = CALL_USED_REGISTERS;
+	  char c_mask = CALL_USED_REGISTERS_MASK (TARGET_64BIT_MS_ABI);
+	  clobbered = (abi_call_used_regs[regno] == 1
+		       || (abi_call_used_regs[regno] & c_mask));
+	}
+      if (clobbered)
+	return false;
+    }
+
+  /* The profiler sequence itself writes registers right before calling mcount,
+     and the check above can let those through.  The large code models load the
+     address of mcount into R10, which -fcall-saved-r10 makes call-saved.
+     Targets with profile counters load the address of the counter into R11,
+     which -fcall-saved-r11 makes call-saved, or on ia32 into
+     PROFILE_COUNT_REGISTER (EDX), which can carry an argument.  */
+  if (crtl->profile && !ix86_profile_before_prologue ())
+    {
+      if (regno == R10_REG
+	  && (ix86_cmodel == CM_LARGE || ix86_cmodel == CM_LARGE_PIC))
+	return false;
+#ifndef NO_PROFILE_COUNTERS
+      if (regno == (TARGET_64BIT ? R11_REG : DX_REG))
+	return false;
+#endif
+    }
+
   /* An indirect sibcall can hold its target in any register of CLOBBERED_REGS
      across the epilogue.  The register operands of a sibcall are already
      covered by regs_live_at_exit ().  */
@@ -8320,11 +8362,12 @@ drap_reg_usable_p (unsigned int regno, const_hard_reg_set live_at_exit)
 
 /* Return the register to use as the dynamic realign argument pointer.  The
    preferred register isn't always usable: a global register variable or
-   -ffixed-REG can make it fixed, and -fcall-used-REG can make it call-used.
-   Check it like any other candidate, and when it fails, try the rest in order,
-   starting with the ones the function has to preserve anyway.  The APX
-   registers and AX are only tried after those, so they don't change the choice
-   for a function that any of the older candidates already worked for.  */
+   -ffixed-REG can make it fixed, -fcall-used-REG can make it call-used, and
+   mcount can clobber R10 under -pg without -mfentry.  Check it like any other
+   candidate, and when it fails, try the rest in order, starting with the ones
+   the function has to preserve anyway.  The APX registers and AX are only
+   tried after those, so they don't change the choice for a function that any
+   of the older candidates already worked for.  */
 
 static unsigned int
 find_drap_reg (void)
@@ -25180,45 +25223,17 @@ current_fentry_section (const char **name)
   return true;
 }
 
-/* Return a caller-saved register which isn't live or a callee-saved
-   register which has been saved on stack in the prologue at entry for
-   profile.  */
+/* Return the scratch register that holds the address of mcount under the
+   large code models.  mcount may clobber R10, so it can't hold anything else
+   when the profiler is called.  drap_reg_usable_p () keeps R10 from being the
+   DRAP register when the profiler is called after the prologue.  */
 
 static int
-x86_64_select_profile_regnum (bool r11_ok ATTRIBUTE_UNUSED)
+x86_64_select_profile_regnum (void)
 {
-  /* Use %r10 if the profiler is emitted before the prologue or it isn't
-     used by DRAP.  */
-  if (ix86_profile_before_prologue ()
-      || !crtl->drap_reg
-      || REGNO (crtl->drap_reg) != R10_REG)
-    return R10_REG;
-
-  /* The profiler is emitted after the prologue.  If there is a
-     caller-saved register which isn't live or a callee-saved
-     register saved on stack in the prologue, use it.  */
-
-  bitmap reg_live = df_get_live_out (ENTRY_BLOCK_PTR_FOR_FN (cfun));
-
-  int i;
-  for (i = 0; i < FIRST_PSEUDO_REGISTER; i++)
-    if (GENERAL_REGNO_P (i)
-	&& i != R10_REG
-#ifdef NO_PROFILE_COUNTERS
-	&& (r11_ok || i != R11_REG)
-#else
-	&& i != R11_REG
-#endif
-	&& TEST_HARD_REG_BIT (accessible_reg_set, i)
-	&& (ix86_save_reg (i, true, true)
-	    || (crtl->abi->clobbers_full_reg_p (i)
-		&& !fixed_regs[i]
-		&& !REGNO_REG_SET_P (reg_live, i))))
-      return i;
-
-  sorry ("no register available for profiling %<-mcmodel=large%s%>",
-	 ix86_cmodel == CM_LARGE_PIC ? " -fPIC" : "");
-
+  gcc_assert (ix86_profile_before_prologue ()
+	      || !crtl->drap_reg
+	      || REGNO (crtl->drap_reg) != R10_REG);
   return R10_REG;
 }
 
@@ -25272,7 +25287,7 @@ x86_function_profiler (FILE *file, int labelno ATTRIBUTE_UNUSED)
 	  switch (ix86_cmodel)
 	    {
 	    case CM_LARGE:
-	      scratch = x86_64_select_profile_regnum (true);
+	      scratch = x86_64_select_profile_regnum ();
 	      reg = hi_reg_name[scratch];
 	      if (LEGACY_INT_REGNO_P (scratch))
 		{
@@ -25291,7 +25306,7 @@ x86_function_profiler (FILE *file, int labelno ATTRIBUTE_UNUSED)
 	      break;
 	    case CM_LARGE_PIC:
 #ifdef NO_PROFILE_COUNTERS
-	      scratch = x86_64_select_profile_regnum (false);
+	      scratch = x86_64_select_profile_regnum ();
 	      reg = hi_reg_name[scratch];
 	      if (LEGACY_INT_REGNO_P (scratch))
 		{
