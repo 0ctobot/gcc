@@ -3512,6 +3512,21 @@ vect_analyze_data_ref_access (vec_info *vinfo, dr_vec_info *dr_info)
   return vect_analyze_group_access (vinfo, dr_info);
 }
 
+/* Return the address space that DR accesses.  This is what expansion goes by
+   and it can't be read from DR_BASE_ADDRESS, which looks through integer casts
+   of the pointer used for the access.  */
+
+static addr_space_t
+vect_dr_addr_space (data_reference_p dr)
+{
+  tree base = DR_REF (dr);
+  while (handled_component_p (base))
+    base = TREE_OPERAND (base, 0);
+  if (TREE_CODE (base) == MEM_REF || TREE_CODE (base) == TARGET_MEM_REF)
+    return TYPE_ADDR_SPACE (TREE_TYPE (TREE_TYPE (TREE_OPERAND (base, 0))));
+  return TYPE_ADDR_SPACE (TREE_TYPE (base));
+}
+
 /* Compare two data-references DRA and DRB to group them into chunks
    suitable for grouping.  */
 
@@ -3542,6 +3557,13 @@ dr_group_sort_cmp (const void *dra_, const void *drb_)
   cmp = data_ref_compare_tree (DR_OFFSET (dra), DR_OFFSET (drb));
   if (cmp != 0)
     return cmp;
+
+  /* Keep accesses in the same address space next to each other, since an
+     access in another one can't be part of their group.  */
+  addr_space_t asa = vect_dr_addr_space (dra);
+  addr_space_t asb = vect_dr_addr_space (drb);
+  if (asa != asb)
+    return asa < asb ? -1 : 1;
 
   /* Put reads before writes.  */
   if (DR_IS_READ (dra) != DR_IS_READ (drb))
@@ -3702,11 +3724,13 @@ vect_analyze_data_ref_accesses (vec_info *vinfo,
 
 	  /* Check that the data-refs have same first location (except init)
 	     and they are both either store or load (not load and store,
-	     not masked loads or stores).  */
+	     not masked loads or stores).  The same address in a different
+	     address space isn't the same location.  */
 	  if (DR_IS_READ (dra) != DR_IS_READ (drb)
 	      || data_ref_compare_tree (DR_BASE_ADDRESS (dra),
 					DR_BASE_ADDRESS (drb)) != 0
 	      || data_ref_compare_tree (DR_OFFSET (dra), DR_OFFSET (drb)) != 0
+	      || vect_dr_addr_space (dra) != vect_dr_addr_space (drb)
 	      || !can_group_stmts_p (stmtinfo_a, stmtinfo_b, true))
 	    break;
 
