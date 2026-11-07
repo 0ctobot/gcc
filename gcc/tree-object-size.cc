@@ -2907,130 +2907,374 @@ object_size_may_step_back_p (tree ptr)
   return negative && object_size_chain_repeats_p (ptr);
 }
 
-/* Return true if the integer OFF, part of the offset of a pointer, may be
-   negative.  An unsigned value only counts if it's the result of subtracting,
-   since it's otherwise an index that goes forward, or an index so large that
-   using it is undefined.  */
+/* Return true if the constant CST is negative, either as a value of its type or
+   as a pointer offset.  */
 
 static bool
-object_size_offset_may_be_negative_p (tree off)
+object_size_negative_constant_p (tree cst)
+{
+  return tree_int_cst_sgn (cst) < 0 || object_size_negative_offset_p (cst);
+}
+
+/* If the integer VAL is M + -1, return M.  */
+
+static tree
+object_size_decremented_value (tree val)
+{
+  if (TREE_CODE (val) != SSA_NAME)
+    return NULL_TREE;
+
+  gimple *stmt = SSA_NAME_DEF_STMT (val);
+  if (is_gimple_assign (stmt)
+      && gimple_assign_rhs_code (stmt) == PLUS_EXPR
+      && integer_minus_onep (gimple_assign_rhs2 (stmt)))
+    return gimple_assign_rhs1 (stmt);
+
+  return NULL_TREE;
+}
+
+/* If the integer MASK is -M or ~(M - 1), which is how a value gets aligned to a
+   multiple M that isn't a constant, return M.  */
+
+static tree
+object_size_align_mask (tree mask)
+{
+  if (TREE_CODE (mask) != SSA_NAME)
+    return NULL_TREE;
+
+  gimple *stmt = SSA_NAME_DEF_STMT (mask);
+  if (!is_gimple_assign (stmt))
+    return NULL_TREE;
+
+  tree m = gimple_assign_rhs1 (stmt);
+  if (gimple_assign_rhs_code (stmt) == BIT_NOT_EXPR)
+    m = object_size_decremented_value (m);
+  else if (gimple_assign_rhs_code (stmt) != NEGATE_EXPR)
+    return NULL_TREE;
+
+  return m && TREE_CODE (m) == SSA_NAME ? m : NULL_TREE;
+}
+
+/* If the integer VAL is Y + M - 1, added up in either order, return Y.  */
+
+static tree
+object_size_align_base (tree val, tree m)
+{
+  if (TREE_CODE (val) != SSA_NAME)
+    return NULL_TREE;
+
+  gimple *stmt = SSA_NAME_DEF_STMT (val);
+  if (!is_gimple_assign (stmt) || gimple_assign_rhs_code (stmt) != PLUS_EXPR)
+    return NULL_TREE;
+
+  tree rhs1 = gimple_assign_rhs1 (stmt);
+  tree rhs2 = gimple_assign_rhs2 (stmt);
+  if (integer_minus_onep (rhs2))
+    {
+      if (TREE_CODE (rhs1) != SSA_NAME)
+	return NULL_TREE;
+
+      stmt = SSA_NAME_DEF_STMT (rhs1);
+      if (!is_gimple_assign (stmt)
+	  || gimple_assign_rhs_code (stmt) != PLUS_EXPR)
+	return NULL_TREE;
+
+      rhs1 = gimple_assign_rhs1 (stmt);
+      rhs2 = gimple_assign_rhs2 (stmt);
+      if (rhs1 == m)
+	return rhs2;
+      if (rhs2 == m)
+	return rhs1;
+      return NULL_TREE;
+    }
+
+  if (object_size_decremented_value (rhs2) == m)
+    return rhs1;
+  if (object_size_decremented_value (rhs1) == m)
+    return rhs2;
+  return NULL_TREE;
+}
+
+/* Return true if the value of the integer VAL is known to fit in the signed
+   type TYPE, going by how VAL is computed.  */
+
+static bool
+object_size_value_fits_p (tree val, tree type)
+{
+  if (TREE_CODE (val) != SSA_NAME)
+    return false;
+
+  gimple *stmt = SSA_NAME_DEF_STMT (val);
+  if (!is_gimple_assign (stmt))
+    return false;
+
+  tree rhs1 = gimple_assign_rhs1 (stmt);
+  switch (gimple_assign_rhs_code (stmt))
+    {
+    case BIT_AND_EXPR:
+      {
+	tree mask = gimple_assign_rhs2 (stmt);
+	return (TREE_CODE (mask) == INTEGER_CST
+		&& tree_int_cst_sgn (mask) >= 0
+		&& int_fits_type_p (mask, type));
+      }
+    CASE_CONVERT:
+      return (INTEGRAL_TYPE_P (TREE_TYPE (rhs1))
+	      && TYPE_UNSIGNED (TREE_TYPE (rhs1))
+	      && TYPE_PRECISION (TREE_TYPE (rhs1)) < TYPE_PRECISION (type));
+    default:
+      return false;
+    }
+}
+
+/* Return true if the integer OFF, part of the offset of a pointer, can take the
+   pointer below where it was, going by how OFF is computed.  Subtracting always
+   counts, and so does anything done to a subtracted value that leaves it
+   negative.  A value that's zero extended or masked down to something small
+   doesn't count no matter what it was before.
+
+   Without INDEX, OFF is being added to something, so a value of a signed type
+   that may simply be negative counts as well, as does a conversion that can
+   turn a non-negative value into a negative one.  An unsigned value that wasn't
+   subtracted doesn't count, since it's an index that goes forward, or an index
+   so large that using it is undefined.
+
+   With INDEX, OFF is all there is to the step, so a value of a signed type that
+   may be negative doesn't count unless it's added to something.  That's what two
+   steps LABEL + N + C look like once they're folded into one, with N going below
+   LABEL and C coming back, whereas LABEL + N on its own merely uses N as an
+   index.
+
+   LIMIT is the number of definitions left to walk, shared with the walks of
+   the operands of a bitwise AND, and running out counts as stepping back.  */
+
+static bool
+object_size_offset_steps_back_1 (tree off, bool index, int &limit)
 {
   auto_bitmap visited;
-  auto_vec<tree, 8> worklist;
-  int limit = param_ssa_name_def_chain_limit;
+  auto_vec<std::pair<tree, bool>, 8> worklist;
 
-  worklist.safe_push (off);
+  worklist.safe_push (std::make_pair (off, index));
   while (!worklist.is_empty ())
     {
-      off = worklist.pop ();
+      std::pair<tree, bool> item = worklist.pop ();
+      off = item.first;
+      index = item.second;
       if (TREE_CODE (off) == INTEGER_CST)
 	{
-	  if (tree_int_cst_sgn (off) < 0 || object_size_negative_offset_p (off))
+	  if (object_size_negative_constant_p (off))
 	    return true;
 	  continue;
 	}
 
       if (TREE_CODE (off) != SSA_NAME || !INTEGRAL_TYPE_P (TREE_TYPE (off)))
-	return true;
-      if (!bitmap_set_bit (visited, SSA_NAME_VERSION (off)))
+	{
+	  if (!index)
+	    return true;
+	  continue;
+	}
+      if (!bitmap_set_bit (visited, 2 * SSA_NAME_VERSION (off) + index))
 	continue;
-      if (limit-- == 0)
+      if (limit-- <= 0)
 	return true;
 
       gimple *stmt = SSA_NAME_DEF_STMT (off);
       if (gimple_code (stmt) == GIMPLE_PHI)
 	{
-	  for (unsigned i = 0; i < gimple_phi_num_args (stmt); i++)
-	    worklist.safe_push (gimple_phi_arg_def (stmt, i));
+	  if (!index)
+	    for (unsigned i = 0; i < gimple_phi_num_args (stmt); i++)
+	      worklist.safe_push (std::make_pair (gimple_phi_arg_def (stmt, i),
+						  false));
 	  continue;
 	}
 
       if (is_gimple_assign (stmt))
-	switch (gimple_assign_rhs_code (stmt))
-	  {
-	  case NEGATE_EXPR:
-	  case MINUS_EXPR:
-	    return true;
-	  case PLUS_EXPR:
-	  case MULT_EXPR:
-	    worklist.safe_push (gimple_assign_rhs1 (stmt));
-	    worklist.safe_push (gimple_assign_rhs2 (stmt));
-	    continue;
-	  CASE_CONVERT:
-	    {
-	      /* A non-negative value of an unsigned type can come out of a
-		 conversion to a signed type as a negative one.  */
-	      tree type = TREE_TYPE (off);
-	      tree rhs = gimple_assign_rhs1 (stmt);
-	      if (!TYPE_UNSIGNED (type)
-		  && TYPE_UNSIGNED (TREE_TYPE (rhs))
-		  && TYPE_PRECISION (type) <= TYPE_PRECISION (TREE_TYPE (rhs)))
-		return true;
-	      worklist.safe_push (rhs);
-	      continue;
-	    }
-	  default:
-	    break;
-	  }
+	{
+	  tree type = TREE_TYPE (off);
+	  tree rhs1 = gimple_assign_rhs1 (stmt);
+	  tree rhs2 = gimple_assign_rhs2 (stmt);
+	  enum tree_code code = gimple_assign_rhs_code (stmt);
+	  bool follow_rhs2 = true;
 
-      if (!tree_expr_nonnegative_p (off))
+	  switch (code)
+	    {
+	    case NEGATE_EXPR:
+	    case MINUS_EXPR:
+	    case POINTER_DIFF_EXPR:
+	    case BIT_NOT_EXPR:
+	      return true;
+	    case PLUS_EXPR:
+	      if (index)
+		{
+		  worklist.safe_push (std::make_pair (off, false));
+		  continue;
+		}
+	      break;
+	    case MULT_EXPR:
+	    case BIT_IOR_EXPR:
+	    case BIT_XOR_EXPR:
+	      break;
+	    case LSHIFT_EXPR:
+	      follow_rhs2 = false;
+	      break;
+	    case BIT_AND_EXPR:
+	      {
+		/* Aligning Y up to a multiple M gives at most Y + M - 1 if M
+		   isn't zero, and zero if it is.  The -1 can only step back
+		   when M is zero, and then the mask clears everything.  */
+		tree m = object_size_align_mask (rhs2);
+		tree y = m ? object_size_align_base (rhs1, m) : NULL_TREE;
+		if (!y && (m = object_size_align_mask (rhs1)))
+		  y = object_size_align_base (rhs2, m);
+		if (y)
+		  {
+		    worklist.safe_push (std::make_pair (y, false));
+		    worklist.safe_push (std::make_pair (m, false));
+		    continue;
+		  }
+
+		/* The result can't be negative unless both operands are, and
+		   it can't be above an operand that isn't, so it goes forward
+		   if either operand can't be negative.  Ask that of each
+		   operand as a value added to something, since with INDEX a
+		   signed value that may be negative doesn't count on its own,
+		   yet (N + 5) & K is N + 5 for K = -1.  When neither operand
+		   bounds the result, it may step back, and with INDEX both
+		   operands are followed, so N & K of two signed indexes is
+		   still taken as an index like N or K alone.  */
+		if (!object_size_offset_steps_back_1 (rhs2, false, limit)
+		    || !object_size_offset_steps_back_1 (rhs1, false, limit))
+		  continue;
+		if (!index)
+		  return true;
+		if (TREE_CODE (rhs2) == INTEGER_CST)
+		  follow_rhs2 = false;
+		break;
+	      }
+	    case MIN_EXPR:
+	    case MAX_EXPR:
+	      /* A non-negative constant bounds the unsigned minimum from above,
+		 and the signed maximum from below.  */
+	      if (TREE_CODE (rhs2) == INTEGER_CST
+		  && !object_size_negative_constant_p (rhs2)
+		  && TYPE_UNSIGNED (type) == (code == MIN_EXPR))
+		continue;
+	      break;
+	    case COND_EXPR:
+	      rhs1 = gimple_assign_rhs3 (stmt);
+	      break;
+	    case SSA_NAME:
+	      follow_rhs2 = false;
+	      break;
+	    case RSHIFT_EXPR:
+	    case TRUNC_MOD_EXPR:
+	      /* The sign of the result is the sign of the first operand.  */
+	      if (TYPE_UNSIGNED (type))
+		goto fallback;
+	      follow_rhs2 = false;
+	      break;
+	    case TRUNC_DIV_EXPR:
+	    case EXACT_DIV_EXPR:
+	      if (TYPE_UNSIGNED (type))
+		goto fallback;
+	      break;
+	    CASE_CONVERT:
+	      {
+		tree rhs_type = TREE_TYPE (rhs1);
+		if (INTEGRAL_TYPE_P (rhs_type)
+		    && TYPE_UNSIGNED (rhs_type)
+		    && TYPE_PRECISION (rhs_type) < TYPE_PRECISION (type))
+		  continue;
+
+		/* A non-negative value can come out of a conversion to a signed
+		   type as a negative one, if it doesn't fit.  */
+		if (!index
+		    && !TYPE_UNSIGNED (type)
+		    && (TYPE_PRECISION (type) < TYPE_PRECISION (rhs_type)
+			|| (TYPE_PRECISION (type) == TYPE_PRECISION (rhs_type)
+			    && TYPE_UNSIGNED (rhs_type))))
+		  {
+		    if (object_size_value_fits_p (rhs1, type))
+		      continue;
+		    return true;
+		  }
+		follow_rhs2 = false;
+		break;
+	      }
+	    default:
+	      goto fallback;
+	    }
+
+	  worklist.safe_push (std::make_pair (rhs1, index));
+	  if (follow_rhs2)
+	    worklist.safe_push (std::make_pair (rhs2, index));
+	  continue;
+	}
+
+    fallback:
+      if (!index && !tree_expr_nonnegative_p (off))
 	return true;
     }
 
   return false;
 }
 
+/* Return true if the integer OFF steps back as object_size_offset_steps_back_1
+   says, walking no more than a fixed number of definitions.  */
+
+static bool
+object_size_offset_steps_back_p (tree off, bool index)
+{
+  int limit = param_ssa_name_def_chain_limit;
+  return object_size_offset_steps_back_1 (off, index, limit);
+}
+
 /* Return true if the non-constant offset OFF is computed in a way that can step
-   back, which is different from an index that merely might be negative.  That's
-   the case for subtracting, and for adding to an index with something that may
-   be negative, or to one that may be negative itself.  The latter is what two
-   steps LABEL + N + C look like once they're folded into one, with N going
-   below LABEL and C coming back.  */
+   back, which is different from an index that merely might be negative.  */
 
 static bool
 object_size_negated_offset_p (tree off)
 {
-  while (TREE_CODE (off) == SSA_NAME)
+  return object_size_offset_steps_back_p (off, true);
+}
+
+/* Return true if the chain of definitions of PTR has a step that may have taken
+   it below where it started, going by that step alone.  A non-constant offset on
+   a cycle only counts if it's a step backward in itself, since it's otherwise an
+   ordinary walk through the subobject.  */
+
+static bool
+object_size_chain_steps_back_p (tree ptr)
+{
+  return object_size_walk_steps (ptr, [] (tree lhs, tree base, tree off)
     {
-      gimple *stmt = SSA_NAME_DEF_STMT (off);
-      if (!is_gimple_assign (stmt))
-	return false;
+      if (TREE_CODE (off) == INTEGER_CST)
+	return object_size_negative_offset_p (off);
 
-      switch (gimple_assign_rhs_code (stmt))
-	{
-	case NEGATE_EXPR:
-	case MINUS_EXPR:
-	  return true;
-	case PLUS_EXPR:
-	  return object_size_offset_may_be_negative_p (off);
-	case MULT_EXPR:
-	  if (object_size_negative_offset_p (gimple_assign_rhs2 (stmt)))
-	    return true;
-	  off = gimple_assign_rhs1 (stmt);
-	  break;
-	CASE_CONVERT:
-	  off = gimple_assign_rhs1 (stmt);
-	  break;
-	default:
-	  return false;
-	}
-    }
-
-  return false;
+      return object_size_offset_steps_back_p
+	(off, object_size_step_repeats_p (lhs, base));
+    }, true);
 }
 
 /* Return true if the step LHS = BASE + OFF gives a pointer that may have come
    back from below its subobject, or that may be there still.  A non-constant
-   offset applied in a cycle doesn't count unless it's a step backward in
-   itself: that's an ordinary walk through the subobject.  */
+   offset applied in a cycle is an ordinary walk through the subobject, so it
+   only counts if it's a step backward in itself or if the chain leading to the
+   cycle may be below the subobject already.  */
 
 static bool
 object_size_step_returns_p (tree lhs, tree base, tree off)
 {
   if (TREE_CODE (off) != INTEGER_CST)
-    return (object_size_negated_offset_p (off)
-	    || (!object_size_step_repeats_p (lhs, base)
-		&& object_size_may_step_back_p (base)));
+    {
+      if (object_size_negated_offset_p (off))
+	return true;
+
+      if (object_size_step_repeats_p (lhs, base))
+	return object_size_chain_steps_back_p (base);
+
+      return object_size_may_step_back_p (base);
+    }
 
   if (object_size_negative_offset_p (off))
     return object_size_chain_repeats_p (base);
