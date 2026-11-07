@@ -125,15 +125,20 @@ tree_associate_condition_with_expr (tree stmt, unsigned uid)
 /* Hash set of poisoned variables in a bind expr.  */
 static hash_set<tree> *asan_poisoned_variables = NULL;
 
-/* Where the variables and the user labels that a jump can come back to are in
-   the function being gimplified, or NULL if every label has to count as such a
-   label.  See find_back_jump_labels.  */
+/* Where the variables and the labels that a jump can come back to are in the
+   function being gimplified, or NULL outside of C and Objective-C.  See
+   find_back_jump_labels.  */
 static hash_map<tree, unsigned> *reinit_places;
 
+/* True if every user label in the function being gimplified has to count as one
+   that a jump can come back to, since a computed goto or a nested function can
+   reach it from anywhere.  Neither of those can reach an artificial label, so
+   those still go by reinit_places.  */
+static bool reinit_all_labels;
+
 /* The flag of each variable whose re-run initializer gets built in a temporary
-   while automatic variable initialization is in effect, or NULL unless
-   gimplify_body is working on a C or Objective-C function.  See
-   reinit_auto_init.  */
+   while automatic variable initialization is in effect, or NULL along with
+   reinit_places.  See reinit_auto_init.  */
 static hash_map<tree, tree> *reinit_auto_init_vars;
 
 static void gimple_add_init_for_auto_var (tree, enum auto_init_type,
@@ -2423,11 +2428,15 @@ struct reinit_read_walk
 /* Callback for walk_tree from reinit_needs_tmp_p.  DATA is the walk state.
    Find what can make the old value of the variable visible while its
    initializer is being evaluated: a read of it by name, a jump that abandons
-   the initializer and leaves the variable to be read below, or a read through a
-   pointer if the variable has its address taken.  The pointer needn't be
-   dereferenced in the initializer itself, since a call that isn't const can read
-   memory, and a pure one or a builtin like strlen has no side effects to tell us
-   so.  */
+   the initializer and leaves the variable to be read below, a call that
+   abandons it with a longjmp if something in this function can regain control
+   after that, or a read through a pointer if the variable has its address
+   taken.  The pointer needn't be dereferenced in the initializer itself, since
+   a call that isn't const can read memory, and a pure one or a builtin like
+   strlen has no side effects to tell us so.  A va_arg reads memory too,
+   through the pointer in its va_list, which can point into the variable.
+   Other side effects, like an increment or a volatile read, can't do any of
+   this.  */
 
 static tree
 find_reinit_read_r (tree *tp, int *, void *data)
@@ -2449,17 +2458,25 @@ find_reinit_read_r (tree *tp, int *, void *data)
       break;
 
     case ASM_EXPR:
-      if (ASM_LABELS (t))
+      /* We can't tell what an asm does, so it counts as a call.  */
+      if (ASM_LABELS (t)
+	  || TREE_ADDRESSABLE (w->decl)
+	  || gimplify_ctxp->has_reinit_receiver)
 	return t;
       break;
 
     case INDIRECT_REF:
     case MEM_REF:
+    case VA_ARG_EXPR:
       if (TREE_ADDRESSABLE (w->decl))
 	return t;
       break;
+
     case CALL_EXPR:
       if (TREE_ADDRESSABLE (w->decl) && !(call_expr_flags (t) & ECF_CONST))
+	return t;
+      if (gimplify_ctxp->has_reinit_receiver
+	  && !(call_expr_flags (t) & (ECF_CONST | ECF_PURE)))
 	return t;
       break;
 
@@ -2496,17 +2513,12 @@ reinit_needs_tmp_p (tree decl, tree val)
       || TREE_CODE (DECL_SIZE_UNIT (decl)) != INTEGER_CST)
     return false;
 
-  if (TREE_SIDE_EFFECTS (val))
-    {
-      /* Anything in VAL can abandon it with a longjmp.  */
-      if (gimplify_ctxp->has_reinit_receiver || TREE_ADDRESSABLE (decl))
-	return true;
-    }
   /* A plain copy has nothing to clear or to store a part at a time.  */
-  else if (DECL_P (val)
-	   || handled_component_p (val)
-	   || INDIRECT_REF_P (val)
-	   || TREE_CODE (val) == MEM_REF)
+  if (!TREE_SIDE_EFFECTS (val)
+      && (DECL_P (val)
+	  || handled_component_p (val)
+	  || INDIRECT_REF_P (val)
+	  || TREE_CODE (val) == MEM_REF))
     return false;
 
   reinit_read_walk w;
@@ -2623,14 +2635,15 @@ gimplify_decl_expr (tree *stmt_p, gimple_seq *seq_p)
 		 end its lifetime, so DECL can hold a value when its initializer
 		 runs again, and that value has to stay in place until the new
 		 one is complete.  A call in the initializer can read it through
-		 the address of DECL, and a call that abandons the initialization
-		 with a longjmp must leave it behind.  Only a setjmp before the
-		 declaration or a user label before it with a jump back from
-		 further down allows this, since a loop body is a block of its
-		 own.  The read takes a DECL with its address taken.  The longjmp
-		 only matters if something in this function can regain control
-		 after it, since otherwise it ends this frame and DECL along with
-		 it.  */
+		 the address of DECL, and a call that abandons the
+		 initialization with a longjmp must leave it behind.  Only a
+		 setjmp before the declaration, a user label before it with a
+		 jump back from further down, or a loop around a compound
+		 literal in the loop's own condition or increment allows this,
+		 since a loop body is a block of its own.  The read takes a DECL
+		 with its address taken.  The longjmp only matters if something
+		 in this function can regain control after it, since otherwise
+		 it ends this frame and DECL along with it.  */
 	      tree old_reinit_decl = gimplify_ctxp->reinit_decl;
 	      bool init_in_tmp = false;
 	      gimplify_ctxp->reinit_decl = NULL_TREE;
@@ -3641,14 +3654,11 @@ gimplify_label_expr (tree *expr_p, gimple_seq *pre_p)
 
   tree label = LABEL_EXPR_LABEL (*expr_p);
   glabel *label_stmt = gimple_build_label (label);
-  if (!DECL_ARTIFICIAL (label))
-    {
-      if (!reinit_places)
-	gimplify_ctxp->reinit_last_jump = UINT_MAX;
-      else if (unsigned *jump = reinit_places->get (label))
-	gimplify_ctxp->reinit_last_jump = MAX (gimplify_ctxp->reinit_last_jump,
-					       *jump);
-    }
+  if (!reinit_places || (reinit_all_labels && !DECL_ARTIFICIAL (label)))
+    gimplify_ctxp->reinit_last_jump = UINT_MAX;
+  else if (unsigned *jump = reinit_places->get (label))
+    gimplify_ctxp->reinit_last_jump = MAX (gimplify_ctxp->reinit_last_jump,
+					   *jump);
   gimple_set_location (label_stmt, EXPR_LOCATION (*expr_p));
   gimplify_seq_add_stmt (pre_p, label_stmt);
 
@@ -22652,6 +22662,8 @@ struct back_jump_walk
   unsigned place;
   /* The place of the statement being walked in the innermost BIND_EXPR.  */
   unsigned stmt_place;
+  /* Whether a computed goto was walked.  */
+  bool computed_goto;
 };
 
 /* Callback for walk_tree from find_back_jump_labels.  DATA is the walk state.
@@ -22661,8 +22673,7 @@ struct back_jump_walk
    another.  The order can differ for a jump in one operand and a compound
    literal in another too, and that jump can reach a label above both of them.
    A variable thus takes the place of the whole statement holding it, which
-   comes before any jump in that statement.  Return non-NULL at a computed
-   goto.  */
+   comes before any jump in that statement.  */
 
 static tree
 find_back_jump_labels_r (tree *tp, int *walk_subtrees, void *data)
@@ -22678,8 +22689,8 @@ find_back_jump_labels_r (tree *tp, int *walk_subtrees, void *data)
 
     case GOTO_EXPR:
       if (TREE_CODE (GOTO_DESTINATION (t)) != LABEL_DECL)
-	return t;
-      if (w->seen.contains (GOTO_DESTINATION (t)))
+	w->computed_goto = true;
+      else if (w->seen.contains (GOTO_DESTINATION (t)))
 	w->places->put (GOTO_DESTINATION (t), ++w->place);
       break;
 
@@ -22695,24 +22706,23 @@ find_back_jump_labels_r (tree *tp, int *walk_subtrees, void *data)
 	 at their DECL_EXPR instead.  */
       *walk_subtrees = 0;
       {
-	tree stop = NULL_TREE;
 	unsigned old_stmt_place = w->stmt_place;
 	if (TREE_CODE (BIND_EXPR_BODY (t)) == STATEMENT_LIST)
 	  for (tree_stmt_iterator i = tsi_start (BIND_EXPR_BODY (t));
-	       !stop && !tsi_end_p (i); tsi_next (&i))
+	       !tsi_end_p (i); tsi_next (&i))
 	    {
 	      w->stmt_place = ++w->place;
-	      stop = walk_tree (tsi_stmt_ptr (i), find_back_jump_labels_r, data,
-				&w->visited);
+	      walk_tree (tsi_stmt_ptr (i), find_back_jump_labels_r, data,
+			 &w->visited);
 	    }
 	else
 	  {
 	    w->stmt_place = ++w->place;
-	    stop = walk_tree (&BIND_EXPR_BODY (t), find_back_jump_labels_r, data,
-			      &w->visited);
+	    walk_tree (&BIND_EXPR_BODY (t), find_back_jump_labels_r, data,
+		       &w->visited);
 	  }
 	w->stmt_place = old_stmt_place;
-	return stop;
+	return NULL_TREE;
       }
 
     case DECL_EXPR:
@@ -22721,12 +22731,11 @@ find_back_jump_labels_r (tree *tp, int *walk_subtrees, void *data)
 	  tree decl = DECL_EXPR_DECL (t);
 	  if (DECL_INITIAL (decl))
 	    w->places->put (decl, w->stmt_place);
-	  if (tree stop = walk_tree (&DECL_SIZE_UNIT (decl),
-				     find_back_jump_labels_r, data,
-				     &w->visited))
-	    return stop;
-	  return walk_tree (&DECL_INITIAL (decl), find_back_jump_labels_r, data,
-			    &w->visited);
+	  walk_tree (&DECL_SIZE_UNIT (decl), find_back_jump_labels_r, data,
+		     &w->visited);
+	  walk_tree (&DECL_INITIAL (decl), find_back_jump_labels_r, data,
+		     &w->visited);
+	  return NULL_TREE;
 	}
       break;
 
@@ -22741,15 +22750,19 @@ find_back_jump_labels_r (tree *tp, int *walk_subtrees, void *data)
    where the last jump is to each label that a jump can come back to from
    further down, as numbers that grow in the order those get gimplified.
    Running the initializer of a declaration again within its lifetime takes a
-   jump from its statement or below to a label above it.  Nothing else can go up
-   without leaving the block of the declaration, since a loop around the
-   declaration has that block inside of it.  A label above a declaration thus
-   only counts for that declaration if the last jump to the label comes later
-   than the declaration, which leaves out a retry loop above it.  The usual
-   forward goto to a label at the end of a block can't run anything twice.
-   Return false if FNDECL has a computed goto, which can go back to any label
-   with its address taken, since every label has to count then.  Only taking the
-   address doesn't make a label a target, as in the kernel's _THIS_IP_.  */
+   jump from its statement or below to a label above it.  That can be the jump
+   back of a loop to its artificial label, since a compound literal in the
+   condition or the increment of a loop belongs to the block of the iteration
+   statement, and that block holds both the label and the jump.  Nothing else
+   can go up without leaving the block of the variable, since a loop around a
+   declaration, or around a compound literal in its body, has that block inside
+   of it.  A label above a declaration thus only counts for that declaration if
+   the last jump to the label comes later than the declaration, which leaves out
+   a retry loop above it.  The usual forward goto to a label at the end of a
+   block can't run anything twice.  Return true if FNDECL has a computed goto,
+   which can go back to any user label with its address taken, since every user
+   label has to count then.  Only taking the address doesn't make a label a
+   target, as in the kernel's _THIS_IP_.  */
 
 static bool
 find_back_jump_labels (tree fndecl, hash_map<tree, unsigned> *places)
@@ -22758,8 +22771,10 @@ find_back_jump_labels (tree fndecl, hash_map<tree, unsigned> *places)
   w.places = places;
   w.place = 0;
   w.stmt_place = 0;
-  return !walk_tree (&DECL_SAVED_TREE (fndecl), find_back_jump_labels_r, &w,
-		     &w.visited);
+  w.computed_goto = false;
+  walk_tree (&DECL_SAVED_TREE (fndecl), find_back_jump_labels_r, &w,
+	     &w.visited);
+  return w.computed_goto;
 }
 
 /* Gimplify the body of statements of FNDECL and return a GIMPLE_BIND node
@@ -22809,11 +22824,12 @@ gimplify_body (tree fndecl, bool do_parms)
       gimplify_ctxp->has_reinit_receiver
 	= function_has_reinit_receiver_p (fndecl);
 
-      /* A nested function can jump to any label of FNDECL.  */
+      /* A nested function can jump to any user label of FNDECL.  */
       cgraph_node *cgn = cgraph_node::get (fndecl);
-      if ((!cgn || !first_nested_function (cgn))
-	  && find_back_jump_labels (fndecl, &places))
-	reinit_places = &places;
+      reinit_all_labels = find_back_jump_labels (fndecl, &places);
+      if (cgn && first_nested_function (cgn))
+	reinit_all_labels = true;
+      reinit_places = &places;
       reinit_auto_init_vars = &auto_init_vars;
     }
 
