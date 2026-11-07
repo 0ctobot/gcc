@@ -845,15 +845,11 @@ prefer (pre_expr a, pre_expr b)
       if (refa->set == refb->set
 	  && refa->base_set == refb->base_set)
 	;
-      else if ((refb->set == refa->set
-		|| alias_set_subset_of (refb->set, refa->set))
-	       && (refb->base_set == refa->base_set
-		   || alias_set_subset_of (refb->base_set, refa->base_set)))
+      else if (alias_sets_cover_p (refa->set, refa->base_set,
+				   refb->set, refb->base_set))
 	palias = a;
-      else if ((refa->set == refb->set
-		|| alias_set_subset_of (refa->set, refb->set))
-	       && (refa->base_set == refb->base_set
-		   || alias_set_subset_of (refa->base_set, refb->base_set)))
+      else if (alias_sets_cover_p (refb->set, refb->base_set,
+				   refa->set, refa->base_set))
 	palias = b;
       else
 	/* We have to chose an expression representation that can stand
