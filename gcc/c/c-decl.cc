@@ -11650,6 +11650,8 @@ finish_function (location_t end_loc)
   /* Tie off the statement tree for this function.  */
   DECL_SAVED_TREE (fndecl) = pop_stmt_list (DECL_SAVED_TREE (fndecl));
 
+  c_check_cond_unsure_vars (fndecl);
+
   finish_fname_decls ();
 
   /* Complain if there's no return statement only if option specified on

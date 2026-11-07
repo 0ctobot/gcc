@@ -37,6 +37,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "trans-mem.h"
 #include "varasm.h"
 #include "stmt.h"
+#include "calls.h"
 #include "langhooks.h"
 #include "c-lang.h"
 #include "intl.h"
@@ -6662,6 +6663,267 @@ type_or_builtin_type (tree expr, tree *bltin = NULL)
   return type;
 }
 
+/* What the operands of a conditional expression do, for the checks of
+   whether the sizes in the type of its result can be evaluated ahead of it.  */
+
+struct cond_operands_info
+{
+  /* The SAVE_EXPRs that appear in the operands.  */
+  hash_set<tree> saves;
+  /* The variables declared in the operands.  */
+  hash_set<tree> decls;
+  /* The variables the operands store to by name.  */
+  hash_set<tree> stored;
+  /* Whether the operands can store to memory through a pointer, a call or an
+     asm.  */
+  bool writes_memory = false;
+};
+
+/* Callback for walk_tree to fill in the cond_operands_info DATA.  */
+
+static tree
+collect_cond_operands_r (tree *tp, int *, void *data)
+{
+  cond_operands_info *info = (cond_operands_info *) data;
+  tree t = *tp;
+  switch (TREE_CODE (t))
+    {
+    case SAVE_EXPR:
+      info->saves.add (t);
+      break;
+
+    case DECL_EXPR:
+      if (VAR_P (DECL_EXPR_DECL (t)))
+	info->decls.add (DECL_EXPR_DECL (t));
+      break;
+
+    case BIND_EXPR:
+      for (tree v = BIND_EXPR_VARS (t); v; v = DECL_CHAIN (v))
+	if (VAR_P (v))
+	  info->decls.add (v);
+      break;
+
+    case MODIFY_EXPR:
+    case INIT_EXPR:
+    case PREDECREMENT_EXPR:
+    case PREINCREMENT_EXPR:
+    case POSTDECREMENT_EXPR:
+    case POSTINCREMENT_EXPR:
+      {
+	tree base = get_base_address (TREE_OPERAND (t, 0));
+	if (base && DECL_P (base))
+	  info->stored.add (base);
+	else
+	  info->writes_memory = true;
+      }
+      break;
+
+    case ASM_EXPR:
+      info->writes_memory = true;
+      for (tree o = ASM_OUTPUTS (t); o; o = TREE_CHAIN (o))
+	{
+	  tree base = get_base_address (TREE_VALUE (o));
+	  if (base && DECL_P (base))
+	    info->stored.add (base);
+	}
+      break;
+
+    case CALL_EXPR:
+      if (!(call_expr_flags (t) & (ECF_CONST | ECF_PURE)))
+	info->writes_memory = true;
+      break;
+
+    default:
+      break;
+    }
+  return NULL_TREE;
+}
+
+/* The state of a check of the type of the result of a conditional expression,
+   for cond_type_usable_p.  */
+
+struct cond_type_check
+{
+  cond_type_check (cond_operands_info *i) : info (i) {}
+  cond_operands_info *info;
+  /* The SAVE_EXPRs to evaluate ahead of the conditional.  */
+  auto_vec<tree> hoist;
+  /* The automatic variables that the hoisted SAVE_EXPRs use and that the
+     operands could still change through memory, depending on code later in
+     the function.  */
+  auto_vec<tree> unsure;
+  /* The trees that cond_size_usable_r has already seen.  */
+  hash_set<tree> seen;
+  /* The types that cond_type_usable_p has already seen.  */
+  hash_set<tree> types;
+};
+
+/* An automatic variable from the unsure list of the check that picked the type
+   of the result of the conditional at LOC.  */
+
+struct cond_unsure_var
+{
+  tree decl;
+  location_t loc;
+};
+
+/* The unsure variables of the conditionals in the functions being parsed, for
+   c_check_cond_unsure_vars.  */
+
+static vec<cond_unsure_var> cond_unsure_vars;
+
+/* Return true if T, part of a SAVE_EXPR that appears in the operands of a
+   conditional expression checked by C, has the same value ahead of the
+   conditional and can't trap there.  */
+
+static bool
+cond_size_stable_p (tree t, cond_type_check *c)
+{
+  cond_operands_info *info = c->info;
+  if (CONSTANT_CLASS_P (t))
+    return true;
+  switch (TREE_CODE (t))
+    {
+    case VAR_DECL:
+    case PARM_DECL:
+      if (info->decls.contains (t)
+	  || info->stored.contains (t)
+	  || TREE_THIS_VOLATILE (t))
+	return false;
+      if (!info->writes_memory)
+	return true;
+      if (TREE_ADDRESSABLE (t) || DECL_NONLOCAL (t) || is_global_var (t))
+	return false;
+      /* Nothing seen so far lets the operands change T through memory, but
+	 its address can still be taken later in the function and reach the
+	 operands through a backward goto or a loop, and a nested function
+	 defined later can write T when the operands call it.  */
+      c->unsure.safe_push (t);
+      return true;
+
+    case SAVE_EXPR:
+    CASE_CONVERT:
+    case NON_LVALUE_EXPR:
+    case NEGATE_EXPR:
+    case BIT_NOT_EXPR:
+      return cond_size_stable_p (TREE_OPERAND (t, 0), c);
+
+    case PLUS_EXPR:
+    case MINUS_EXPR:
+    case MULT_EXPR:
+    case MIN_EXPR:
+    case MAX_EXPR:
+    case BIT_AND_EXPR:
+    case BIT_IOR_EXPR:
+    case BIT_XOR_EXPR:
+      return (cond_size_stable_p (TREE_OPERAND (t, 0), c)
+	      && cond_size_stable_p (TREE_OPERAND (t, 1), c));
+
+    case TRUNC_DIV_EXPR:
+    case CEIL_DIV_EXPR:
+    case FLOOR_DIV_EXPR:
+    case ROUND_DIV_EXPR:
+    case EXACT_DIV_EXPR:
+    case TRUNC_MOD_EXPR:
+    case FLOOR_MOD_EXPR:
+      return (TREE_CODE (TREE_OPERAND (t, 1)) == INTEGER_CST
+	      && !integer_zerop (TREE_OPERAND (t, 1))
+	      && cond_size_stable_p (TREE_OPERAND (t, 0), c));
+
+    default:
+      return false;
+    }
+}
+
+/* Callback for walk_tree from cond_type_usable_p.  Return non-NULL if part of
+   the size expression *TP can't be evaluated ahead of the conditional, and
+   push each SAVE_EXPR that has to be evaluated there onto the hoist list of
+   the cond_type_check DATA.
+
+   A SAVE_EXPR that doesn't appear in the operands either was evaluated where
+   its type was declared ahead of the conditional or comes from laying out the
+   composite type, so only what's in it needs checking.  One that appears in
+   the operands would otherwise be evaluated where the operands first use it,
+   which may be in an arm that doesn't run.  */
+
+static tree
+cond_size_usable_r (tree *tp, int *walk_subtrees, void *data)
+{
+  cond_type_check *c = (cond_type_check *) data;
+  tree t = *tp;
+  if (TREE_CODE (t) == SAVE_EXPR && c->info->saves.contains (t))
+    {
+      *walk_subtrees = 0;
+      if (!cond_size_stable_p (TREE_OPERAND (t, 0), c))
+	return t;
+      c->hoist.safe_push (t);
+    }
+  else if ((VAR_P (t) || TREE_CODE (t) == PARM_DECL)
+	   && c->info->decls.contains (t))
+    return t;
+  return NULL_TREE;
+}
+
+/* Return true if the size expression T can be evaluated ahead of the
+   conditional checked by C.  */
+
+static bool
+cond_size_usable_p (tree t, cond_type_check *c)
+{
+  return !t || !walk_tree (&t, cond_size_usable_r, c, &c->seen);
+}
+
+/* Return true if every size in the variably modified parts of TYPE, the type
+   of the result of a conditional expression or a part of it, can be evaluated
+   ahead of the conditional checked by C.
+
+   The gimplifier evaluates the size of the result's temporary ahead of both
+   arms and possibly ahead of the condition, and code after the conditional
+   can use any size in the type, such as the size of an array that a member
+   points to.  None of that works with a variably sized type declared inside
+   of an arm, which only has its sizes evaluated if that arm runs.  The sizes
+   of such a type are only usable if what they're computed from has the same
+   value ahead of the conditional, and then they get evaluated there.  */
+
+static bool
+cond_type_usable_p (tree type, cond_type_check *c)
+{
+  if (!type
+      || type == error_mark_node
+      || !c_type_variably_modified_p (type)
+      || c->types.add (type))
+    return true;
+  if (!cond_size_usable_p (TYPE_SIZE (type), c)
+      || !cond_size_usable_p (TYPE_SIZE_UNIT (type), c))
+    return false;
+  switch (TREE_CODE (type))
+    {
+    case POINTER_TYPE:
+      return cond_type_usable_p (TREE_TYPE (type), c);
+
+    case ARRAY_TYPE:
+      if (TYPE_DOMAIN (type)
+	  && (!cond_size_usable_p (TYPE_MIN_VALUE (TYPE_DOMAIN (type)), c)
+	      || !cond_size_usable_p (TYPE_MAX_VALUE (TYPE_DOMAIN (type)), c)))
+	return false;
+      return cond_type_usable_p (TREE_TYPE (type), c);
+
+    case RECORD_TYPE:
+    case UNION_TYPE:
+      for (tree f = TYPE_FIELDS (type); f; f = DECL_CHAIN (f))
+	if (TREE_CODE (f) == FIELD_DECL
+	    && (!cond_size_usable_p (DECL_FIELD_OFFSET (f), c)
+		|| !cond_size_usable_p (DECL_SIZE (f), c)
+		|| !cond_size_usable_p (DECL_SIZE_UNIT (f), c)
+		|| !cond_type_usable_p (TREE_TYPE (f), c)))
+	  return false;
+      return true;
+
+    default:
+      return true;
+    }
+}
+
 /* Build and return a conditional expression IFEXP ? OP1 : OP2.  If
    IFEXP_BCP then the condition is a call to __builtin_constant_p, and
    if folded to an integer constant then the unselected half may
@@ -6681,6 +6943,8 @@ build_conditional_expr (location_t colon_loc, tree ifexp, bool ifexp_bcp,
   bool int_const, op1_int_operands, op2_int_operands, int_operands;
   bool ifexp_int_operands;
   tree ret;
+  /* SAVE_EXPRs in the type of the result to evaluate ahead of it.  */
+  auto_vec<tree> cond_hoist;
 
   op1_int_operands = EXPR_INT_CONST_OPERANDS (orig_op1);
   if (op1_int_operands)
@@ -7019,8 +7283,48 @@ build_conditional_expr (location_t colon_loc, tree ifexp, bool ifexp_bcp,
   else if (RECORD_OR_UNION_TYPE_P (type1) && RECORD_OR_UNION_TYPE_P (type2)
 	   && comptypes (TYPE_MAIN_VARIANT (type1),
 			 TYPE_MAIN_VARIANT (type2)))
-    result_type = composite_type (TYPE_MAIN_VARIANT (type1),
-				  TYPE_MAIN_VARIANT (type2));
+    {
+      tree t1 = TYPE_MAIN_VARIANT (type1);
+      tree t2 = TYPE_MAIN_VARIANT (type2);
+      result_type = composite_type (t1, t2);
+      if (c_type_variably_modified_p (t1) || c_type_variably_modified_p (t2))
+	{
+	  /* The composite type takes its sizes from its first type, so try
+	     the other order if the sizes of the first one can't be used, or
+	     if they depend on variables the operands might change through
+	     memory.  When both orders depend on such variables, take the
+	     first and have the rest of the function confirm that it can't
+	     change them.  */
+	  cond_operands_info info;
+	  hash_set<tree> pset;
+	  walk_tree (&ifexp, collect_cond_operands_r, &info, &pset);
+	  walk_tree (&op1, collect_cond_operands_r, &info, &pset);
+	  walk_tree (&op2, collect_cond_operands_r, &info, &pset);
+	  cond_type_check c1 (&info);
+	  cond_type_check c2 (&info);
+	  cond_type_check *c = NULL;
+	  if (cond_type_usable_p (result_type, &c1))
+	    c = &c1;
+	  if (!c || !c1.unsure.is_empty ())
+	    {
+	      tree other = composite_type (t2, t1);
+	      if (cond_type_usable_p (other, &c2)
+		  && (!c || c2.unsure.is_empty ()))
+		{
+		  result_type = other;
+		  c = &c2;
+		}
+	    }
+	  if (c)
+	    {
+	      cond_hoist.safe_splice (c->hoist);
+	      for (tree v : c->unsure)
+		cond_unsure_vars.safe_push ({ v, colon_loc });
+	    }
+	  else
+	    result_type = NULL_TREE;
+	}
+    }
 
   if (!result_type)
     {
@@ -7106,9 +7410,44 @@ build_conditional_expr (location_t colon_loc, tree ifexp, bool ifexp_bcp,
     warning_at (EXPR_LOCATION (ret), OPT_Wduplicated_branches,
 		"this condition has identical branches");
 
+  for (tree save : cond_hoist)
+    ret = build2_loc (colon_loc, COMPOUND_EXPR, TREE_TYPE (ret), save, ret);
+
   return ret;
 }
 
+/* Called at the end of FNDECL's body.  Give an error for each conditional
+   expression whose result's sizes were evaluated ahead of it from an automatic
+   variable of FNDECL that the operands could change through memory, which is
+   only known once the rest of the function shows that the variable has its
+   address taken or is used by a nested function.  */
+
+void
+c_check_cond_unsure_vars (tree fndecl)
+{
+  location_t last = UNKNOWN_LOCATION;
+  unsigned j = 0;
+  for (cond_unsure_var v : cond_unsure_vars)
+    {
+      if (DECL_CONTEXT (v.decl) != fndecl)
+	{
+	  cond_unsure_vars[j++] = v;
+	  continue;
+	}
+      if ((TREE_ADDRESSABLE (v.decl) || DECL_NONLOCAL (v.decl))
+	  && v.loc != last)
+	{
+	  auto_diagnostic_group d;
+	  error_at (v.loc, "type mismatch in conditional expression");
+	  inform (DECL_SOURCE_LOCATION (v.decl),
+		  "the size of the result is computed from %qD ahead of the "
+		  "operands, which can change it through memory", v.decl);
+	  last = v.loc;
+	}
+    }
+  cond_unsure_vars.truncate (j);
+}
+
 /* EXPR is an expression, location LOC, whose result is discarded.
    Warn if it is a call to a nodiscard function (or a COMPOUND_EXPR
    whose right-hand operand is such a call, possibly recursively).  */
