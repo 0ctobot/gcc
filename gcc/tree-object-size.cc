@@ -3060,6 +3060,61 @@ object_size_value_fits_p (tree val, tree type)
     }
 }
 
+/* Return VAL with the integer conversions that define it looked through.
+   If PREC isn't null, lower it to the precision of the narrowest type on the
+   way, including those of VAL and of the result.  */
+
+static tree
+object_size_strip_conversions (tree val, unsigned *prec = NULL)
+{
+  while (TREE_CODE (val) == SSA_NAME)
+    {
+      if (prec)
+	*prec = MIN (*prec, TYPE_PRECISION (TREE_TYPE (val)));
+      gimple *stmt = SSA_NAME_DEF_STMT (val);
+      if (!is_gimple_assign (stmt)
+	  || !CONVERT_EXPR_CODE_P (gimple_assign_rhs_code (stmt))
+	  || !INTEGRAL_TYPE_P (TREE_TYPE (gimple_assign_rhs1 (stmt))))
+	break;
+      val = gimple_assign_rhs1 (stmt);
+    }
+  return val;
+}
+
+/* If VAL, an argument of the PHI that defines RES, is RES + X with or without
+   conversions in between, return X.  That's how an index steps on a cycle.
+   Set *PREC to the precision of the narrowest type on the way from RES back
+   to VAL, since a narrowing conversion only keeps that many low bits of the
+   step: (short) (RES + 65535) is RES - 1 for a short RES.  */
+
+static tree
+object_size_induction_step (tree val, tree res, unsigned *prec)
+{
+  *prec = TYPE_PRECISION (TREE_TYPE (res));
+  val = object_size_strip_conversions (val, prec);
+  if (TREE_CODE (val) != SSA_NAME)
+    return NULL_TREE;
+
+  gimple *stmt = SSA_NAME_DEF_STMT (val);
+  if (!is_gimple_assign (stmt) || gimple_assign_rhs_code (stmt) != PLUS_EXPR)
+    return NULL_TREE;
+
+  tree rhs1 = gimple_assign_rhs1 (stmt);
+  tree rhs2 = gimple_assign_rhs2 (stmt);
+  unsigned prec1 = *prec, prec2 = *prec;
+  if (object_size_strip_conversions (rhs1, &prec1) == res)
+    {
+      *prec = prec1;
+      return rhs2;
+    }
+  if (object_size_strip_conversions (rhs2, &prec2) == res)
+    {
+      *prec = prec2;
+      return rhs1;
+    }
+  return NULL_TREE;
+}
+
 /* Return true if the integer OFF, part of the offset of a pointer, can take the
    pointer below where it was, going by how OFF is computed.  Subtracting always
    counts, and so does anything done to a subtracted value that leaves it
@@ -3114,10 +3169,27 @@ object_size_offset_steps_back_1 (tree off, bool index, int &limit)
       gimple *stmt = SSA_NAME_DEF_STMT (off);
       if (gimple_code (stmt) == GIMPLE_PHI)
 	{
-	  if (!index)
-	    for (unsigned i = 0; i < gimple_phi_num_args (stmt); i++)
-	      worklist.safe_push (std::make_pair (gimple_phi_arg_def (stmt, i),
-						  false));
+	  /* An index that counts up by a constant on a cycle is an ordinary
+	     walk through the subobject, like a pointer that does.  Any other
+	     step on the cycle is followed the way it would be for a pointer,
+	     as is each value the index may start out with.  The sign of a
+	     constant step is that of the bits a narrowing conversion on the
+	     cycle keeps.  */
+	  tree res = gimple_phi_result (stmt);
+	  for (unsigned i = 0; i < gimple_phi_num_args (stmt); i++)
+	    {
+	      tree arg = gimple_phi_arg_def (stmt, i);
+	      unsigned prec = 0;
+	      tree step = (index
+			   ? object_size_induction_step (arg, res, &prec)
+			   : NULL_TREE);
+	      if (!step)
+		worklist.safe_push (std::make_pair (arg, index));
+	      else if (TREE_CODE (step) != INTEGER_CST)
+		worklist.safe_push (std::make_pair (step, true));
+	      else if (wi::neg_p (wi::sext (wi::to_wide (step), prec)))
+		return true;
+	    }
 	  continue;
 	}
 
@@ -3197,20 +3269,75 @@ object_size_offset_steps_back_1 (tree off, bool index, int &limit)
 	      rhs1 = gimple_assign_rhs3 (stmt);
 	      break;
 	    case SSA_NAME:
+	    case INTEGER_CST:
 	      follow_rhs2 = false;
 	      break;
 	    case RSHIFT_EXPR:
 	    case TRUNC_MOD_EXPR:
-	      /* The sign of the result is the sign of the first operand.  */
-	      if (TYPE_UNSIGNED (type))
-		goto fallback;
-	      follow_rhs2 = false;
-	      break;
 	    case TRUNC_DIV_EXPR:
 	    case EXACT_DIV_EXPR:
+	      /* An unsigned result can't be above the first operand, and
+		 shifting right by at least one, dividing by more than one or
+		 taking the remainder of a divisor without the top bit set
+		 leaves it without the top bit.  That's only enough when the
+		 type is no wider than an offset, since narrowing the result
+		 can leave the top bit of the offset set.  A signed result has
+		 the sign of the first operand, except for a division where it
+		 also depends on the divisor.  */
 	      if (TYPE_UNSIGNED (type))
-		goto fallback;
+		{
+		  if (TREE_CODE (rhs2) == INTEGER_CST
+		      && TYPE_PRECISION (type) <= TYPE_PRECISION (sizetype)
+		      && (code == RSHIFT_EXPR
+			  ? integer_nonzerop (rhs2)
+			  : code == TRUNC_MOD_EXPR
+			  ? !tree_int_cst_sign_bit (rhs2)
+			  : compare_tree_int (rhs2, 1) > 0))
+		    continue;
+		  follow_rhs2 = false;
+		}
+	      else if (code == RSHIFT_EXPR || code == TRUNC_MOD_EXPR)
+		follow_rhs2 = false;
 	      break;
+	    case LROTATE_EXPR:
+	    case RROTATE_EXPR:
+	      /* Rotating by zero or by the precision leaves the value as it
+		 was, so only the value is followed, as for a shift to the
+		 left.  */
+	      follow_rhs2 = false;
+	      break;
+	    case REALPART_EXPR:
+	      {
+		/* The value of an operation that's checked for overflow is
+		   the same as that of the operation itself.  */
+		tree val = TREE_OPERAND (rhs1, 0);
+		gimple *call = (TREE_CODE (val) == SSA_NAME
+				? SSA_NAME_DEF_STMT (val) : NULL);
+		if (!call
+		    || !is_gimple_call (call)
+		    || !gimple_call_internal_p (call))
+		  goto fallback;
+
+		switch (gimple_call_internal_fn (call))
+		  {
+		  case IFN_SUB_OVERFLOW:
+		  case IFN_USUBC:
+		    return true;
+		  case IFN_ADD_OVERFLOW:
+		  case IFN_UADDC:
+		    index = false;
+		    break;
+		  case IFN_MUL_OVERFLOW:
+		    break;
+		  default:
+		    goto fallback;
+		  }
+
+		for (unsigned i = 0; i < gimple_call_num_args (call); i++)
+		  worklist.safe_push (std::make_pair (gimple_call_arg (call, i),
+						      index));
+		continue;
+	      }
 	    CASE_CONVERT:
 	      {
 		tree rhs_type = TREE_TYPE (rhs1);
