@@ -2424,7 +2424,10 @@ struct reinit_read_walk
    Find what can make the old value of the variable visible while its
    initializer is being evaluated: a read of it by name, a jump that abandons
    the initializer and leaves the variable to be read below, or a read through a
-   pointer if the variable has its address taken.  */
+   pointer if the variable has its address taken.  The pointer needn't be
+   dereferenced in the initializer itself, since a call that isn't const can read
+   memory, and a pure one or a builtin like strlen has no side effects to tell us
+   so.  */
 
 static tree
 find_reinit_read_r (tree *tp, int *, void *data)
@@ -2453,6 +2456,10 @@ find_reinit_read_r (tree *tp, int *, void *data)
     case INDIRECT_REF:
     case MEM_REF:
       if (TREE_ADDRESSABLE (w->decl))
+	return t;
+      break;
+    case CALL_EXPR:
+      if (TREE_ADDRESSABLE (w->decl) && !(call_expr_flags (t) & ECF_CONST))
 	return t;
       break;
 
