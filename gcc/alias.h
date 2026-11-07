@@ -27,7 +27,10 @@ extern alias_set_type get_varargs_alias_set (void);
 extern alias_set_type get_frame_alias_set (void);
 extern tree component_uses_parent_alias_set_from (const_tree);
 extern bool ends_tbaa_access_path_p (const_tree);
+extern bool alias_set_exact_subset_of (alias_set_type, alias_set_type);
 extern bool alias_set_subset_of (alias_set_type, alias_set_type);
+extern bool alias_sets_cover_p (alias_set_type, alias_set_type,
+				alias_set_type, alias_set_type);
 extern void record_alias_subset (alias_set_type, alias_set_type);
 extern void record_component_aliases (tree);
 extern bool alias_sets_conflict_p (alias_set_type, alias_set_type);

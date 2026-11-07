@@ -1,0 +1,19 @@
+/* PR target/119980 */
+/* { dg-do compile } */
+/* { dg-options "-O2 -fdump-tree-optimized" } */
+
+/* Redundant stores with related alias sets still get removed when the sets
+   involve a member with alias set zero.  */
+
+struct both { char c; short s; };
+
+/* The store to the char member is covered by the store to the whole struct.  */
+
+void
+f1 (struct both *p)
+{
+  *p = (struct both) { 0, 0 };
+  p->c = 0;
+}
+
+/* { dg-final { scan-tree-dump-not "(->|\\.)c = " "optimized" } } */
