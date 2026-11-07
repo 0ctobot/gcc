@@ -9358,14 +9358,23 @@ fold_unary_loc (location_t loc, enum tree_code code, tree type, tree op0)
 	{
 	  tree arg01 = TREE_OPERAND (arg0, 1);
 	  tree arg02 = TREE_OPERAND (arg0, 2);
+	  /* A C23 conditional can have an arm whose structure type is
+	     compatible with the type of the conditional without being the
+	     same main variant, which fold_convert_loc can't convert.  Don't
+	     convert an arm whose value is discarded anyway.  */
+	  bool discard = VOID_TYPE_P (type);
 	  if (! VOID_TYPE_P (TREE_TYPE (arg01)))
 	    arg01 = fold_build1_loc (loc, code, type,
-				 fold_convert_loc (loc,
-						   TREE_TYPE (op0), arg01));
+				     (discard
+				      ? arg01
+				      : fold_convert_loc (loc, TREE_TYPE (op0),
+							  arg01)));
 	  if (! VOID_TYPE_P (TREE_TYPE (arg02)))
 	    arg02 = fold_build1_loc (loc, code, type,
-				 fold_convert_loc (loc,
-						   TREE_TYPE (op0), arg02));
+				     (discard
+				      ? arg02
+				      : fold_convert_loc (loc, TREE_TYPE (op0),
+							  arg02)));
 	  tem = fold_build3_loc (loc, COND_EXPR, type, TREE_OPERAND (arg0, 0),
 			     arg01, arg02);
 
