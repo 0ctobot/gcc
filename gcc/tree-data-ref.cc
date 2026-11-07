@@ -3600,9 +3600,27 @@ dr_outer_dims_disjoint_p (const dr_outer_dim &a, const dr_outer_dim &b)
 	      <= TYPE_PRECISION (sizetype)));
 }
 
-/* Return true if a constant step in dimension DIM of the access functions
-   ACCESS_FNS of the reference REF may wrap the address.  UNCONSTRAINED_BASE says
-   whether the last dimension is the evolution of a pointer, which counts bytes.
+/* Return the size in bytes of a unit of dimension DIM of the access functions
+   ACCESS_FNS of the reference REF, or null if that dimension doesn't select an
+   element of an array.  UNCONSTRAINED_BASE says whether the last dimension is
+   the evolution of a pointer, which counts bytes.  */
+
+static tree
+dr_dim_scale (tree ref, const vec<tree> &access_fns, unsigned int dim,
+	      bool unconstrained_base)
+{
+  for (unsigned int i = 0; i < dim && handled_component_p (ref); ++i)
+    ref = TREE_OPERAND (ref, 0);
+
+  if (unconstrained_base && dim + 1 == access_fns.length ())
+    return size_one_node;
+  if (TREE_CODE (ref) == ARRAY_REF)
+    return array_ref_element_size (ref);
+  return NULL_TREE;
+}
+
+/* Return true if a constant step of the access function FN, whose unit is SCALE
+   bytes, may wrap the address.
 
    The access functions count elements, whereas the address moves by the step
    times the size of an element modulo the size of the address space.  What the
@@ -3617,25 +3635,12 @@ dr_outer_dims_disjoint_p (const dr_outer_dim &a, const dr_outer_dim &b)
    a proof out of it in the first place.  */
 
 static bool
-dr_dim_stride_may_wrap_p (tree ref, const vec<tree> &access_fns,
-			  unsigned int dim, bool unconstrained_base)
+dr_dim_stride_may_wrap_p (tree fn, tree scale)
 {
   const unsigned int lanes_log2 = 16;
   const unsigned int precision = TYPE_PRECISION (sizetype);
 
-  for (unsigned int i = 0; i < dim && handled_component_p (ref); ++i)
-    ref = TREE_OPERAND (ref, 0);
-
-  tree scale;
-  if (unconstrained_base && dim + 1 == access_fns.length ())
-    scale = size_one_node;
-  else if (TREE_CODE (ref) == ARRAY_REF)
-    scale = array_ref_element_size (ref);
-  else
-    return false;
-
-  for (tree fn = access_fns[dim]; TREE_CODE (fn) == POLYNOMIAL_CHREC;
-       fn = CHREC_LEFT (fn))
+  for (; TREE_CODE (fn) == POLYNOMIAL_CHREC; fn = CHREC_LEFT (fn))
     {
       tree step = CHREC_RIGHT (fn);
       if (TREE_CODE (step) != INTEGER_CST)
@@ -3657,6 +3662,40 @@ dr_dim_stride_may_wrap_p (tree ref, const vec<tree> &access_fns,
   return false;
 }
 
+/* Return true if the initial values of the access functions FN_A and FN_B,
+   whose unit is SCALE bytes, may be far enough apart for the difference of
+   their addresses to wrap.  The subscript tests take indices that differ by a
+   constant as different elements, yet with an 8-byte element, indices that are
+   (1L << 61) + 1 apart select neighboring ones.
+
+   The difference is computed the same way the subscript tests compute it, and
+   its product with SCALE is held below 1 << (precision - 2).  That's the bound
+   the steps stay within over 1 << 16 iterations as well, so adding the two up
+   can't reach the point of wrapping.  Without a known SCALE, only a difference
+   of a single element can be said not to wrap.  A difference that isn't
+   constant gives the subscript tests no proof to begin with.  */
+
+static bool
+dr_dim_offset_may_wrap_p (tree fn_a, tree fn_b, tree scale)
+{
+  tree type = signed_type_for_types (TREE_TYPE (fn_a), TREE_TYPE (fn_b));
+  tree diff = chrec_fold_minus (type,
+				chrec_convert (type, initial_condition (fn_a),
+					       NULL),
+				chrec_convert (type, initial_condition (fn_b),
+					       NULL));
+  if (TREE_CODE (diff) != INTEGER_CST)
+    return false;
+
+  widest_int index = wi::to_widest (diff);
+  if (TREE_CODE (scale) != INTEGER_CST)
+    return wi::gts_p (wi::abs (index), 1);
+
+  widest_int bytes = wi::abs (index * wi::to_widest (scale));
+  return (wi::min_precision (bytes, UNSIGNED) + 2
+	  > TYPE_PRECISION (sizetype));
+}
+
 /* An access function describes which subobject of an enclosing object gets
    used, and differing values for a dimension are taken as proof of independence
    provided that the enclosing objects either coincide or are fully disjoint.
@@ -3668,9 +3707,10 @@ dr_dim_stride_may_wrap_p (tree ref, const vec<tree> &access_fns,
    aliasing isn't in effect, since a stride smaller than the object then just
    makes the objects of different iterations overlap, or when pointers can wrap,
    since a stride of sizeof (struct) * K can wrap around to any smaller
-   value.  When pointers can wrap, the innermost dimension that differs needs a
-   stride that doesn't wrap as well, since otherwise what it says about elements
-   doesn't hold for their addresses.  */
+   value.  When pointers can wrap, each of the LENGTH dimensions whose access
+   functions differ also needs steps that can't wrap and initial values that
+   aren't far enough apart to wrap, since otherwise what the subscript tests say
+   about its elements doesn't hold for their addresses.  */
 
 static bool
 dr_access_fns_separate_p (struct data_reference *a, struct data_reference *b,
@@ -3689,13 +3729,27 @@ dr_access_fns_separate_p (struct data_reference *a, struct data_reference *b,
   if (i == length)
     return true;
 
-  if (flag_wrapv_pointer
-      && (dr_dim_stride_may_wrap_p (DR_REF (a), indices_a->access_fns,
-				    start_a + i, indices_a->unconstrained_base)
-	  || dr_dim_stride_may_wrap_p (DR_REF (b), indices_b->access_fns,
-				       start_b + i,
-				       indices_b->unconstrained_base)))
-    return false;
+  /* The subscript tests can prove independence from any of these dimensions,
+     not just the innermost one that differs.  */
+  if (flag_wrapv_pointer)
+    for (unsigned int j = i; j < length; ++j)
+      {
+	tree fn_a = indices_a->access_fns[start_a + j];
+	tree fn_b = indices_b->access_fns[start_b + j];
+	if (eq_evolutions_p (fn_a, fn_b))
+	  continue;
+	tree scale_a = dr_dim_scale (DR_REF (a), indices_a->access_fns,
+				     start_a + j, indices_a->unconstrained_base);
+	tree scale_b = dr_dim_scale (DR_REF (b), indices_b->access_fns,
+				     start_b + j, indices_b->unconstrained_base);
+	if ((scale_a
+	     && (dr_dim_stride_may_wrap_p (fn_a, scale_a)
+		 || dr_dim_offset_may_wrap_p (fn_a, fn_b, scale_a)))
+	    || (scale_b
+		&& (dr_dim_stride_may_wrap_p (fn_b, scale_b)
+		    || dr_dim_offset_may_wrap_p (fn_a, fn_b, scale_b))))
+	  return false;
+      }
 
   /* The decision is about the two references together, so that each dimension
      from there outwards needs one rule that both of them satisfy.  */
