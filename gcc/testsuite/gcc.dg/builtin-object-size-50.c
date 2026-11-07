@@ -68,12 +68,21 @@ shl_wrap (int n, int s)
   CHECK (p);
 }
 
+__attribute__ ((noipa)) void
+aref_mul (int n)
+{
+  int i = (n & __INT_MAX__) * 3;
+  char *p = &L[i];
+  CHECK (p);
+}
+
 int
 main (void)
 {
   mul_wrap (MUL_X);
   plus_wrap (__INT_MAX__);
   shl_wrap (__INT_MAX__, 1);
+  aref_mul (MUL_X);
 
   if (fails)
     __builtin_abort ();
