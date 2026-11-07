@@ -8152,6 +8152,17 @@ drap_reg_usable_p (unsigned int regno)
       && regno == REGNO (ix86_static_chain (cfun->decl, false)))
     return false;
 
+  /* Without -mfentry, the profiler is called after the prologue loads the
+     DRAP register and before the body copies it out.  mcount has to preserve
+     the registers that can carry an argument, but it may clobber the other
+     call-used ones like any other function.  final.cc saves the static chain
+     around the profiler call for the same reason.  */
+  if (crtl->profile
+      && !ix86_profile_before_prologue ()
+      && call_used_or_fixed_reg_p (regno)
+      && !ix86_function_arg_regno_p (regno))
+    return false;
+
   /* An indirect sibcall can hold its target in any register of CLOBBERED_REGS
      across the epilogue.  The register operands of a sibcall are already
      covered by reg_live_at_exit_p().  */
@@ -8233,7 +8244,8 @@ drap_reg_usable_p (unsigned int regno)
 
 /* Return the register to use as the dynamic realign argument pointer.  The
    preferred register isn't always usable: a global register variable or
-   -ffixed-REG can make it fixed, and -fcall-used-REG can make it call-used.
+   -ffixed-REG can make it fixed, -fcall-used-REG can make it call-used, and
+   mcount can clobber R10 under -pg without -mfentry.
    Check it like any other candidate, and when it fails, try the rest in order,
    starting with the ones the function has to preserve anyway.  The APX
    registers and AX are only tried after those, so they don't change the choice
