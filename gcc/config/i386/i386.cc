@@ -13741,7 +13741,15 @@ output_pic_addr_const (FILE *file, rtx x, int code)
 	}
       else
 	{
-	  gcc_assert (CONST_INT_P (XEXP (x, 1)));
+	  /* An asm operand with the "p" constraint can be any address, such
+	     as a register plus a symbolic offset, rather than just a constant
+	     expression.  Report it like other invalid operands, which is
+	     still an internal error for insns that aren't asm.  */
+	  if (!CONST_INT_P (XEXP (x, 1)))
+	    {
+	      output_operand_lossage ("invalid expression as operand");
+	      return;
+	    }
 	  output_pic_addr_const (file, XEXP (x, 1), code);
 	  putc ('+', file);
 	  output_pic_addr_const (file, XEXP (x, 0), code);
