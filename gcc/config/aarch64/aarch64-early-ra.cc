@@ -3265,7 +3265,28 @@ early_ra::replace_regs (rtx_insn *insn, df_ref refs)
 	}
       rtx x = DF_REF_REG (ref);
       rtx new_rtx;
-      if (DEBUG_INSN_P (insn) && SUBREG_P (x))
+      if (DEBUG_INSN_P (insn) && SUBREG_P (x) && range.group->stride != 1)
+	{
+	  // The registers in a strided group aren't consecutive, so applying
+	  // the subreg to the first register would describe the wrong FPR.
+	  // Use the register of the allocno that the subreg selects, as for
+	  // a non-debug instruction, and reset the debug instruction if the
+	  // subreg doesn't select exactly one allocno of the group.
+	  subreg_info info;
+	  subreg_get_info (V0_REGNUM, GET_MODE (SUBREG_REG (x)),
+			   SUBREG_BYTE (x), GET_MODE (x), &info);
+	  if (!info.representable_p
+	      || info.nregs != 1
+	      || info.offset < 0
+	      || info.offset >= (int) range.count)
+	    {
+	      INSN_VAR_LOCATION_LOC (insn) = gen_rtx_UNKNOWN_VAR_LOC ();
+	      return true;
+	    }
+	  new_rtx = gen_rtx_REG (GET_MODE (x),
+				 range.allocno (info.offset)->hard_regno);
+	}
+      else if (DEBUG_INSN_P (insn) && SUBREG_P (x))
 	{
 	  // Any subreg is valid in a debug insn, including one that refers to
 	  // FPRs outside the group.  Apply it to the register that the inner
