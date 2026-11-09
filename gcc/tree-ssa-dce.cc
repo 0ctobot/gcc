@@ -2296,13 +2296,17 @@ simple_dce_from_worklist (bitmap worklist, bitmap need_eh_cleanup,
       if (need_eh_cleanup && stmt_could_throw_p (cfun, t))
 	bitmap_set_bit (need_eh_cleanup, gimple_bb (t)->index);
 
-      /* Add uses to the worklist.  */
+      /* Add uses to the worklist.  Leave out DEF itself, which a PHI uses
+	 when it feeds itself.  NO_DELETE keeps such an argument on an abnormal
+	 edge, so queueing DEF again would find the same PHI with the same use
+	 every time.  */
       ssa_op_iter iter;
       use_operand_p use_p;
       FOR_EACH_PHI_OR_STMT_USE (use_p, t, iter, SSA_OP_USE)
 	{
 	  tree use = USE_FROM_PTR (use_p);
 	  if (TREE_CODE (use) == SSA_NAME
+	      && use != def
 	      && ! SSA_NAME_IS_DEFAULT_DEF (use))
 	    bitmap_set_bit (worklist, SSA_NAME_VERSION (use));
 	}
