@@ -1936,6 +1936,83 @@ shadow_walk_finish (shadow_walk &w)
     }
 }
 
+/* Set in SKIP the UIDs of the automatic variables in the callback sets that
+   aren't in GLOBAL_REACH, the objects reachable from global memory, ESCAPED
+   and NONLOCAL.  Code called back from outside of the partition starts out
+   with nothing but those, so it can't get a pointer to such a local in any
+   activation that's live across the call.  The callback sets only have such
+   a local because a function that can be called back accesses its own
+   locals, or those its callers pass down by address, and when it runs as a
+   callback, those belong to activations that the callback itself creates.  */
+
+static void
+find_callback_skip (bitmap skip, bitmap global_reach)
+{
+  for (varinfo_t cb : { ipa_callback_uses, ipa_callback_clobbers })
+    {
+      bitmap_iterator bi;
+      unsigned i;
+      EXECUTE_IF_SET_IN_BITMAP (get_varinfo (var_rep[cb->id])->solution,
+				0, i, bi)
+	{
+	  varinfo_t v = get_varinfo (i);
+	  if (v->decl
+	      && auto_var_p (v->decl)
+	      && !bitmap_bit_p (global_reach, shadow_walk_first_field (v)->id))
+	    {
+	      bitmap_set_bit (skip, DECL_PT_UID (v->decl));
+	      if (v->shadow_var_uid != 0)
+		bitmap_set_bit (skip, v->shadow_var_uid);
+	    }
+	}
+    }
+}
+
+/* Add the callback set CB, which is IPA_CALLBACK_USES or
+   IPA_CALLBACK_CLOBBERS, to *PT, the use or clobber set of a call in FNDECL
+   that can leave the partition, directly or through its callees.  Leave out
+   the variables in SKIP, which find_callback_skip computed.  *PT must not be
+   modified in place afterwards since its bitmap is shared.  */
+
+static void
+add_callback_solution (tree fndecl, pt_solution *pt, varinfo_t cb,
+		       bitmap skip)
+{
+  pt_solution sol = find_what_var_points_to (fndecl, cb);
+  bitmap vars = sol.vars;
+  sol.vars = NULL;
+  pt_solution_ior_into (pt, &sol);
+  if (pt->anything || !vars)
+    return;
+
+  /* *PT and VARS can share their bitmap with other solutions, so build the
+     result in a new bitmap.  Most calls end up with the same set, so share
+     the result as well rather than keeping a copy per call.  */
+  bitmap result = BITMAP_GGC_ALLOC ();
+  bitmap_and_compl (result, vars, skip);
+  if (pt->vars)
+    bitmap_ior_into (result, pt->vars);
+  if (bitmap shared = shared_bitmap_lookup (result))
+    {
+      bitmap_clear (result);
+      result = shared;
+    }
+  else
+    shared_bitmap_add (result);
+  pt->vars = result;
+}
+
+/* Return whether the part of function info FI at offset PART points to
+   IPA_CALLBACK_MARKER, meaning that the function can leave the partition,
+   directly or through its callees.  */
+
+static bool
+callback_marked_p (varinfo_t fi, unsigned part)
+{
+  varinfo_t vi = get_varinfo (var_rep[first_vi_for_offset (fi, part)->id]);
+  return bitmap_bit_p (vi->solution, ipa_callback_marker->id);
+}
+
 /* Execute the driver for IPA PTA.  */
 static unsigned int
 ipa_pta_execute (void)
@@ -2023,16 +2100,21 @@ ipa_pta_execute (void)
 	shadow_walk_solution (fw, get_varinfo (var_rep[ai->id])->solution);
       shadow_walk_finish (fw);
     }
+  /* The shadow UIDs are final now, so the variables to leave out of the
+     callback sets only need to be found once.  */
+  auto_bitmap callback_skip;
+  find_callback_skip (callback_skip, global_reach);
+
   unsigned shadow_var_cnt = gw.count + fw.count;
   if (shadow_var_cnt && dump_file && (dump_flags & TDF_DETAILS))
     fprintf (dump_file, "Allocated %u shadow variables for locals "
 	     "maybe leaking into recursive invocations of their containing "
 	     "functions\n", shadow_var_cnt);
 
-  /* Compute the global points-to sets for ESCAPED.
-     ???  Note that the computed escape set is not correct
-     for the whole unit as we fail to consider graph edges to
-     externally visible functions.  */
+  /* Compute the global points-to sets for ESCAPED.  ESCAPED doesn't include
+     what the functions that code outside of the partition can call use and
+     clobber, so calls that leave the partition add the callback sets to their
+     use and clobber sets below.  */
   ipa_escaped_pt = find_what_var_points_to (NULL, get_varinfo (escaped_id));
 
   /* Make sure the ESCAPED solution (which is used as placeholder in
@@ -2106,6 +2188,15 @@ ipa_pta_execute (void)
 		  *gimple_call_use_set (stmt)
 		     = find_what_var_points_to
 			 (node->decl, first_vi_for_offset (fi, fi_uses));
+		  /* The callee can leave the partition and be called back.  */
+		  if (callback_marked_p (fi, fi_clobbers))
+		    add_callback_solution (node->decl,
+					   gimple_call_clobber_set (stmt),
+					   ipa_callback_clobbers, callback_skip);
+		  if (callback_marked_p (fi, fi_uses))
+		    add_callback_solution (node->decl,
+					   gimple_call_use_set (stmt),
+					   ipa_callback_uses, callback_skip);
 		}
 	      /* Handle direct calls to external functions.  */
 	      else if (decl && (!fi || fi->decl))
@@ -2130,6 +2221,10 @@ ipa_pta_execute (void)
 		      *pt = ipa_escaped_pt;
 		      pt->nonlocal = 1;
 		    }
+		  /* The callee can call back into the partition.  */
+		  if (!(gimple_call_flags (stmt) & ECF_CONST))
+		    add_callback_solution (node->decl, pt, ipa_callback_uses,
+					   callback_skip);
 
 		  pt = gimple_call_clobber_set (stmt);
 		  if (gimple_call_flags (stmt) &
@@ -2152,6 +2247,10 @@ ipa_pta_execute (void)
 		      *pt = ipa_escaped_pt;
 		      pt->nonlocal = 1;
 		    }
+		  if (!(gimple_call_flags (stmt)
+			& (ECF_CONST|ECF_PURE|ECF_NOVOPS)))
+		    add_callback_solution (node->decl, pt,
+					   ipa_callback_clobbers, callback_skip);
 		}
 	      /* Handle indirect calls.  */
 	      else if ((fi = get_fi_for_callee (stmt)))
@@ -2173,6 +2272,7 @@ ipa_pta_execute (void)
 		      bitmap_iterator bi;
 		      unsigned i;
 		      struct pt_solution *uses, *clobbers;
+		      bool cb_uses = false, cb_clobbers = false;
 
 		      uses = gimple_call_use_set (stmt);
 		      clobbers = gimple_call_clobber_set (stmt);
@@ -2190,6 +2290,9 @@ ipa_pta_execute (void)
 			      uses->ipa_escaped = 1;
 			      clobbers->nonlocal = 1;
 			      clobbers->ipa_escaped = 1;
+			      /* The callee can call back into the
+				 partition.  */
+			      cb_uses = cb_clobbers = true;
 			      continue;
 			    }
 
@@ -2199,6 +2302,7 @@ ipa_pta_execute (void)
 				      (node->decl,
 				       first_vi_for_offset (vi, fi_uses));
 			      pt_solution_ior_into (uses, &sol);
+			      cb_uses |= callback_marked_p (vi, fi_uses);
 			    }
 			  if (!clobbers->anything)
 			    {
@@ -2206,8 +2310,20 @@ ipa_pta_execute (void)
 				      (node->decl,
 				       first_vi_for_offset (vi, fi_clobbers));
 			      pt_solution_ior_into (clobbers, &sol);
+			      cb_clobbers
+				|= callback_marked_p (vi, fi_clobbers);
 			    }
 			}
+		      /* Add the callback sets last, since their bitmaps are
+			 shared from then on.  */
+		      if (cb_uses)
+			add_callback_solution (node->decl, uses,
+					       ipa_callback_uses,
+					       callback_skip);
+		      if (cb_clobbers)
+			add_callback_solution (node->decl, clobbers,
+					       ipa_callback_clobbers,
+					       callback_skip);
 		    }
 		}
 	      else
@@ -2225,6 +2341,9 @@ ipa_pta_execute (void)
     }
 
   delete_points_to_sets ();
+  ipa_callback_uses = NULL;
+  ipa_callback_clobbers = NULL;
+  ipa_callback_marker = NULL;
 
   in_ipa_mode = 0;
 
