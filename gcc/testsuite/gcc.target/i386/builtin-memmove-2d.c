@@ -23,42 +23,42 @@
 **	je	.L2
 **	movq	%rbx, \(%rsp\)
 **	movq	%rbp, 8\(%rsp\)
-**	movq	%r14, 16\(%rsp\)
-**	movq	%r15, 24\(%rsp\)
+**	movq	%r12, 16\(%rsp\)
+**	movq	%r13, 24\(%rsp\)
 **	.cfi_offset 3, -40
 **	.cfi_offset 6, -32
-**	.cfi_offset 14, -24
-**	.cfi_offset 15, -16
-**	movq	-8\(%rcx,%rdx\), %r15
-**	movq	-16\(%rcx,%rdx\), %r14
+**	.cfi_offset 12, -24
+**	.cfi_offset 13, -16
+**	movq	-8\(%rcx,%rdx\), %r13
+**	movq	-16\(%rcx,%rdx\), %r12
 **	movq	-24\(%rcx,%rdx\), %rbp
-**	movq	-32\(%rcx,%rdx\), %r11
+**	movq	-32\(%rcx,%rdx\), %rbx
 **.L11:
+**	movq	\(%rcx\), %r11
 **	movq	8\(%rcx\), %r10
-**	movq	16\(%rcx\), %r9
 **	subq	\$32, %rsi
 **	addq	\$32, %rdi
+**	movq	16\(%rcx\), %r9
 **	movq	24\(%rcx\), %r8
-**	movq	\(%rcx\), %rbx
 **	addq	\$32, %rcx
+**	movq	%r11, -32\(%rdi\)
 **	movq	%r10, -24\(%rdi\)
-**	movq	%rbx, -32\(%rdi\)
 **	movq	%r9, -16\(%rdi\)
 **	movq	%r8, -8\(%rdi\)
 **	cmpq	\$32, %rsi
 **	ja	.L11
-**	movq	%r15, -8\(%rax,%rdx\)
-**	movq	%r14, -16\(%rax,%rdx\)
+**	movq	%r13, -8\(%rax,%rdx\)
+**	movq	%r12, -16\(%rax,%rdx\)
 **	movq	%rbp, -24\(%rax,%rdx\)
-**	movq	%r11, -32\(%rax,%rdx\)
+**	movq	%rbx, -32\(%rax,%rdx\)
 **	movq	\(%rsp\), %rbx
 **	.cfi_restore 3
 **	movq	8\(%rsp\), %rbp
 **	.cfi_restore 6
-**	movq	16\(%rsp\), %r14
-**	.cfi_restore 14
-**	movq	24\(%rsp\), %r15
-**	.cfi_restore 15
+**	movq	16\(%rsp\), %r12
+**	.cfi_restore 12
+**	movq	24\(%rsp\), %r13
+**	.cfi_restore 13
 **	jmp	.L2
 **	.p2align 4,,10
 **	.p2align 3
@@ -95,19 +95,19 @@
 **	cmpq	\$32, %rdx
 **	jbe	.L9
 **	movq	%rbx, \(%rsp\)
-**	movq	%r14, 16\(%rsp\)
+**	movq	%rbp, 8\(%rsp\)
 **	.cfi_offset 3, -40
-**	.cfi_offset 14, -24
-**	movq	\(%rsi\), %rbx
-**	movq	8\(%rsi\), %r14
+**	.cfi_offset 6, -32
+**	movq	\(%rsi\), %rbp
+**	movq	8\(%rsi\), %rbx
 **	movq	16\(%rsi\), %r11
 **	movq	24\(%rsi\), %r10
 **	movq	-8\(%rsi,%rdx\), %r9
 **	movq	-16\(%rsi,%rdx\), %r8
 **	movq	-24\(%rsi,%rdx\), %rdi
 **	movq	-32\(%rsi,%rdx\), %rcx
-**	movq	%rbx, \(%rax\)
-**	movq	%r14, 8\(%rax\)
+**	movq	%rbp, \(%rax\)
+**	movq	%rbx, 8\(%rax\)
 **	movq	%r11, 16\(%rax\)
 **	movq	%r10, 24\(%rax\)
 **	movq	%r9, -8\(%rax,%rdx\)
@@ -116,8 +116,8 @@
 **	movq	%rcx, -32\(%rax,%rdx\)
 **	movq	\(%rsp\), %rbx
 **	.cfi_restore 3
-**	movq	16\(%rsp\), %r14
-**	.cfi_restore 14
+**	movq	8\(%rsp\), %rbp
+**	.cfi_restore 6
 **.L2:
 **	addq	\$32, %rsp
 **	.cfi_def_cfa_offset 8
@@ -152,39 +152,39 @@
 **.L10:
 **	movq	%rbx, \(%rsp\)
 **	leaq	\(%rdi,%rdx\), %rdi
-**	movq	%r14, 16\(%rsp\)
-**	movq	%r15, 24\(%rsp\)
+**	movq	%rbp, 8\(%rsp\)
+**	movq	%r12, 16\(%rsp\)
 **	.cfi_offset 3, -40
-**	.cfi_offset 14, -24
-**	.cfi_offset 15, -16
-**	movq	\(%rcx\), %r14
-**	movq	8\(%rcx\), %r15
-**	movq	16\(%rcx\), %r10
+**	.cfi_offset 6, -32
+**	.cfi_offset 12, -24
+**	movq	\(%rcx\), %r12
+**	movq	8\(%rcx\), %rbp
+**	movq	16\(%rcx\), %rbx
 **	movq	24\(%rcx\), %r11
 **	addq	%rdx, %rcx
 **.L12:
+**	movq	-8\(%rcx\), %r10
 **	movq	-16\(%rcx\), %r9
-**	movq	-24\(%rcx\), %r8
 **	subq	\$32, %rsi
 **	subq	\$32, %rdi
+**	movq	-24\(%rcx\), %r8
 **	movq	-32\(%rcx\), %rdx
-**	movq	-8\(%rcx\), %rbx
 **	subq	\$32, %rcx
+**	movq	%r10, 24\(%rdi\)
 **	movq	%r9, 16\(%rdi\)
-**	movq	%rbx, 24\(%rdi\)
 **	movq	%r8, 8\(%rdi\)
 **	movq	%rdx, \(%rdi\)
 **	cmpq	\$32, %rsi
 **	ja	.L12
-**	movq	%r14, \(%rax\)
+**	movq	%r12, \(%rax\)
+**	movq	16\(%rsp\), %r12
+**	.cfi_restore 12
+**	movq	%rbp, 8\(%rax\)
+**	movq	8\(%rsp\), %rbp
+**	.cfi_restore 6
+**	movq	%rbx, 16\(%rax\)
 **	movq	\(%rsp\), %rbx
 **	.cfi_restore 3
-**	movq	%r15, 8\(%rax\)
-**	movq	16\(%rsp\), %r14
-**	.cfi_restore 14
-**	movq	%r10, 16\(%rax\)
-**	movq	24\(%rsp\), %r15
-**	.cfi_restore 15
 **	movq	%r11, 24\(%rax\)
 **	jmp	.L2
 **	.cfi_endproc
