@@ -14328,7 +14328,28 @@ try_casesi (tree index_type, tree index_expr, tree minval, tree range,
   create_fixed_operand (&ops[4], (default_label
 				  ? default_label
 				  : fallback_label));
+  rtx_insn *last = get_last_insn ();
   expand_jump_insn (targetm.code_for_casesi, 5, ops);
+
+  /* The casesi pattern emits its own bounds check, but it has no operand for
+     the probability of the default case.  Put that probability on the
+     conditional jump to the default label, since otherwise the jump ends up
+     with an even guess and the block layout can't tell the default case is
+     cold.  */
+  if (default_label
+      && default_probability.initialized_p ()
+      && profile_status_for_fn (cfun) != PROFILE_ABSENT)
+    for (rtx_insn *insn = last ? NEXT_INSN (last) : get_insns (); insn;
+	 insn = NEXT_INSN (insn))
+      {
+	rtx lab;
+	if (JUMP_P (insn)
+	    && any_condjump_p (insn)
+	    && (lab = condjump_label (insn)) != NULL_RTX
+	    && label_ref_label (lab) == default_label
+	    && !find_reg_note (insn, REG_BR_PROB, 0))
+	  add_reg_br_prob_note (insn, default_probability);
+      }
   return true;
 }
 
