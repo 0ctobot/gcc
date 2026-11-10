@@ -813,9 +813,9 @@ section to make clear that your version contains modifications.
 Specify a string that identifies your package.  You may wish
 to include a build number or build date.  This version string will be
 included in the output of @command{gcc --version}.  This suffix does
-not replace the default version string, only the @samp{GCC} part.
+not replace the default version string, only the @samp{Neutrino GCC} part.
 
-The default value is @samp{GCC}.
+The default value is @samp{Neutrino GCC}.
 
 @item --with-bugurl=@var{url}
 Specify the URL that users should visit if they wish to report a bug.

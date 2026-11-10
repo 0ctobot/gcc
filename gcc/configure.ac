@@ -1065,7 +1065,7 @@ AC_ARG_WITH(specs,
 )
 AC_SUBST(CONFIGURE_SPECS)
 
-ACX_PKGVERSION([GCC])
+ACX_PKGVERSION([Neutrino GCC])
 ACX_BUGURL([https://gcc.gnu.org/bugs/])
 
 # Allow overriding the default URL for documentation
