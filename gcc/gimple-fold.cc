@@ -8473,6 +8473,54 @@ reuse_split_load (tree /* in[0] out[1] */ ln_arg[2],
     }
 }
 
+/* Return true if bits [BITPOS, BITPOS + BITSIZE) of an object of TYPE
+   overlap a volatile field or element.  A BITSIZE of zero stands for the
+   whole object.  Fields whose position or size isn't constant count as
+   overlapping.  */
+
+static bool
+volatile_bits_in_range_p (tree type, HOST_WIDE_INT bitpos,
+			  HOST_WIDE_INT bitsize)
+{
+  if (TYPE_VOLATILE (type))
+    return true;
+
+  if (RECORD_OR_UNION_TYPE_P (type))
+    {
+      for (tree f = TYPE_FIELDS (type); f; f = DECL_CHAIN (f))
+	{
+	  if (TREE_CODE (f) != FIELD_DECL)
+	    continue;
+	  if (!tree_fits_shwi_p (bit_position (f))
+	      || !DECL_SIZE (f)
+	      || !tree_fits_shwi_p (DECL_SIZE (f)))
+	    {
+	      if (TREE_THIS_VOLATILE (f)
+		  || volatile_bits_in_range_p (TREE_TYPE (f), 0, 0))
+		return true;
+	      continue;
+	    }
+	  HOST_WIDE_INT fpos = int_bit_position (f);
+	  HOST_WIDE_INT fsize = tree_to_shwi (DECL_SIZE (f));
+	  if (bitsize > 0
+	      && (fpos >= bitpos + bitsize || fpos + fsize <= bitpos))
+	    continue;
+	  if (TREE_THIS_VOLATILE (f)
+	      || volatile_bits_in_range_p (TREE_TYPE (f), bitpos - fpos,
+					   bitsize))
+	    return true;
+	}
+      return false;
+    }
+
+  /* The range can cover any element of an array, so check each element in
+     full.  A BITSIZE of zero means the whole object.  */
+  if (TREE_CODE (type) == ARRAY_TYPE)
+    return volatile_bits_in_range_p (TREE_TYPE (type), 0, 0);
+
+  return false;
+}
+
 /* Find ways of folding logical expressions of LHS and RHS:
 
    Try to merge two comparisons to nearby fields.
@@ -9031,6 +9079,14 @@ fold_truth_andor_for_ifcombine (enum tree_code code, tree truth_type,
      make it wide enough to hold both.  */
   if (l_split_load)
     lnbitsize += GET_MODE_BITSIZE (lnmode2);
+
+  /* The combined load covers every bit in between and around the two
+     fields, which can include a volatile field that the source never
+     reads.  volatilep only tells us about the compared fields, so check
+     the whole range of the load.  */
+  if (volatile_bits_in_range_p (TREE_TYPE (ll_inner), lnbitpos, lnbitsize))
+    return 0;
+
   lntype = build_nonstandard_integer_type (lnbitsize, 1);
   if (!lntype)
     return NULL_TREE;
@@ -9259,6 +9315,9 @@ fold_truth_andor_for_ifcombine (enum tree_code code, tree truth_type,
       rnbitpos = first_bit & ~ (rnbitsize - 1);
       if (r_split_load)
 	rnbitsize += GET_MODE_BITSIZE (rnmode2);
+      if (volatile_bits_in_range_p (TREE_TYPE (lr_inner), rnbitpos,
+				    rnbitsize))
+	return 0;
       rntype = build_nonstandard_integer_type (rnbitsize, 1);
       if (!rntype)
 	return  0;
