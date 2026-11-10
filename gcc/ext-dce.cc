@@ -415,8 +415,8 @@ ext_dce_process_sets (rtx_insn *insn, rtx obj, bitmap live_tmp)
    Replace the source of SET with NEW_SRC which is a source register
    from NEW_SRC_INSN (the left shift in the pair).  This is effectively
    the same as the replacement we do for ZERO/SIGN extends on targets
-   that support those insns.  */
-static void
+   that support those insns.  Return true if INSN was replaced.  */
+static bool
 ext_dce_try_optimize_rshift (rtx_insn *insn, rtx set, rtx new_src, rtx_insn *new_src_insn)
 {
   /* If the modes are not the same or one is a hard register, then
@@ -426,7 +426,13 @@ ext_dce_try_optimize_rshift (rtx_insn *insn, rtx set, rtx new_src, rtx_insn *new
       || !REG_P (new_src)
       || REGNO (XEXP (SET_SRC (set), 0)) < FIRST_PSEUDO_REGISTER
       || REGNO (new_src) < FIRST_PSEUDO_REGISTER)
-    return;
+    return false;
+
+  /* The move that replaces INSN reads NEW_SRC after the left shift, so the
+     left shift must not have overwritten it.  An in-place x = x << C leaves
+     NEW_SRC holding the shifted value, whose low bits are all zero.  */
+  if (reg_set_p (new_src, new_src_insn))
+    return false;
 
   if (dump_file)
     {
@@ -442,7 +448,7 @@ ext_dce_try_optimize_rshift (rtx_insn *insn, rtx set, rtx new_src, rtx_insn *new
     {
       if (dump_file)
 	fprintf (dump_file, "Rejected due to debug counter.\n");
-      return;
+      return false;
     }
 
   /* We're going to generate a fresh insn for the move, so put it
@@ -476,6 +482,7 @@ ext_dce_try_optimize_rshift (rtx_insn *insn, rtx set, rtx new_src, rtx_insn *new
       remove_note (new_src_insn, note);
       add_reg_note (insn, REG_DEAD, new_src);
     }
+  return true;
 }
 
 /* Return true if the extension of INNER to OUTER_MODE is already
@@ -1314,10 +1321,11 @@ ext_dce_process_uses (rtx_insn *insn, rtx obj,
 			  tmp_mask |= mask_array[i];
 		      tmp_mask >>= bit;
 
-		      if (modify && !skipped_dest && (tmp_mask & ~src_mask) == 0)
+		      if (modify && !skipped_dest && (tmp_mask & ~src_mask) == 0
+			  && ext_dce_try_optimize_rshift
+			       (insn, x, XEXP (SET_SRC (prev_set), 0),
+				prev_insn))
 			{
-			  ext_dce_try_optimize_rshift (insn, x, XEXP (SET_SRC (prev_set), 0), prev_insn);
-
 			  /* These may not strictly be necessary, but we might as well try and be
 			     as accurate as possible.  The RHS is now a simple REG.  */
 			  dst_mask = src_mask;
