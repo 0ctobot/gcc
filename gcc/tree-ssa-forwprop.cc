@@ -1202,6 +1202,17 @@ optimize_aggr_zeroprop_1 (gimple *defstmt, gimple *stmt,
    else if (gimple_assign_load_p (stmt) && gimple_store_p (stmt))
      {
 	src2 = gimple_assign_rhs1 (stmt);
+	/* A volatile read has to load memory even though we know what it held
+	   when it was zeroed.  Only the source matters here: a plain copy into
+	   volatile memory, such as WRITE_ONCE (*pmdp, __pmd (0)), keeps its
+	   volatile store when the source becomes {}.  */
+	for (tree t = src2; ; t = TREE_OPERAND (t, 0))
+	  {
+	    if (TREE_THIS_VOLATILE (t))
+	      return;
+	    if (!handled_component_p (t))
+	      break;
+	  }
 	len2 = (TREE_CODE (src2) == COMPONENT_REF
 		? DECL_SIZE_UNIT (TREE_OPERAND (src2, 1))
 		: TYPE_SIZE_UNIT (TREE_TYPE (src2)));
