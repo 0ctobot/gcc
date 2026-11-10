@@ -5880,12 +5880,52 @@
 ;; CNT	v1.8b, v.8b
 ;; ADDV b2, v1.8b
 ;; MOV	w0, v2.b[0]
+;; Without either of them, SImode and DImode use a SWAR sequence in the GP
+;; registers rather than a libgcc call.
 
 (define_expand "popcount<mode>2"
   [(set (match_operand:ALLI 0 "register_operand")
 	(popcount:ALLI (match_operand:ALLI 1 "register_operand")))]
-  "TARGET_CSSC ? GET_MODE_BITSIZE (<MODE>mode) >= 32 : TARGET_SIMD"
+  "GET_MODE_BITSIZE (<MODE>mode) >= 32 || (TARGET_SIMD && !TARGET_CSSC)"
 {
+  if (!TARGET_CSSC && !TARGET_SIMD)
+    {
+      /* Sum the bits in pairs, then in nibbles, then in bytes, and add up
+	 the bytes with a multiplication that leaves the sum in the top
+	 byte.  */
+      scalar_int_mode mode = <MODE>mode;
+      unsigned HOST_WIDE_INT m1 = HOST_WIDE_INT_UC (0x5555555555555555);
+      unsigned HOST_WIDE_INT m2 = HOST_WIDE_INT_UC (0x3333333333333333);
+      unsigned HOST_WIDE_INT m4 = HOST_WIDE_INT_UC (0x0f0f0f0f0f0f0f0f);
+      unsigned HOST_WIDE_INT h01 = HOST_WIDE_INT_UC (0x0101010101010101);
+      rtx x = operands[1];
+      rtx t = expand_simple_binop (mode, LSHIFTRT, x, const1_rtx, NULL_RTX,
+				   1, OPTAB_DIRECT);
+      t = expand_simple_binop (mode, AND, t, gen_int_mode (m1, mode),
+			       NULL_RTX, 1, OPTAB_DIRECT);
+      x = expand_simple_binop (mode, MINUS, x, t, NULL_RTX, 1, OPTAB_DIRECT);
+      t = expand_simple_binop (mode, LSHIFTRT, x, GEN_INT (2), NULL_RTX, 1,
+			       OPTAB_DIRECT);
+      t = expand_simple_binop (mode, AND, t, gen_int_mode (m2, mode),
+			       NULL_RTX, 1, OPTAB_DIRECT);
+      x = expand_simple_binop (mode, AND, x, gen_int_mode (m2, mode),
+			       NULL_RTX, 1, OPTAB_DIRECT);
+      x = expand_simple_binop (mode, PLUS, x, t, NULL_RTX, 1, OPTAB_DIRECT);
+      t = expand_simple_binop (mode, LSHIFTRT, x, GEN_INT (4), NULL_RTX, 1,
+			       OPTAB_DIRECT);
+      x = expand_simple_binop (mode, PLUS, x, t, NULL_RTX, 1, OPTAB_DIRECT);
+      x = expand_simple_binop (mode, AND, x, gen_int_mode (m4, mode),
+			       NULL_RTX, 1, OPTAB_DIRECT);
+      x = expand_simple_binop (mode, MULT, x, gen_int_mode (h01, mode),
+			       NULL_RTX, 1, OPTAB_DIRECT);
+      x = expand_simple_binop (mode, LSHIFTRT, x,
+			       GEN_INT (GET_MODE_BITSIZE (mode) - 8),
+			       operands[0], 1, OPTAB_DIRECT);
+      if (x != operands[0])
+	emit_move_insn (operands[0], x);
+      DONE;
+    }
+
   if (!TARGET_CSSC && TARGET_SVE && <MODE>mode != QImode)
     {
       rtx tmp = gen_reg_rtx (<VEC_POP_MODE>mode);
