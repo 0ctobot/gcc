@@ -3738,7 +3738,22 @@ expand_asm_stmt (gasm *stmt)
 	}
       else
 	{
-	  op = assign_temp (type, 0, 1);
+	  /* The asm writes the whole register, so an integer type narrower
+	     than its mode (e.g., a scalarized bit-field) can get bits above
+	     its precision that later uses assume are an extension of the
+	     value.  Let the asm write a full-precision temporary and reduce
+	     it through a conversion, like any other narrowing.  */
+	  tree tmp_type = type;
+	  scalar_int_mode smode;
+	  if (INTEGRAL_TYPE_P (type)
+	      && TREE_CODE (type) != BOOLEAN_TYPE
+	      && is_a <scalar_int_mode> (TYPE_MODE (type), &smode)
+	      && !type_has_mode_precision_p (type))
+	    tmp_type
+	      = build_nonstandard_integer_type (GET_MODE_PRECISION (smode),
+						TYPE_UNSIGNED (type));
+
+	  op = assign_temp (tmp_type, 0, 1);
 	  op = validize_mem (op);
 	  if (!MEM_P (op) && TREE_CODE (val) == SSA_NAME)
 	    set_reg_attrs_for_decl_rtl (SSA_NAME_VAR (val), op);
@@ -3746,7 +3761,8 @@ expand_asm_stmt (gasm *stmt)
 	  generating_concat_p = old_generating_concat_p;
 
 	  push_to_sequence2 (after_rtl_seq, after_rtl_end);
-	  expand_assignment (val, make_tree (type, op), false);
+	  expand_assignment (val, fold_convert (type, make_tree (tmp_type, op)),
+			     false);
 	  after_rtl_seq = get_insns ();
 	  after_rtl_end = get_last_insn ();
 	  end_sequence ();
