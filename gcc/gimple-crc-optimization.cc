@@ -222,6 +222,11 @@ class crc_optimization {
   false otherwise.  */
   bool validate_crc_and_data ();
 
+  /* Returns true if the data's value on the latch edge is its value on
+     entry to the iteration, shifted by one bit towards the bit the CRC
+     consumes next.  Otherwise, returns false.  */
+  bool data_shifts_by_one_bit ();
+
   /* Convert polynomial to unsigned HOST_WIDE_INT.  */
   void construct_constant_polynomial (value *polynomial);
 
@@ -1161,9 +1166,70 @@ bool crc_optimization::validate_crc_and_data ()
 		     "Loop iteration number and data's size differ.\n");
 	  return false;
 	}
+      if (!data_shifts_by_one_bit ())
+	{
+	  if (dump_file && (dump_flags & TDF_DETAILS))
+	    fprintf (dump_file,
+		     "Data isn't shifted by one bit per iteration.\n");
+	  return false;
+	}
 	return true;
     }
   return true;
+}
+
+/* Returns true if the data's value on the latch edge is its value on entry
+   to the iteration, shifted by one bit towards the bit the CRC consumes next.
+   Otherwise, returns false.
+
+   Symbolic execution only checks the CRC's value at the end of an iteration
+   against the LFSR, and the condition only reads one bit of the data, so
+   neither notices how the data advances between iterations.  The CRC
+   expansion assumes that iteration I reads bit I of the data's initial
+   value (counting from the MSB for bit-forward CRC), which only holds when
+   each iteration shifts the data by exactly one bit in the direction
+   matching the CRC.  Accept a chain of conversions around exactly one such
+   shift, as long as no conversion narrows the value below the data's
+   precision.  For a bit-forward CRC, a multiply by 2 counts as the shift,
+   since that's how data += data and data *= 2 reach the pass, and it moves
+   every bit up by one just the same.  Sign extension and arithmetic right
+   shifts are fine, since the bits they bring in are never read within the
+   loop's iteration count.  */
+
+bool
+crc_optimization::data_shifts_by_one_bit ()
+{
+  tree data = gimple_phi_result (m_phi_for_data);
+  unsigned data_size = TYPE_PRECISION (TREE_TYPE (data));
+  tree_code shift_code = m_is_bit_forward ? LSHIFT_EXPR : RSHIFT_EXPR;
+  bool shifted = false;
+  tree t = PHI_ARG_DEF_FROM_EDGE (m_phi_for_data, loop_latch_edge (m_crc_loop));
+
+  while (t != data)
+    {
+      if (TREE_CODE (t) != SSA_NAME
+	  || !INTEGRAL_TYPE_P (TREE_TYPE (t))
+	  || TYPE_PRECISION (TREE_TYPE (t)) < data_size)
+	return false;
+
+      gassign *def = dyn_cast<gassign *> (SSA_NAME_DEF_STMT (t));
+      if (!def)
+	return false;
+
+      tree_code code = gimple_assign_rhs_code (def);
+      if (!shifted
+	  && ((code == shift_code
+	       && integer_onep (gimple_assign_rhs2 (def)))
+	      || (m_is_bit_forward
+		  && code == MULT_EXPR
+		  && TREE_CODE (gimple_assign_rhs2 (def)) == INTEGER_CST
+		  && wi::to_wide (gimple_assign_rhs2 (def)) == 2)))
+	shifted = true;
+      else if (!CONVERT_EXPR_CODE_P (code))
+	return false;
+      t = gimple_assign_rhs1 (def);
+    }
+  return shifted;
 }
 
 /* Convert polynomial to unsigned HOST_WIDE_INT.  */
