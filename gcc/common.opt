@@ -3686,7 +3686,7 @@ Common RejectNegative Joined
 Clear call-used registers upon function return.
 
 fzero-init-padding-bits=
-Common Joined RejectNegative Enum(zero_init_padding_bits_kind) Var(flag_zero_init_padding_bits) Init(ZERO_INIT_PADDING_BITS_STANDARD)
+Common Joined RejectNegative Enum(zero_init_padding_bits_kind) Var(flag_zero_init_padding_bits) Init(ZERO_INIT_PADDING_BITS_STANDARD) Optimization
 -fzero-init-padding-bits=[standard|unions|all]	Zero padding bits in initializers.
 
 Enum

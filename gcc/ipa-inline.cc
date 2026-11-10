@@ -590,6 +590,7 @@ can_inline_edge_by_limits_p (struct cgraph_edge *e, int flags)
 	      || check_match (flag_wrapv_pointer)
 	      || check_match (flag_trapv)
 	      || check_match (flag_pcc_struct_return)
+	      || check_maybe_up (flag_zero_init_padding_bits)
 	      || check_maybe_down (optimize_debug)
 	      /* When caller or callee does FP math, be sure FP codegen flags
 		 compatible.  */
