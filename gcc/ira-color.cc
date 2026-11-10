@@ -2030,10 +2030,13 @@ calculate_saved_nregs (int hard_regno, machine_mode mode)
    callee-saved registers allocated so far.  The registers are saved in
    SAVE_BB, which is the entry block unless they can be shrink-wrapped
    separately, and restored at the matching exits.  The cost is
-   TARGET_CALLEE_SAVE_COST weighted by the frequencies of those blocks.  */
+   TARGET_CALLEE_SAVE_COST weighted by the frequencies of those blocks.
+   If BIAS_SKIPPED is nonnull, set *BIAS_SKIPPED to true when the target
+   priced the save at 1, which leaves no room for the bias toward
+   callee-saved registers.  */
 static int
 calculate_saved_regs_cost (int hard_regno, machine_mode mode, int saved_nregs,
-			   basic_block save_bb)
+			   basic_block save_bb, bool *bias_skipped = NULL)
 {
   int nregs = hard_regno_nregs (hard_regno, mode);
   enum reg_class rclass = REGNO_REG_CLASS (hard_regno);
@@ -2059,6 +2062,8 @@ calculate_saved_regs_cost (int hard_regno, machine_mode mode, int saved_nregs,
      least as high as the exit frequency.  */
   if (entry_cost > 1)
     entry_cost -= 1;
+  else if (bias_skipped)
+    *bias_skipped = true;
 
   auto exit_cost = targetm.callee_save_cost
     (spill_cost_type::RESTORE, hard_regno, mode, saved_nregs,
@@ -2504,6 +2509,9 @@ assign_hard_reg (ira_allocno_t a, bool retry_p)
 	continue;
       cost = costs[i];
       full_cost = full_costs[i];
+      /* Whether the bias toward callee-saved registers below was skipped
+	 for HARD_REGNO because the target priced its save at 1.  */
+      bool save_bias_skipped = false;
       if (!HONOR_REG_ALLOC_ORDER)
 	{
 	  if ((saved_nregs = calculate_saved_nregs (hard_regno, mode)) != 0)
@@ -2513,7 +2521,8 @@ assign_hard_reg (ira_allocno_t a, bool retry_p)
 	     increase the cost.  */
 	  {
 	    add_cost = calculate_saved_regs_cost (hard_regno, mode,
-						  saved_nregs, save_bb);
+						  saved_nregs, save_bb,
+						  &save_bias_skipped);
 	    cost += add_cost;
 	    full_cost += add_cost;
 	  }
@@ -2531,7 +2540,16 @@ assign_hard_reg (ira_allocno_t a, bool retry_p)
 	}
       if (min_cost > cost)
 	min_cost = cost;
-      if (min_full_cost > full_cost)
+      /* The bias toward callee-saved registers above can't break a tie
+	 when the target prices a save at 1, since lowering that cost would
+	 make the save look free.  Break such a tie here instead, in favor of
+	 the register that doesn't need to be saved around calls.  */
+      if (min_full_cost > full_cost
+	  || (save_bias_skipped
+	      && min_full_cost == full_cost
+	      && best_hard_regno >= 0
+	      && ira_need_caller_save_p (a, best_hard_regno)
+	      && !ira_need_caller_save_p (a, hard_regno)))
 	{
 	  min_full_cost = full_cost;
 	  best_hard_regno = hard_regno;
