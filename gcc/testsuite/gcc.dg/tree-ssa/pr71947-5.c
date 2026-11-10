@@ -5,7 +5,9 @@
 static inline long load(long *p)
 {
         long ret;
-        asm ("xyzzy      %1,%0\n\t" : "=r" (ret) : "m" (*p));
+        /* The asm has to cost more than the load of *p for DOM to replace
+           the load with ret, so its template holds two instructions.  */
+        asm ("xyzzy      %1,%0\n\tnop\n\t" : "=r" (ret) : "m" (*p));
         if (ret != *p)
                 __builtin_unreachable();
         return ret;
