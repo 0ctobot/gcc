@@ -14501,6 +14501,109 @@ aarch64_far_jump_table_base_p (rtx diff_vec)
 	  && aarch64_cmodel != AARCH64_CMODEL_TINY);
 }
 
+/* Return true if INSN is an inline asm statement, basic or extended.  */
+
+static bool
+aarch64_inline_asm_insn_p (rtx_insn *insn)
+{
+  if (!NONDEBUG_INSN_P (insn))
+    return false;
+
+  rtx pat = PATTERN (insn);
+  return GET_CODE (pat) == ASM_INPUT || asm_noperands (pat) >= 0;
+}
+
+/* The number of inline asm statements that precede each insn of the function
+   being compiled, indexed by INSN_UID, along with the function and the
+   maximum UID it was built for.  shorten_branches asks about every jump table
+   in every iteration of its length calculation, and a table's labels can span
+   most of the function, so walking the insns between them for each query
+   would make the cost quadratic in the number of tables.  */
+
+static auto_vec<int> aarch64_asms_before;
+static int aarch64_asms_before_funcdef_no = -1;
+static int aarch64_asms_before_max_uid;
+
+/* Return true if an inline asm statement lies between FROM and TO, which
+   must follow FROM.  */
+
+static bool
+aarch64_inline_asm_between_p (rtx_insn *from, rtx_insn *to)
+{
+  /* Only shorten_branches gets here, and it doesn't change the insn stream,
+     so the index stays valid for every query it makes on a function.  */
+  int max_uid = get_max_uid ();
+  if (aarch64_asms_before_funcdef_no != current_function_funcdef_no
+      || aarch64_asms_before_max_uid != max_uid)
+    {
+      aarch64_asms_before.truncate (0);
+      aarch64_asms_before.safe_grow_cleared (max_uid, true);
+      int n = 0;
+      for (rtx_insn *insn = get_insns (); insn; insn = NEXT_INSN (insn))
+	{
+	  aarch64_asms_before[INSN_UID (insn)] = n;
+	  if (aarch64_inline_asm_insn_p (insn))
+	    n++;
+	}
+      aarch64_asms_before_funcdef_no = current_function_funcdef_no;
+      aarch64_asms_before_max_uid = max_uid;
+    }
+
+  return (aarch64_asms_before[INSN_UID (to)]
+	  > aarch64_asms_before[INSN_UID (from)]);
+}
+
+/* Return true if an inline asm statement sits between the base label of
+   ADDR_DIFF_VEC BODY and any of its case labels.  */
+
+static bool
+aarch64_case_vector_spans_asm_p (rtx body)
+{
+  rtx_insn *base = as_a <rtx_insn *> (XEXP (XEXP (body, 0), 0));
+  rtx_insn *min_lab = as_a <rtx_insn *> (XEXP (XEXP (body, 2), 0));
+  rtx_insn *max_lab = as_a <rtx_insn *> (XEXP (XEXP (body, 3), 0));
+
+  addr_diff_vec_flags flags = ADDR_DIFF_VEC_FLAGS (body);
+
+  /* MIN_LAB and MAX_LAB are the first and last case labels in insn order,
+     so the labels that follow the base label lie between it and MAX_LAB, and
+     those that precede it lie between MIN_LAB and the base label.
+     shorten_branches records in FLAGS which side of the base label each of
+     the two is on, so only check a side that has case labels.  */
+  if (flags.max_after_base && aarch64_inline_asm_between_p (base, max_lab))
+    return true;
+
+  return !flags.min_after_base && aarch64_inline_asm_between_p (min_lab, base);
+}
+
+/* Implement CASE_VECTOR_SHORTEN_MODE.  MIN and MAX are the estimated byte
+   offsets of the first and last case labels of ADDR_DIFF_VEC BODY from its
+   base label.
+
+   The estimate counts an inline asm as one instruction per statement of its
+   template (each part separated by a newline or a ';'), but an asm can emit
+   far more than that (.rept, .fill, .skip or an assembler macro).  The
+   dispatch sign-extends byte and halfword entries, and the assembler takes
+   an entry that only fits the field unsigned (128 to 255 for a byte, 32768
+   to 65535 for a halfword) without a warning, which sends the dispatch
+   backward into unrelated code.  Since there's no way to bound what an asm
+   emits, use word entries whenever an asm lies between the base label and a
+   case label.  The dispatch has the same number of instructions for every
+   entry size; only the table grows.  */
+
+scalar_int_mode
+aarch64_case_vector_shorten_mode (HOST_WIDE_INT min, HOST_WIDE_INT max,
+				  rtx body)
+{
+  if (min < -0x1fff0 || max > 0x1fff0 || aarch64_case_vector_spans_asm_p (body))
+    return SImode;
+
+  if (min < -0x1f0 || max > 0x1f0)
+    return HImode;
+
+  return QImode;
+}
+
 const char*
 aarch64_output_casesi (rtx *operands)
 {
