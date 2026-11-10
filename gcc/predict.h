@@ -90,6 +90,7 @@ extern void invert_br_probabilities (rtx_insn *);
 extern void guess_outgoing_edge_probabilities (basic_block);
 extern void tree_guess_outgoing_edge_probabilities (basic_block);
 extern void tree_estimate_probability (bool);
+extern bool expect_phi_cond_p (gcond *);
 extern void handle_missing_profiles (void);
 extern bool update_max_bb_count (void);
 extern bool expensive_function_p (int);

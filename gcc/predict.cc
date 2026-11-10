@@ -3287,6 +3287,330 @@ tree_estimate_probability_bb (basic_block bb, bool local_only)
   tree_predict_by_opcode (bb);
 }
 
+/* Walk T back through SSA copies and integral conversions and return the
+   value it was computed from.  If DEFS is nonnull, also walk through bitwise
+   negations, as in likely (!b) on a bool b, and push each statement walked
+   through onto DEFS, outermost first.  */
+
+static tree
+strip_expect_conversions (tree t, vec<gassign *> *defs)
+{
+  for (int n = 0; n < 4 && TREE_CODE (t) == SSA_NAME; n++)
+    {
+      gassign *def = dyn_cast <gassign *> (SSA_NAME_DEF_STMT (t));
+      if (!def
+	  || !(gimple_assign_ssa_name_copy_p (def)
+	       || CONVERT_EXPR_CODE_P (gimple_assign_rhs_code (def))
+	       || (defs && gimple_assign_rhs_code (def) == BIT_NOT_EXPR))
+	  || !INTEGRAL_TYPE_P (TREE_TYPE (t))
+	  || !INTEGRAL_TYPE_P (TREE_TYPE (gimple_assign_rhs1 (def))))
+	break;
+      if (defs)
+	defs->safe_push (def);
+      t = gimple_assign_rhs1 (def);
+    }
+  return t;
+}
+
+/* Apply the statements in DEFS, as pushed by strip_expect_conversions (), to
+   the constant VAL, innermost first, and return the resulting constant or
+   NULL_TREE if one of them doesn't fold.  */
+
+static tree
+replay_expect_conversions (tree val, const vec<gassign *> &defs)
+{
+  for (unsigned j = defs.length (); val && j-- > 0;)
+    if (!gimple_assign_ssa_name_copy_p (defs[j]))
+      val = fold_unary (gimple_assign_rhs_code (defs[j]),
+			TREE_TYPE (gimple_assign_lhs (defs[j])), val);
+  return val && TREE_CODE (val) == INTEGER_CST ? val : NULL_TREE;
+}
+
+/* Return the outcome of COND when the hint call it tests returns VAL, given
+   the statements COND_DEFS between the call and COND's operand, or NULL_TREE
+   if it doesn't fold to a constant.  */
+
+static tree
+expect_cond_outcome (gcond *cond, const vec<gassign *> &cond_defs, tree val)
+{
+  val = replay_expect_conversions (val, cond_defs);
+  if (!val)
+    return NULL_TREE;
+  tree res = fold_binary (gimple_cond_code (cond), boolean_type_node, val,
+			  gimple_cond_rhs (cond));
+  return res && TREE_CODE (res) == INTEGER_CST ? res : NULL_TREE;
+}
+
+/* Look for a condition on a __builtin_expect () hint whose first argument
+   comes from a PHI node, as in
+
+     <bb 5>:
+     # iftmp.0_10 = PHI <1(4), 0(3)>
+     _4 = (long int) iftmp.0_10;
+     _5 = __builtin_expect (_4, 0);
+     if (_5 != 0)
+
+   which is what unlikely (a || b) looks like when a || b is computed into a
+   variable first, as the Linux kernel's WARN_ON () and preempt_enable () do.
+   The hint describes the PHI node's value, so it also describes the branches
+   that pick each of the PHI node's constants.
+
+   A constant argument only contradicts the hint if it sends COND the other
+   way than the expected value does: with if (__builtin_expect (r, 1)), the
+   constants 2 and 3 take the expected branch just like 1.  If COND is such a
+   condition and at least one PHI argument is a constant that contradicts the
+   hint, return the PHI node, store the hint call in *CALLP and push the
+   indices of all such arguments onto UNEXPECTED, either of which may be
+   null.  PHI nodes in loop headers are ignored.  */
+
+static gphi *
+expect_phi_for_cond (gcond *cond, gcall **callp, vec<unsigned> *unexpected)
+{
+  if (TREE_CODE (gimple_cond_rhs (cond)) != INTEGER_CST)
+    return NULL;
+
+  auto_vec<gassign *, 4> cond_defs;
+  tree t = strip_expect_conversions (gimple_cond_lhs (cond), &cond_defs);
+  if (TREE_CODE (t) != SSA_NAME)
+    return NULL;
+  gcall *call = dyn_cast <gcall *> (SSA_NAME_DEF_STMT (t));
+  if (!call
+      || !(gimple_call_builtin_p (call, BUILT_IN_EXPECT)
+	   || gimple_call_builtin_p (call, BUILT_IN_EXPECT_WITH_PROBABILITY)
+	   || gimple_call_internal_p (call, IFN_BUILTIN_EXPECT)))
+    return NULL;
+
+  tree arg = gimple_call_arg (call, 0);
+  tree expected = gimple_call_arg (call, 1);
+  if (!INTEGRAL_TYPE_P (TREE_TYPE (arg))
+      || TREE_CODE (expected) != INTEGER_CST)
+    return NULL;
+
+  auto_vec<gassign *, 4> defs;
+  t = strip_expect_conversions (arg, &defs);
+  if (TREE_CODE (t) != SSA_NAME)
+    return NULL;
+  gphi *phi = dyn_cast <gphi *> (SSA_NAME_DEF_STMT (t));
+  if (!phi)
+    return NULL;
+  basic_block bb = gimple_bb (phi);
+  if (current_loops && bb->loop_father && bb->loop_father->header == bb)
+    return NULL;
+
+  tree expected_outcome
+    = expect_cond_outcome (cond, cond_defs,
+			   fold_convert (TREE_TYPE (arg), expected));
+  if (!expected_outcome)
+    return NULL;
+
+  bool found = false;
+  for (unsigned i = 0; i < gimple_phi_num_args (phi); i++)
+    {
+      tree val = gimple_phi_arg_def (phi, i);
+      if (TREE_CODE (val) != INTEGER_CST
+	  || (gimple_phi_arg_edge (phi, i)->flags & EDGE_COMPLEX))
+	continue;
+
+      /* Compute what the constant becomes on its way to the hint, and then
+	 which way it sends COND.  */
+      val = replay_expect_conversions (val, defs);
+      if (!val)
+	continue;
+      tree outcome = expect_cond_outcome (cond, cond_defs, val);
+      if (!outcome
+	  || integer_zerop (outcome) == integer_zerop (expected_outcome))
+	continue;
+
+      found = true;
+      if (!unexpected)
+	break;
+      unexpected->safe_push (i);
+    }
+  if (!found)
+    return NULL;
+
+  if (callp)
+    *callp = call;
+  return phi;
+}
+
+/* Return true if COND tests a __builtin_expect () hint on a PHI node with a
+   constant argument that makes COND go the other way than the hint.  */
+
+bool
+expect_phi_cond_p (gcond *cond)
+{
+  return expect_phi_for_cond (cond, NULL, NULL);
+}
+
+/* Return true if E leads to PHI's block only through blocks with a single
+   predecessor and successor, and enters it through one of the arguments in
+   UNEXPECTED, a bitmap of argument indices.  */
+
+static bool
+edge_to_unexpected_phi_arg_p (edge e, gphi *phi, bitmap unexpected)
+{
+  for (int n = 0; n < 4; n++)
+    {
+      if (e->dest == gimple_bb (phi))
+	return bitmap_bit_p (unexpected, e->dest_idx);
+      if (!single_pred_p (e->dest) || !single_succ_p (e->dest))
+	return false;
+      e = single_succ_edge (e->dest);
+    }
+  return false;
+}
+
+/* Predict edge E with PROBABILITY of PREDICTOR, where every path along E
+   carries a constant to PHI that contradicts a __builtin_expect () hint, the
+   arguments of which are in the bitmap UNEXPECTED.  If every successor of
+   E's source block carries such a constant, which is always the case for a
+   single successor, predict the edges into that block instead.  Edges from
+   other loops than PHI's are left to the loop heuristics, and a block with
+   more than two successors is left to the other heuristics.  */
+
+static void
+predict_unexpected_phi_edge (edge e, enum br_predictor predictor,
+			     int probability, gphi *phi, bitmap unexpected,
+			     bitmap visited, int depth, bool dry_run)
+{
+  basic_block src = e->src;
+  basic_block phi_bb = gimple_bb (phi);
+  if (src == ENTRY_BLOCK_PTR_FOR_FN (cfun)
+      || src->loop_father != phi_bb->loop_father
+      || !bitmap_set_bit (visited, src->index))
+    return;
+
+  bool all_unexpected = true;
+  edge succ;
+  edge_iterator ei;
+  FOR_EACH_EDGE (succ, ei, src->succs)
+    if (succ != e && !edge_to_unexpected_phi_arg_p (succ, phi, unexpected))
+      {
+	all_unexpected = false;
+	break;
+      }
+
+  if (!all_unexpected)
+    {
+      /* The hint bounds how often E runs compared with PHI's block.  That
+	 only carries over to the branch in SRC if all of SRC's paths go
+	 through PHI's block, as with the tests of a and b in a || b.  When
+	 the other successor is a loop exit or an early return instead,
+	 predicting E as unlikely would make that exit the likely path, so
+	 leave such a branch to the other heuristics.  */
+      if (!dominated_by_p (CDI_POST_DOMINATORS, src, phi_bb))
+	return;
+
+      if (!e->probability.initialized_p ())
+	{
+	  /* A hint on the branch itself wins, and a second condition on the
+	     same hinted value mustn't predict the edge again.  Only predict a
+	     two-way branch.  For a switch, combine_predictions_for_bb () gives
+	     the predicted edge its probability and splits the rest evenly
+	     among the other edges, so with more than ten edges a 10% hint
+	     would make the unexpected case the most likely one.  */
+	  if (EDGE_COUNT (src->succs) == 2
+	      && !gimple_predicted_by_p (src, PRED_BUILTIN_EXPECT)
+	      && !gimple_predicted_by_p (src,
+					 PRED_BUILTIN_EXPECT_WITH_PROBABILITY))
+	    predict_edge (e, predictor, probability);
+	  return;
+	}
+
+      /* The branch comes from an inlined function body, which already got
+	 its probabilities guessed when the function itself was estimated.
+	 combine_predictions_for_bb () leaves those alone, but the guess was
+	 made without the caller's hint, as in
+
+	   static inline bool f (void) { return a () || b (); }
+	   ...
+	   if (unlikely (f ()))
+
+	 so apply the hint here.  Only ever make the unexpected edge less
+	 likely, which keeps a hint inside the inlined body that already did
+	 better.  */
+      profile_probability p
+	= profile_probability::from_reg_br_prob_base (probability);
+      if (!dry_run
+	  && EDGE_COUNT (src->succs) == 2
+	  && !e->probability.reliable_p ()
+	  && e->probability > p)
+	{
+	  if (dump_file)
+	    {
+	      fprintf (dump_file, "  Lowered guessed probability of edge "
+		       "%i->%i to %s hint: ", src->index, e->dest->index,
+		       predictor_info[predictor].name);
+	      p.dump (dump_file);
+	      fprintf (dump_file, "\n");
+	    }
+	  e->probability = p;
+	  EDGE_SUCC (src, EDGE_SUCC (src, 0) == e)->probability = p.invert ();
+	}
+      return;
+    }
+
+  if (depth < 4)
+    {
+      edge pred;
+      FOR_EACH_EDGE (pred, ei, src->preds)
+	if (!(pred->flags & EDGE_COMPLEX))
+	  predict_unexpected_phi_edge (pred, predictor, probability, phi,
+				       unexpected, visited, depth + 1, dry_run);
+    }
+}
+
+/* tree_predict_by_opcode () only uses a hint on a PHI node to predict the
+   branch on the hinted value.  The branches that compute the value are left
+   to the opcode heuristics, which can easily make the unexpected path the
+   likely one.  A path that brings in a constant which sends COND the
+   unexpected way runs at most as often as COND goes that way, so predict
+   each branch that picks such a constant with the hint's probability.  This
+   is only an estimate, since the predictions compound: two tests that each
+   get 10%, as in unlikely (a || b), add up to 19% for the pair.  DRY_RUN is
+   as for tree_estimate_probability ().  */
+
+static void
+predict_expect_phi_args (gcond *cond, bool dry_run)
+{
+  auto_vec<unsigned, 4> args;
+  gcall *call;
+  gphi *phi = expect_phi_for_cond (cond, &call, &args);
+  if (!phi)
+    return;
+
+  /* The hint only describes the paths that reach COND.  If some path from
+     the PHI node's block can leave without testing COND, as in
+
+       v = a || b;
+       if (mode)
+	 return f (v);
+       if (unlikely (v))
+
+     then a and b may well be true on that path.  */
+  if (!dominated_by_p (CDI_POST_DOMINATORS, gimple_bb (phi),
+		       gimple_bb (cond)))
+    return;
+
+  enum br_predictor predictor;
+  HOST_WIDE_INT probability;
+  tree val = expr_expected_value (gimple_call_lhs (call), &predictor,
+				  &probability);
+  if (!val
+      || (predictor != PRED_BUILTIN_EXPECT
+	  && predictor != PRED_BUILTIN_EXPECT_WITH_PROBABILITY))
+    return;
+
+  int prob = REG_BR_PROB_BASE - get_predictor_value (predictor, probability);
+  auto_bitmap unexpected, visited;
+  for (unsigned i : args)
+    bitmap_set_bit (unexpected, i);
+  for (unsigned i : args)
+    predict_unexpected_phi_edge (gimple_phi_arg_edge (phi, i), predictor, prob,
+				 phi, unexpected, visited, 0, dry_run);
+}
+
 /* Predict branch probabilities and estimate profile of the tree CFG.
    This function can be called from the loop optimizers to recompute
    the profile information.
@@ -3318,6 +3642,11 @@ tree_estimate_probability (bool dry_run)
 
   FOR_EACH_BB_FN (bb, cfun)
     tree_estimate_probability_bb (bb, false);
+
+  /* This must come after all branches got their own predictions.  */
+  FOR_EACH_BB_FN (bb, cfun)
+    if (gcond *cond = safe_dyn_cast <gcond *> (*gsi_last_bb (bb)))
+      predict_expect_phi_args (cond, dry_run);
 
   FOR_EACH_BB_FN (bb, cfun)
     combine_predictions_for_bb (bb, dry_run);
