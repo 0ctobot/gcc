@@ -14280,7 +14280,79 @@ aarch64_return_addr (int count, rtx frame ATTRIBUTE_UNUSED)
 {
   if (count != 0)
     return const0_rtx;
+
+  /* When the return address might be signed, the prologue's PACIASP or
+     PACIBSP overwrites X30.  Reading X30's incoming value keeps that value
+     live from the entry block to the block that reads it, which prevents
+     shrink-wrapping: the value stays either in X30, which the prologue
+     clobbers, or in a callee-saved register that the prologue must save
+     first.  This hurts functions that read the return address only on a
+     cold path.  Load the return address from its save slot instead, which
+     requires the prologue only in the block that reads it.
+
+     Don't do this when profiling, since a function graph tracer's _mcount
+     can replace the saved return address with its own return hook, which
+     the incoming value of X30 is immune to.  */
+  if (aarch_ra_sign_scope != AARCH_FUNCTION_NONE
+      && !fixed_regs[LR_REGNUM]
+      && !crtl->profile)
+    {
+      rtx dest = gen_reg_rtx (Pmode);
+      emit_insn (gen_aarch64_load_return_addr (dest));
+      return dest;
+    }
+
   return aarch64_return_addr_rtx ();
+}
+
+/* Split an aarch64_load_return_addr insn, which sets DEST to the current
+   function's return address.  Load the return address from the slot that
+   the prologue saved X30 to, and strip its pointer authentication code.
+   X30 is clobbered by the insn and thus free to use as a scratch
+   register.  */
+
+void
+aarch64_split_load_return_addr (rtx dest)
+{
+  aarch64_frame &frame = cfun->machine->frame;
+  rtx lr = gen_rtx_REG (Pmode, LR_REGNUM);
+
+  /* The clobber of X30 marks it as ever live, so the frame always saves
+     it.  */
+  gcc_assert (frame.laid_out && known_ge (frame.reg_offset[LR_REGNUM], 0));
+
+  /* Address the slot like aarch64_process_components does.  The stack
+     pointer is only usable when it's constant within the function body,
+     which is the case when the frame pointer isn't needed.  Using the frame
+     pointer only when it's needed also ensures that shrink-wrapping sees a
+     use of a register set up by the prologue.  */
+  rtx base = gen_rtx_REG (Pmode, frame_pointer_needed
+			  ? HARD_FRAME_POINTER_REGNUM
+			  : STACK_POINTER_REGNUM);
+  poly_int64 offset = frame.reg_offset[LR_REGNUM];
+  if (frame_pointer_needed)
+    offset -= frame.bytes_below_hard_fp;
+
+  /* Without FEAT_PAuth only XPACLRI is available, which operates on X30.  */
+  bool use_lr = !TARGET_PAUTH || REGNO (dest) == LR_REGNUM;
+  rtx tmp = use_lr ? lr : dest;
+  rtx addr = plus_constant (Pmode, base, offset);
+  if (!aarch64_legitimate_address_p (Pmode, addr, true))
+    {
+      rtx temp2 = REGNO (dest) == LR_REGNUM ? NULL_RTX : (use_lr ? dest : lr);
+      aarch64_add_offset (Pmode, tmp, base, offset, tmp, temp2, 0, false);
+      addr = tmp;
+    }
+  emit_move_insn (tmp, gen_frame_mem (Pmode, addr));
+
+  if (use_lr)
+    {
+      emit_insn (gen_xpaclri ());
+      if (REGNO (dest) != LR_REGNUM)
+	emit_move_insn (dest, lr);
+    }
+  else
+    emit_insn (gen_aarch64_xpaci (dest, dest));
 }
 
 static void

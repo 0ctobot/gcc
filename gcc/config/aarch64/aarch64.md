@@ -336,6 +336,8 @@
     UNSPEC_RSQRTS
     UNSPEC_NZCV
     UNSPEC_XPACLRI
+    UNSPEC_XPACI
+    UNSPEC_LOAD_RETURN_ADDR
     UNSPEC_LD1_SVE
     UNSPEC_ST1_SVE
     UNSPEC_LDNT1_SVE
@@ -8352,6 +8354,40 @@
   [(set (reg:DI R30_REGNUM) (unspec:DI [(reg:DI R30_REGNUM)] UNSPEC_XPACLRI))]
   ""
   "hint\t7 // xpaclri"
+)
+
+;; Stripping the signature in any general register.
+
+(define_insn "aarch64_xpaci"
+  [(set (match_operand:DI 0 "register_operand" "=r")
+	(unspec:DI [(match_operand:DI 1 "register_operand" "0")]
+		   UNSPEC_XPACI))]
+  "TARGET_PAUTH"
+  "xpaci\t%0"
+)
+
+;; Reading the current function's return address for
+;; __builtin_return_address (0) when it might be signed.  The return address
+;; is loaded from the slot that the prologue saved X30 to, rather than taken
+;; from X30's incoming value, so that only the block reading it needs the
+;; prologue.  The clobber of X30 marks X30 as ever live, which forces the
+;; prologue to save it, and frees X30 for use as a scratch register by the
+;; split.  The BLK memory operand marks the insn as a memory read, which keeps
+;; if-conversion from speculating it onto a path that doesn't need the
+;; prologue and keeps CSE and GCSE from reusing its result across a call.
+
+(define_insn_and_split "aarch64_load_return_addr"
+  [(set (match_operand:DI 0 "register_operand" "=r")
+	(unspec:DI [(mem:BLK (scratch))] UNSPEC_LOAD_RETURN_ADDR))
+   (clobber (reg:DI R30_REGNUM))]
+  ""
+  "#"
+  "&& reload_completed"
+  [(const_int 0)]
+  {
+    aarch64_split_load_return_addr (operands[0]);
+    DONE;
+  }
 )
 
 ;; Save X30 in the X18-based POST_INC stack (consistent with clang).
