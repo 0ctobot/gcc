@@ -617,9 +617,12 @@ gimple_range_global (vrange &r, tree name, struct function *fun)
 	    r.set_varying (type);
 	  // Try to use the "nonnull" attribute to refine a pointer to
 	  // ~[0, 0].  Note that this is only valid with default definitions
-	  // of PARM_DECLs
+	  // of PARM_DECLs.  Don't do this under -fno-delete-null-pointer-checks,
+	  // which keeps null pointer checks even for an argument the attribute
+	  // says can't be null.
 	  if (POINTER_TYPE_P (type)
-	      && ((cfun && fun == cfun && nonnull_arg_p (sym))))
+	      && ((cfun && fun == cfun && flag_delete_null_pointer_checks
+		   && nonnull_arg_p (sym))))
 	   {
 	     prange nz (type);
 	     nz.set_nonzero (type);
