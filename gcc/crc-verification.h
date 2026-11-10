@@ -156,7 +156,7 @@ class crc_symbolic_execution {
 /**************************** LFSR MATCHING *********************************/
 
 /* Returns true if all states match the LFSR, otherwise - false.  */
-bool all_states_match_lfsr (value *, bool, tree, const vec<state *> &);
+bool all_states_match_lfsr (value *, bool, tree, tree, const vec<state *> &);
 
 
 #endif //GCC_CRC_VERIFICATION
