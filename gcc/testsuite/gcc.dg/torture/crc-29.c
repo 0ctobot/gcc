@@ -3,10 +3,11 @@
 /* { dg-skip-if "" { *-*-* } { "-O0" "-O1" "-g" "-Os" "-flto" } } */
 /* { dg-require-effective-target int32plus } */
 
-/* This is a CRC, even though it may seem it's not.
-   'j' is initialized with 4 (100) and increased by 2 each time.
-   Thus, first bit value is never 1. For each iteration 'j & 1' yields 0,
-   and it doesn't affect the CRC result.  */
+/* This loop computes a CRC of crc alone, since 'j' is initialized with 4
+   (100) and increased by 2 each time, so 'j & 1' is always 0.  It mustn't
+   be replaced with a CRC that takes 'j' as the data, because the expansion
+   would read bit I of j's initial value 4 on iteration I and mix in bit 2.
+   'j' isn't shifted by one bit per iteration, so the loop is rejected.  */
 
 #include <stdint.h>
 
@@ -29,4 +30,5 @@ uint16_t crc (uint8_t data, uint16_t crc) {
   return crc;
 }
 
-/* { dg-final { scan-tree-dump "calculates CRC!" "crc" } } */
+/* { dg-final { scan-tree-dump "Data isn't shifted by one bit per iteration" "crc" } } */
+/* { dg-final { scan-tree-dump-not "calculates CRC!" "crc" } } */
