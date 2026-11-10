@@ -4677,6 +4677,7 @@ extern void simplify_using_condition (rtx, rtx *, bitmap);
 extern void compute_alignments (void);
 extern void update_alignments (vec<rtx> &);
 extern int asm_str_count (const char *templ);
+extern int asm_str_code_count (const char *templ);
 extern rtx get_call_rtx_from (const rtx_insn *);
 
 struct rtl_hooks

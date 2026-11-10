@@ -13625,7 +13625,26 @@ If this happens then the assembler may produce a diagnostic saying that
 a label is unreachable.
 
 @cindex @code{asm inline}
-This size is also used for inlining decisions.  If you use @code{asm inline}
+For inlining decisions and the other optimizations that weigh code size,
+GCC instead counts only the statements that the @code{asm} assembles into
+the function's own section and subsection.  It splits the pattern into
+statements as above, except that a separator inside a string literal
+does not end a statement.  Blank statements, comments, labels, macro
+definitions, section directives such as @code{.pushsection},
+@code{.popsection}, @code{.section}, @code{.subsection} and
+@code{.previous}, conditional assembly directives, directives that only
+define or annotate symbols or produce debug information, and anything
+assembled into another section or subsection count as zero.  The only
+comments recognized are those written as @samp{/* @dots{} */} and those
+that start with the comment string GCC itself uses in assembler output
+for the target.  Every other statement counts as one instruction,
+including assembler macro invocations, data and alignment directives,
+and lines that the assembler treats as comments for other reasons, such
+as a line starting with @samp{#} on AArch64.  Repeat blocks and macros
+are not expanded and every arm of a conditional is counted, so this
+estimate can be lower or higher than what the assembler emits.
+
+If you use @code{asm inline}
 instead of just @code{asm}, then for inlining purposes the size of the asm
 is taken as the minimum size, ignoring how many instructions GCC thinks it is.
 

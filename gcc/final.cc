@@ -1405,6 +1405,238 @@ asm_str_count (const char *templ)
 
   return count;
 }
+
+/* Where the statements of an inline-asm template are assembled, as tracked
+   by asm_str_code_count.  */
+
+enum asm_section_state
+{
+  /* The function's own section and subsection.  */
+  ASM_SECTION_CODE,
+  /* The function's own section in a different subsection, which places the
+     code after the function's body, away from its execution path.  */
+  ASM_SECTION_SUBSECTION,
+  /* Any other section.  */
+  ASM_SECTION_OTHER
+};
+
+/* Return true if the directive at NAME, which is LEN characters long, is
+   DIRECTIVE.  */
+
+static bool
+asm_directive_is (const char *name, size_t len, const char *directive)
+{
+  return len == strlen (directive) && !memcmp (name, directive, len);
+}
+
+/* Classify the template statement STMT, update the section state in
+   *CUR, *PREV, STACK and *MACRO_DEPTH accordingly, and return the number
+   of instructions it adds to the function's execution path.  */
+
+static int
+asm_stmt_code_count (const char *stmt, asm_section_state *cur,
+		     asm_section_state *prev, auto_vec<unsigned char, 8> &stack,
+		     int *macro_depth)
+{
+  const char *s = stmt;
+
+  /* Skip any labels in front of the statement.  */
+  for (;;)
+    {
+      while (ISSPACE (*s))
+	s++;
+      const char *e = s;
+      while (ISALNUM (*e) || *e == '_' || *e == '.' || *e == '$'
+	     || *e == '%' || *e == '=')
+	e++;
+      if (e == s || *e != ':')
+	break;
+      s = e + 1;
+    }
+
+  /* Blank lines, comments and bare labels emit nothing.  */
+  if (!*s)
+    return 0;
+
+  const char *name = s;
+  size_t len = 0;
+  if (*s == '.')
+    while (name[len] && !ISSPACE (name[len]) && name[len] != ',')
+      len++;
+
+  /* A macro definition emits nothing until the macro is used, and the use
+     is counted as an instruction below since its size isn't known.  */
+  if (*macro_depth)
+    {
+      if (asm_directive_is (name, len, ".macro"))
+	++*macro_depth;
+      else if (asm_directive_is (name, len, ".endm"))
+	--*macro_depth;
+      return 0;
+    }
+
+  if (!len)
+    return *cur == ASM_SECTION_CODE;
+
+  /* Track section changes.  A section that can't be identified as the
+     function's own is assumed to be some other one, except for .text and an
+     unbalanced .popsection, which are assumed to return to the function's
+     section in order to err on the side of counting more.  */
+  if (asm_directive_is (name, len, ".pushsection"))
+    {
+      stack.safe_push (*cur | (*prev << 2));
+      *prev = *cur;
+      *cur = ASM_SECTION_OTHER;
+      return 0;
+    }
+  if (asm_directive_is (name, len, ".popsection"))
+    {
+      if (stack.is_empty ())
+	*cur = *prev = ASM_SECTION_CODE;
+      else
+	{
+	  unsigned char top = stack.pop ();
+	  *cur = (asm_section_state) (top & 3);
+	  *prev = (asm_section_state) (top >> 2);
+	}
+      return 0;
+    }
+  if (asm_directive_is (name, len, ".previous"))
+    {
+      std::swap (*cur, *prev);
+      return 0;
+    }
+  if (asm_directive_is (name, len, ".subsection"))
+    {
+      const char *arg = name + len;
+      while (ISSPACE (*arg))
+	arg++;
+      bool zero = arg[0] == '0' && (!arg[1] || ISSPACE (arg[1]));
+      *prev = *cur;
+      if (*cur != ASM_SECTION_OTHER)
+	*cur = zero ? ASM_SECTION_CODE : ASM_SECTION_SUBSECTION;
+      return 0;
+    }
+  if (asm_directive_is (name, len, ".text"))
+    {
+      *prev = *cur;
+      *cur = ASM_SECTION_CODE;
+      return 0;
+    }
+  if (asm_directive_is (name, len, ".section")
+      || asm_directive_is (name, len, ".data")
+      || asm_directive_is (name, len, ".bss"))
+    {
+      *prev = *cur;
+      *cur = ASM_SECTION_OTHER;
+      return 0;
+    }
+
+  if (asm_directive_is (name, len, ".macro"))
+    {
+      ++*macro_depth;
+      return 0;
+    }
+
+  /* Nothing assembled outside of the function's own subsection executes as
+     part of the function.  */
+  if (*cur != ASM_SECTION_CODE)
+    return 0;
+
+  /* Conditional assembly markers emit nothing themselves.  Their bodies are
+     counted as if the condition were true.  */
+  if (!strncmp (name, ".if", 3)
+      || asm_directive_is (name, len, ".else")
+      || asm_directive_is (name, len, ".elseif")
+      || asm_directive_is (name, len, ".endif")
+      || asm_directive_is (name, len, ".endr"))
+    return 0;
+
+  /* Directives that only define or annotate symbols, select the
+     instruction set or produce debug information.  */
+  static const char *const no_code[] = {
+    ".globl", ".global", ".weak", ".weakref", ".hidden", ".protected",
+    ".internal", ".local", ".type", ".size", ".set", ".equ", ".equiv",
+    ".eqv", ".symver", ".loc", ".loc_mark_labels", ".file", ".ident",
+    ".arch", ".arch_extension", ".cpu", ".purgem", ".reloc", ".variant_pcs",
+    ".tlsdesccall"
+  };
+  for (const char *d : no_code)
+    if (asm_directive_is (name, len, d))
+      return 0;
+  if (!strncmp (name, ".cfi_", 5))
+    return 0;
+
+  /* Count anything else, including data and alignment directives in the
+     function's section and the start of a .rept or .irp block, as one
+     instruction.  */
+  return 1;
+}
+
+/* Return the number of instructions that the inline-asm template TEMPL is
+   likely to put on the execution path of the function containing it, for
+   the GIMPLE size and time estimates.  Unlike asm_str_count, which has to
+   count every line since its result bounds the asm's length for branch
+   shortening, this leaves out what can't execute as part of the function:
+   blank lines, comments, labels, directives that emit nothing, macro
+   definitions, and everything assembled into another section or subsection
+   (between .pushsection and .popsection, or between .section or .subsection
+   and .previous).  Kernels wrap single instructions in such directives to
+   record patch sites, and counting them made one-instruction helpers look
+   too large to inline.  Statements that can't be classified count as one
+   instruction each.  */
+
+int
+asm_str_code_count (const char *templ)
+{
+  asm_section_state cur = ASM_SECTION_CODE, prev = ASM_SECTION_CODE;
+  auto_vec<unsigned char, 8> stack;
+  int macro_depth = 0, count = 0;
+  bool in_string = false;
+  char stmt[128];
+  size_t len = 0;
+  size_t comment_len = strlen (ASM_COMMENT_START);
+
+  for (const char *p = templ;; p++)
+    {
+      if (*p && in_string)
+	{
+	  if (*p == '\\' && p[1])
+	    p++;
+	  else if (*p == '"')
+	    in_string = false;
+	  continue;
+	}
+      if (*p == '/' && p[1] == '*')
+	{
+	  const char *end = strstr (p + 2, "*/");
+	  p = end ? end + 1 : p + strlen (p) - 1;
+	  continue;
+	}
+      if (*p && comment_len && !strncmp (p, ASM_COMMENT_START, comment_len))
+	{
+	  while (p[1] && p[1] != '\n')
+	    p++;
+	  continue;
+	}
+      if (*p && *p != '\n' && !IS_ASM_LOGICAL_LINE_SEPARATOR (*p, p))
+	{
+	  /* Only the start of a statement is needed to classify it.  */
+	  if (len < sizeof (stmt) - 1)
+	    stmt[len++] = *p;
+	  if (*p == '"')
+	    in_string = true;
+	  continue;
+	}
+      stmt[len] = '\0';
+      count += asm_stmt_code_count (stmt, &cur, &prev, stack, &macro_depth);
+      len = 0;
+      if (!*p)
+	break;
+    }
+
+  return count;
+}
 
 /* Return true if DWARF2 debug info can be emitted for DECL.  */
 
