@@ -7873,10 +7873,19 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
   (if (inverse_conditions_p (@0, @1))
    (cnd @0 @3 @4)))
 
- /* A ? B : B -> B.  */
+ /* A ? B : B -> B.  The addresses of two members at the same offset
+    compare equal, but the members' object sizes differ, so don't fold
+    A ? &s.x : &s.y before the object sizes have been computed.  */
  (simplify
-  (cnd @0 @1 @1)
-  @1)
+  (cnd @0 @1 @2)
+  (with
+   {
+     unsigned int flags = 0;
+     if (!cfun || !(cfun->curr_properties & PROP_objsz))
+       flags = OEP_ADDRESS_OF_SAME_FIELD;
+   }
+   (if (operand_equal_p (@1, @2, flags) && types_match (@1, @2))
+    @1)))
 
  /* !A ? B : C -> A ? C : B.  */
  (simplify
