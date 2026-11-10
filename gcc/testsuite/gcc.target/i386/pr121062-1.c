@@ -1,5 +1,8 @@
 /* { dg-do compile } */
-/* { dg-options "-O2 -march=x86-64-v3" } */
+/* { dg-options "-O2 -march=x86-64-v3 -fno-strict-aliasing" } */
+/* With strict aliasing, the float stores can't change
+   render_result_from_bake_w, so the outer loop never exits once entered and
+   DSE removes every store in it, including the one of -1.  */
 
 extern union {
   int i;

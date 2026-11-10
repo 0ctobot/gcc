@@ -1150,7 +1150,7 @@ dse_classify_store (ao_ref *ref, gimple *stmt,
 	{
 	  /* STMT might be partially dead and we may be able to reduce
 	     how many memory locations it stores into.  */
-	  if (byte_tracking_enabled && !gimple_clobber_p (stmt))
+	  if (byte_tracking_enabled)
 	    return DSE_STORE_MAYBE_PARTIAL_DEAD;
 	  return DSE_STORE_LIVE;
 	}
@@ -1262,26 +1262,64 @@ dse_classify_store (ao_ref *ref, gimple *stmt,
       if (defs.is_empty ())
 	return DSE_STORE_DEAD;
       /* If more than one def survives we have to analyze multiple
-	 paths.  We can handle this by recursing, sharing 'visited'
-	 to avoid redundant work and limiting it by shared 'cnt'.
-	 For now do not bother with byte-tracking in this case.  */
+	 paths.  We can handle this by recursing, limiting the work by
+	 the shared 'cnt'.  */
+      if (defs.length () > 1 && byte_tracking_enabled)
+	{
+	  /* Track the live bytes separately on each path, starting with
+	     the bytes live here minus the ones the path's first def
+	     writes.  STMT is dead when it's dead on every path, and
+	     otherwise the bytes left live on any path are live.  A PHI
+	     found dead with the bytes live on one path says nothing about
+	     the bytes live on another, so each path gets its own copy of
+	     'visited' instead of sharing it.  The PHIs already in
+	     'visited' were reached on the way here with a superset of the
+	     bytes live here, which is why each copy starts with them.  */
+	  auto_sbitmap path_live (SBITMAP_SIZE (live_bytes));
+	  auto_sbitmap union_live (SBITMAP_SIZE (live_bytes));
+	  bitmap_clear (union_live);
+	  bool all_dead = true;
+	  for (gimple *def : defs)
+	    {
+	      dse_store_status status = DSE_STORE_DEAD;
+	      bool path_by_clobber = true;
+	      bitmap_copy (path_live, live_bytes);
+	      clear_bytes_written_by (path_live, def, ref);
+	      if (bitmap_empty_p (path_live))
+		path_by_clobber = gimple_clobber_p (def);
+	      else
+		{
+		  auto_bitmap path_visited;
+		  bitmap_copy (path_visited, visited);
+		  status = dse_classify_store (ref, def, true, path_live,
+					       &path_by_clobber, stop_at_vuse,
+					       cnt, path_visited);
+		}
+	      /* Without an answer for this path we still know that the
+		 bytes that aren't live here are dead.  */
+	      if (status == DSE_STORE_LIVE)
+		return DSE_STORE_MAYBE_PARTIAL_DEAD;
+	      if (status == DSE_STORE_MAYBE_PARTIAL_DEAD)
+		{
+		  bitmap_ior (union_live, union_live, path_live);
+		  all_dead = false;
+		}
+	      if (by_clobber_p && !path_by_clobber)
+		*by_clobber_p = false;
+	    }
+	  if (all_dead)
+	    return DSE_STORE_DEAD;
+	  bitmap_copy (live_bytes, union_live);
+	  return DSE_STORE_MAYBE_PARTIAL_DEAD;
+	}
+      /* Without byte tracking share 'visited' to avoid redundant work.  */
       while (defs.length () > 1)
 	{
 	  if (dse_classify_store (ref, defs.last (), false, NULL,
 				  by_clobber_p, stop_at_vuse, cnt,
 				  visited) != DSE_STORE_DEAD)
-	    break;
-	  byte_tracking_enabled = false;
+	    return DSE_STORE_LIVE;
 	  defs.pop ();
-	}
-      /* If more than one def survives fail.  */
-      if (defs.length () > 1)
-	{
-	  /* STMT might be partially dead and we may be able to reduce
-	     how many memory locations it stores into.  */
-	  if (byte_tracking_enabled && !gimple_clobber_p (stmt))
-	    return DSE_STORE_MAYBE_PARTIAL_DEAD;
-	  return DSE_STORE_LIVE;
 	}
       temp = defs[0];
 
@@ -1308,8 +1346,15 @@ dse_classify_store (ao_ref *ref, gimple *stmt,
 {
   int cnt = 0;
   auto_bitmap visited;
-  return dse_classify_store (ref, stmt, byte_tracking_enabled, live_bytes,
-			     by_clobber_p, stop_at_vuse, cnt, visited);
+  dse_store_status status
+    = dse_classify_store (ref, stmt, byte_tracking_enabled, live_bytes,
+			  by_clobber_p, stop_at_vuse, cnt, visited);
+  /* A clobber can't be trimmed, so a partially dead one is live.  This
+     isn't checked during the walk since the recursion for each path
+     passes a def as STMT.  */
+  if (status == DSE_STORE_MAYBE_PARTIAL_DEAD && gimple_clobber_p (stmt))
+    return DSE_STORE_LIVE;
+  return status;
 }
 
 
