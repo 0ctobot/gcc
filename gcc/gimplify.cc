@@ -7207,12 +7207,9 @@ gimplify_init_constructor (tree *expr_p, gimple_seq *pre_p, gimple_seq *post_p,
 	   is smaller than this, use readonly data.  */
 	const int unique_nonzero_ratio = 8;
 	/* True if a single access of the object must be ensured.  This is the
-	   case if the target is volatile, the type is non-addressable and more
-	   than one field need to be assigned.  */
+	   case if the target is volatile and the type is non-addressable.  */
 	const bool ensure_single_access
-	  = TREE_THIS_VOLATILE (object)
-	    && !TREE_ADDRESSABLE (type)
-	    && vec_safe_length (elts) > 1;
+	  = TREE_THIS_VOLATILE (object) && !TREE_ADDRESSABLE (type);
 	struct gimplify_init_ctor_preeval_data preeval_data;
 	HOST_WIDE_INT num_ctor_elements, num_nonzero_elements;
 	HOST_WIDE_INT num_unique_nonzero_elements;
@@ -7421,8 +7418,19 @@ gimplify_init_constructor (tree *expr_p, gimple_seq *pre_p, gimple_seq *post_p,
 
 	/* If a single access to the target must be ensured and there are
 	   nonzero elements or the zero elements are not assigned en masse,
-	   initialize the target from a temporary.  */
-	if (ensure_single_access && (num_nonzero_elements > 0 || !cleared))
+	   initialize the target from a temporary.  A lone element is no
+	   exception unless it fills the whole target with one store: a nested
+	   CONSTRUCTOR is stored one field at a time, a RANGE_EXPR stores every
+	   element in its range, and an incomplete CONSTRUCTOR clears the
+	   target before storing the element.  */
+	if (ensure_single_access
+	    && (num_nonzero_elements > 0 || !cleared)
+	    && !(vec_safe_length (elts) == 1
+		 && !complete_p.sparse && !complete_p.padded_union
+		 && !complete_p.padded_non_union
+		 && TREE_CODE ((*elts)[0].value) != CONSTRUCTOR
+		 && !((*elts)[0].index
+		      && TREE_CODE ((*elts)[0].index) == RANGE_EXPR)))
 	  {
 	    if (notify_temp_creation)
 	      return GS_ERROR;
