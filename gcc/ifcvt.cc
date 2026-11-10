@@ -3723,7 +3723,31 @@ success:
     noce_emit_move_insn (if_info->x, target);
 
   seq = end_ifcvt_sequence (if_info);
-  return noce_commit_sequence (if_info, seq, true, "noce_try_cond_arith");
+  if (!seq || !targetm.noce_conversion_profitable_p (seq, if_info))
+    goto fail;
+
+  /* noce_try_cmove_arith runs after this and would emit t = y op z;
+     x = cond ? t : y instead.  When the comparison reads y, that form is
+     usually better: the operation no longer waits for the conditional
+     move, and it can often be merged with the comparison (e.g., a single
+     flag-setting subtract for "if (x >= n) x -= n").  Leave such a
+     conversion to noce_try_cmove_arith unless this sequence is cheaper.  */
+  if (reg_overlap_mentioned_p (b, cond))
+    {
+      start_sequence ();
+      rtx alt_tmp = gen_reg_rtx (mode);
+      noce_emit_move_insn (alt_tmp, copy_rtx (outer_a ? outer_a : a));
+      rtx alt_target = noce_emit_cmove (if_info, gen_reg_rtx (mode), code,
+					XEXP (cond, 0), XEXP (cond, 1),
+					alt_tmp, b);
+      rtx_insn *alt_seq = end_sequence ();
+      if (alt_target
+	  && (seq_cost (alt_seq, if_info->speed_p)
+	      <= seq_cost (seq, if_info->speed_p)))
+	goto fail;
+    }
+
+  return noce_commit_sequence (if_info, seq, false, "noce_try_cond_arith");
 
 end_seq_n_fail:
   end_sequence ();
