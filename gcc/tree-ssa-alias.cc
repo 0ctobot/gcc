@@ -3223,6 +3223,55 @@ process_args:
   return false;
 }
 
+/* Return true if the asm statement STMT may read (if USE_P) or write the
+   memory reference REF.
+
+   An asm statement can name memory only through its operands, its "memory"
+   clobber or the symbols in its template.  The clobber and the template's
+   symbols only reach memory whose address escapes or that is global, so a
+   local whose address is never taken can only be accessed through one of
+   the asm's operands.  Check those and nothing else.  Without this, every
+   asm with a virtual operand (the arm64 atomics, per-cpu accessors and
+   barrier()) looks like it reads and writes every local, which keeps dead
+   stores to unrelated locals alive.  */
+
+static bool
+asm_may_access_ref_p (gasm *stmt, ao_ref *ref, bool use_p)
+{
+  tree base = ao_ref_base (ref);
+  if (!base
+      || !DECL_P (base)
+      || is_global_var (base)
+      || may_be_aliased (base)
+      || (VAR_P (base) && DECL_HARD_REGISTER (base)))
+    return true;
+
+  for (unsigned i = 0; i < gimple_asm_noutputs (stmt); ++i)
+    {
+      tree op = TREE_VALUE (gimple_asm_output_op (stmt, i));
+      if (TREE_CODE (op) != SSA_NAME
+	  && !is_gimple_min_invariant (op)
+	  && refs_may_alias_p (op, ref, false))
+	return true;
+    }
+
+  /* An in-out operand is split into an output and a matching input, so
+     the inputs cover what the asm reads.  Outputs are checked above even
+     for a use, since an output that is only partially written by the asm
+     keeps the rest of its old value.  */
+  if (use_p)
+    for (unsigned i = 0; i < gimple_asm_ninputs (stmt); ++i)
+      {
+	tree op = TREE_VALUE (gimple_asm_input_op (stmt, i));
+	if (TREE_CODE (op) != SSA_NAME
+	    && !is_gimple_min_invariant (op)
+	    && refs_may_alias_p (op, ref, false))
+	  return true;
+      }
+
+  return false;
+}
+
 static bool
 ref_maybe_used_by_call_p (gcall *call, ao_ref *ref, bool tbaa_p)
 {
@@ -3279,6 +3328,8 @@ ref_maybe_used_by_stmt_p (gimple *stmt, ao_ref *ref, bool tbaa_p)
 	return ptr_deref_may_alias_global_p (TREE_OPERAND (base, 0), false);
       return false;
     }
+  else if (gasm *asm_stmt = dyn_cast <gasm *> (stmt))
+    return asm_may_access_ref_p (asm_stmt, ref, true);
 
   return true;
 }
@@ -3505,8 +3556,8 @@ stmt_may_clobber_ref_p_1 (gimple *stmt, ao_ref *ref, bool tbaa_p)
 	  return refs_may_alias_p_1 (ref, &r, tbaa_p);
 	}
     }
-  else if (gimple_code (stmt) == GIMPLE_ASM)
-    return true;
+  else if (gasm *asm_stmt = dyn_cast <gasm *> (stmt))
+    return asm_may_access_ref_p (asm_stmt, ref, false);
 
   return false;
 }
