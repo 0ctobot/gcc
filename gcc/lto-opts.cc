@@ -172,6 +172,14 @@ lto_write_options (void)
 	  && lto_stream_offload_p)
        continue;
 
+      /* Register names are target-specific too, and lto-wrapper passes
+	 these on to the compiler it runs.  */
+      if ((option->opt_index == OPT_ffixed_
+	   || option->opt_index == OPT_fcall_used_
+	   || option->opt_index == OPT_fcall_saved_)
+	  && lto_stream_offload_p)
+	continue;
+
       /* Drop options created from the gcc driver that will be rejected
 	 when passed on to the driver again.  */
       if (cl_options[option->opt_index].cl_reject_driver)

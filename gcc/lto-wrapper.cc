@@ -305,6 +305,46 @@ canonicalize_wrapv_options (vec<cl_decoded_option> &opts)
     }
 }
 
+/* Return true if OPT is -ffixed-, -fcall-used- or -fcall-saved-.  */
+
+static bool
+register_usage_option_p (const cl_decoded_option &opt)
+{
+  return (opt.opt_index == OPT_ffixed_
+	  || opt.opt_index == OPT_fcall_used_
+	  || opt.opt_index == OPT_fcall_saved_);
+}
+
+/* Remove each -ffixed-, -fcall-used- and -fcall-saved- option in OPTS, the
+   options of one TU, that a later one of them for the same register
+   overrides.  The compiler applies these options in order, so the last one
+   for a register decides how the TU treats it.  The merge across TUs and
+   the reordering in append_compiler_options must only see that setting,
+   since otherwise a -ffixed- option that the TU cancelled with a later
+   -fcall-saved- or -fcall-used- would reserve the register again.  Register
+   names are compared as written, like in the merge.  */
+
+static void
+canonicalize_register_usage_options (vec<cl_decoded_option> &opts)
+{
+  unsigned int i, j, k = 0;
+
+  for (i = 0; i < opts.length (); ++i)
+    {
+      if (register_usage_option_p (opts[i]))
+	{
+	  for (j = i + 1; j < opts.length (); ++j)
+	    if (register_usage_option_p (opts[j])
+		&& !strcmp (opts[j].arg, opts[i].arg))
+	      break;
+	  if (j < opts.length ())
+	    continue;
+	}
+      opts[k++] = opts[i];
+    }
+  opts.truncate (k);
+}
+
 /* Try to merge and complain about options FDECODED_OPTIONS when applied
    on top of DECODED_OPTIONS.  */
 
@@ -421,6 +461,23 @@ merge_and_complain (vec<cl_decoded_option> &decoded_options,
 	    fatal_error (input_location,
 			 "option %s with different values",
 			 foption->orig_option_with_args_text);
+	  break;
+
+	case OPT_ffixed_:
+	  /* The link-time compiler generates the code of every TU, so it must
+	     leave alone any register that a TU reserves.  Each option names
+	     one register, so keep one copy per register.  */
+	  for (j = 0; j < decoded_options.length (); ++j)
+	    if (decoded_options[j].opt_index == foption->opt_index
+		&& !strcmp (decoded_options[j].arg, foption->arg))
+	      break;
+	  if (j == decoded_options.length ())
+	    decoded_options.safe_push (*foption);
+	  break;
+
+	case OPT_fcall_used_:
+	case OPT_fcall_saved_:
+	  /* Handled below.  */
 	  break;
 
 	case OPT_fcf_protection_:
@@ -564,6 +621,30 @@ merge_and_complain (vec<cl_decoded_option> &decoded_options,
 	  merge_flto_options (decoded_options, foption, false);
 	  break;
 	}
+    }
+
+  /* -fcall-used- and -fcall-saved- change what a function may assume about
+     the functions it calls as well as what its callers may assume about it.
+     A TU built without them can call, or be called by, code outside of the
+     LTO link that follows the default convention, so only keep them for a
+     register that every file names with the same option.  */
+  for (j = 0; j < decoded_options.length ();)
+    {
+      cl_decoded_option *option = &decoded_options[j];
+      if (option->opt_index == OPT_fcall_used_
+	  || option->opt_index == OPT_fcall_saved_)
+	{
+	  for (i = 0; i < fdecoded_options.length (); ++i)
+	    if (fdecoded_options[i].opt_index == option->opt_index
+		&& !strcmp (fdecoded_options[i].arg, option->arg))
+	      break;
+	  if (i == fdecoded_options.length ())
+	    {
+	      decoded_options.ordered_remove (j);
+	      continue;
+	    }
+	}
+      j++;
     }
 
   /* Merge PIC options:
@@ -809,6 +890,8 @@ append_compiler_options (obstack *argv_obstack, vec<cl_decoded_option> opts)
 	case OPT_fgnu_tm:
 	case OPT_fwrapv:
 	case OPT_fwrapv_pointer:
+	case OPT_fcall_used_:
+	case OPT_fcall_saved_:
 	case OPT_fopenmp:
 	case OPT_fopenacc:
 	case OPT_fopenacc_dim_:
@@ -824,6 +907,10 @@ append_compiler_options (obstack *argv_obstack, vec<cl_decoded_option> opts)
 	case OPT_Os:
 	case OPT_Oz:
 	  break;
+
+	case OPT_ffixed_:
+	  /* Passed on below.  */
+	  continue;
 
 	case OPT_Xassembler:
 	  /* When we detected a mismatch in assembler options between
@@ -841,6 +928,16 @@ append_compiler_options (obstack *argv_obstack, vec<cl_decoded_option> opts)
       for (unsigned int i = 0; i < option->canonical_option_num_elements; ++i)
 	obstack_ptr_grow (argv_obstack, option->canonical_option[i]);
     }
+
+  /* A TU compiled with -ffixed-<reg> relies on the register never being
+     touched, which also meets the needs of a TU that only asked for it to
+     be call-saved or call-used.  The last option naming a register wins, so
+     pass the -ffixed- options on after the -fcall-saved- and -fcall-used-
+     ones.  */
+  for (unsigned int j = 1; j < opts.length (); ++j)
+    if (opts[j].opt_index == OPT_ffixed_)
+      for (unsigned int i = 0; i < opts[j].canonical_option_num_elements; ++i)
+	obstack_ptr_grow (argv_obstack, opts[j].canonical_option[i]);
 }
 
 /* Append diag options in OPTS to ARGV_OBSTACK.  */
@@ -1241,6 +1338,7 @@ find_and_merge_options (int fd, off_t file_offset, const char *prefix,
       vec<cl_decoded_option> f2decoded_options
 	= get_options_from_collect_gcc_options (collect_gcc, fopts);
       canonicalize_wrapv_options (f2decoded_options);
+      canonicalize_register_usage_options (f2decoded_options);
       if (first)
 	{
 	  fdecoded_options = f2decoded_options;
