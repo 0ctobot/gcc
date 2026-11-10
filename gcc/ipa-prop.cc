@@ -2472,6 +2472,26 @@ ipa_get_range_from_ip_invariant (vrange &r, tree val, cgraph_node *context_node)
     r.set (val, val);
 }
 
+/* Make range-ops let overflow wrap where NODE's function asks for it.  Only
+   ever turn wrapping on, so the global options still apply on top.  */
+
+ipa_fn_overflow_flags::ipa_fn_overflow_flags (cgraph_node *node)
+  : m_saved_wrapv (flag_wrapv), m_saved_wrapv_pointer (flag_wrapv_pointer)
+{
+  tree decl = node->decl;
+  tree root = node->inlined_to ? node->inlined_to->decl : decl;
+
+  flag_wrapv |= opt_for_fn (decl, flag_wrapv) | opt_for_fn (root, flag_wrapv);
+  flag_wrapv_pointer |= (opt_for_fn (decl, flag_wrapv_pointer)
+			 | opt_for_fn (root, flag_wrapv_pointer));
+}
+
+ipa_fn_overflow_flags::~ipa_fn_overflow_flags ()
+{
+  flag_wrapv = m_saved_wrapv;
+  flag_wrapv_pointer = m_saved_wrapv_pointer;
+}
+
 /* If T is an SSA_NAME that is the result of a simple type conversion statement
    from an integer type to another integer type which is known to be able to
    represent the values the operand of the conversion can hold, return the

@@ -391,6 +391,8 @@ evaluate_conditions_for_known_args (struct cgraph_node *node,
   class ipa_fn_summary *info = ipa_fn_summaries->get (node);
   int i;
   struct condition *c;
+  /* The operations in the conditions come from the body of NODE.  */
+  ipa_fn_overflow_flags overflow_flags (node);
 
   for (i = 0; vec_safe_iterate (info->conds, i, &c); i++)
     {

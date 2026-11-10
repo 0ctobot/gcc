@@ -1278,6 +1278,25 @@ tree ipa_single_noted_fnptr_in_record (tree rectype, unsigned offset);
 void ipa_prop_cc_finalize (void);
 void ipa_free_noted_fnptr_calls ();
 
+/* While an object of this class is live, range-ops treat signed and pointer
+   overflow as wrapping if the function of the cgraph_node passed to the
+   constructor, or the function it's inlined into, asks for it.  The IPA
+   passes run with no function selected, so range-ops otherwise see only the
+   global options, even when they fold arithmetic of a function that has
+   its own -fwrapv or -fwrapv-pointer from an optimize attribute or
+   pragma.  */
+
+class ipa_fn_overflow_flags
+{
+public:
+  ipa_fn_overflow_flags (cgraph_node *node);
+  ~ipa_fn_overflow_flags ();
+
+private:
+  int m_saved_wrapv;
+  int m_saved_wrapv_pointer;
+};
+
 /* In ipa-cp.cc  */
 void ipa_cp_cc_finalize (void);
 bool ipa_return_value_range (value_range &range, tree decl);

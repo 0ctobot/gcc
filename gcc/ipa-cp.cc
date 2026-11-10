@@ -1879,6 +1879,8 @@ ipa_vr_intersect_with_arith_jfunc (vrange &vr,
   if (src_vr.undefined_p () || src_vr.varying_p ())
     return;
 
+  /* The operation comes from the body of the caller.  */
+  ipa_fn_overflow_flags overflow_flags (context_node);
   enum tree_code operation = ipa_get_jf_pass_through_operation (jfunc);
   if (TREE_CODE_CLASS (operation) == tcc_unary)
     {
