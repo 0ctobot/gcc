@@ -890,11 +890,22 @@ is_a_valid_xor_one (value_bit *bit, tree crc_origin, size_t lfsr_bit_index)
 
 /* Return true, if CONDITION_EXP checks CRC's MSB/LSB value
    (under which xor is/not done).
-   Otherwise, return false.  */
+   Otherwise, return false.
+
+   DATA_ORIGIN is the data variable whose bit DATA_INDEX the loop mixes into
+   the checked bit, or NULL_TREE when the loop has no data variable or the
+   data's bits are known constants during symbolic execution.  The condition
+   must test exactly the CRC's significant bit when there's no symbolic data,
+   and exactly that bit xor-ed with the data's bit otherwise.  The CRC
+   expansion feeds data bit DATA_INDEX into the register on each iteration,
+   so a condition that mixes in any other bit, such as another bit of the CRC
+   or of a loop-invariant variable, makes the loop compute something
+   else.  */
 
 bool
-may_be_xors_condition (tree crc_origin, value_bit *condition_exp,
-		       size_t sb_index)
+may_be_xors_condition (tree crc_origin, tree data_origin,
+		       value_bit *condition_exp, size_t sb_index,
+		       size_t data_index)
 {
   if (!crc_origin)
     return false;
@@ -909,7 +920,8 @@ may_be_xors_condition (tree crc_origin, value_bit *condition_exp,
   if (is_a<symbolic_bit *> (condition_exp))
     {
       symbolic_bit *condition_symbolic = as_a<symbolic_bit *> (condition_exp);
-      return crc_origin == condition_symbolic->get_origin ()
+      return !data_origin
+	     && crc_origin == condition_symbolic->get_origin ()
 	     && sb_index == condition_symbolic->get_index ();
     }
     /* The CONDITION_EXP of CRC may be a bit_xor_expression,
@@ -922,6 +934,9 @@ may_be_xors_condition (tree crc_origin, value_bit *condition_exp,
     {
       bit_xor_expression *condition_xor_exp = as_a<bit_xor_expression *>
 	  (condition_exp);
+      if (!data_origin)
+	return false;
+
       if (!(is_a<symbolic_bit *> (condition_xor_exp->get_left ())
 	    && is_a<symbolic_bit *> (condition_xor_exp->get_right ())))
 	return false;
@@ -934,18 +949,24 @@ may_be_xors_condition (tree crc_origin, value_bit *condition_exp,
 			       && sb_index == cond_left->get_index ());
       bool cond_right_is_crc = (crc_origin == cond_right->get_origin ()
 				&& sb_index == cond_right->get_index ());
-      return cond_left_is_crc || cond_right_is_crc;
+      bool cond_left_is_data = (data_origin == cond_left->get_origin ()
+				&& data_index == cond_left->get_index ());
+      bool cond_right_is_data = (data_origin == cond_right->get_origin ()
+				 && data_index == cond_right->get_index ());
+      return (cond_left_is_crc && cond_right_is_data)
+	     || (cond_left_is_data && cond_right_is_crc);
     }
   return false;
 }
 
 /* Check whether the condition is checked for significant bit being 0 or 1.
    If IS_ONE is 1, when check whether the significant bit is 1 (xor branch),
-   if 0, whether the significant bit is 0 (not xor branch).  */
+   if 0, whether the significant bit is 0 (not xor branch).
+   DATA_ORIGIN and DATA_INDEX are as for may_be_xors_condition.  */
 
 bool
-is_crc_xor_condition (tree crc_origin, unsigned char is_one,
-		      size_t sb_index, state *final_state)
+is_crc_xor_condition (tree crc_origin, tree data_origin, unsigned char is_one,
+		      size_t sb_index, size_t data_index, state *final_state)
 {
   /* The CRC cases we detect must contain only one condition related to CRC.  */
   if (final_state->get_conditions ().elements () != 1)
@@ -960,7 +981,8 @@ is_crc_xor_condition (tree crc_origin, unsigned char is_one,
      if is_one is 0 and condition is for checking MSB/LSB being 0
      return true, otherwise - false.  */
   value_bit *cond_exp = (*condition_iter)->get_left ();
-  if (may_be_xors_condition (crc_origin, cond_exp, sb_index))
+  if (may_be_xors_condition (crc_origin, data_origin, cond_exp, sb_index,
+			     data_index))
     {
       if (!is_a<bit *> ((*condition_iter)->get_right ()))
 	return false;
@@ -1175,12 +1197,16 @@ init_sb_index_and_other_part_begin_end (size_t &it_beg, size_t &it_end,
 	      If CHECKED_SB_VALUE is 1, it indicates that CRC_STATE is
 	      xor-ed path's state.
 	      If CHECKED_SB_VALUE is 0, then CRC_STATE is the state of the
-	      not xor branch.  */
+	      not xor branch.
+   DATA_ORIGIN and DATA_INDEX - are the data variable and the index of its
+	      bit which the CRC's condition must xor with the significant
+	      bit, see may_be_xors_condition.  */
 
 bool
 lfsr_matches_crc_state (const value *lfsr, state *crc_state, value *crc_value,
 			size_t it_beg, size_t it_end, size_t sb_index,
-			unsigned short checked_sb_value)
+			unsigned short checked_sb_value, tree data_origin,
+			size_t data_index)
 {
   if (dump_file && (dump_flags & TDF_DETAILS))
     {
@@ -1194,7 +1220,8 @@ lfsr_matches_crc_state (const value *lfsr, state *crc_state, value *crc_value,
   if (!crc_origin)
     return false;
 
-  if (!is_crc_xor_condition (crc_origin, checked_sb_value, sb_index, crc_state))
+  if (!is_crc_xor_condition (crc_origin, data_origin, checked_sb_value,
+			     sb_index, data_index, crc_state))
     return false;
 
   /* Check whether CRC_VALUE and LFSR bits match.  */
@@ -1248,11 +1275,14 @@ get_crc_val (tree calculated_crc, state *curr_state)
 }
 
 /* Return true if all states from the FINAL_STATES match the LFSR,
-   otherwise - false.  */
+   otherwise - false.
+   DATA_ORIGIN is the data variable (the result of the data's loop header
+   phi) when its bits are symbolic during the execution, otherwise
+   NULL_TREE.  */
 
 bool
 all_states_match_lfsr (value *lfsr, bool is_bit_forward, tree calculated_crc,
-		       const vec<state *> &final_states)
+		       tree data_origin, const vec<state *> &final_states)
 {
   if (final_states.length () != 2)
     {
@@ -1290,14 +1320,22 @@ all_states_match_lfsr (value *lfsr, bool is_bit_forward, tree calculated_crc,
       not_xor_st_index = 0;
     }
 
+  /* The data's bit which the condition must check alongside the CRC's
+     significant bit.  Polynomial extraction sets the same bit.  */
+  size_t data_index = 0;
+  if (data_origin)
+    data_index = determine_index (data_origin, is_bit_forward);
+
   /*  If xor-ed CRC value doesn't match the LFSR value, return false.  */
   if (!lfsr_matches_crc_state (lfsr, final_states[xor_st_index], crc_xor_value,
-			       it_beg, it_end, sb_index, 1))
+			       it_beg, it_end, sb_index, 1, data_origin,
+			       data_index))
     return false;
 
   /*  If not xor-ed CRC value doesn't match the LFSR value, return false.  */
   if (!lfsr_matches_crc_state (lfsr, final_states[not_xor_st_index],
-			       crc_not_xor_value, it_beg, it_end, sb_index, 0))
+			       crc_not_xor_value, it_beg, it_end, sb_index, 0,
+			       data_origin, data_index))
     return false;
 
   return true;
