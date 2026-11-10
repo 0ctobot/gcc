@@ -26186,6 +26186,17 @@ aarch64_builtin_support_vector_misalignment (machine_mode mode,
 					     bool is_packed,
 					     bool is_gather_scatter)
 {
+  /* A vector emulated in a general register (e.g., V8QI or V2SI with
+     -mgeneral-regs-only) has a scalar integer mode, which lacks a
+     movmisalign pattern, so the default hook rejects every misaligned
+     access to it.  The vectorizer then peels for alignment and adds a
+     runtime alignment check to the loop, even though LDR, STR, LDP and STP
+     on X registers work at any address when we aren't -mstrict-align.  A
+     misaligned access in such a mode expands to a plain move, since
+     targetm.slow_unaligned_access is false without STRICT_ALIGNMENT.  */
+  if (!STRICT_ALIGNMENT && SCALAR_INT_MODE_P (mode))
+    return true;
+
   if (TARGET_SIMD && STRICT_ALIGNMENT)
     {
       if (is_gather_scatter)
