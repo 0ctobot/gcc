@@ -907,7 +907,10 @@ state::do_assign (tree arg, tree dest)
 
   value *dest_val = var_states.get (dest);
 
-  /* If the argument is already defined, then we must just copy its bits.  */
+  /* If the argument is already defined, then we must just copy its bits.
+     A wider destination is a conversion, which extends the argument
+     according to the argument's own signedness, so the bits above it are
+     copies of its sign bit when it's signed and zeros when it's not.  */
   if (auto arg_val = var_states.get (arg))
     {
       for (size_t i = 0; i < dest_val->length (); i++)
@@ -915,8 +918,10 @@ state::do_assign (tree arg, tree dest)
 	  value_bit *new_val = nullptr;
 	  if (i < arg_val->length ())
 	    new_val = (*arg_val)[i]->copy ();
-	  else
+	  else if (arg_val->is_unsigned)
 	    new_val = new bit (0);
+	  else
+	    new_val = arg_val->last ()->copy ();
 
 	  delete (*dest_val)[i];
 	  (*dest_val)[i] = new_val;
