@@ -3886,6 +3886,9 @@ simplify_context::simplify_binary_operation_1 (rtx_code code,
 	 Bitfields are represented as an AND based extraction */
       if (GET_CODE (op0) == AND
 	  && GET_CODE (op1) == AND
+	  /* The combined mask is built in a HOST_WIDE_INT.  */
+	  && is_a <scalar_int_mode> (mode, &int_mode)
+	  && HWI_COMPUTABLE_MODE_P (int_mode)
 	  /* Verify both AND operands are logical right shifts. */
 	  && GET_CODE (XEXP (op0, 0)) == LSHIFTRT
 	  && GET_CODE (XEXP (op1, 0)) == LSHIFTRT
@@ -3894,16 +3897,20 @@ simplify_context::simplify_binary_operation_1 (rtx_code code,
 	  /* Verify both fields are a single bit (could be generalized). */
 	  && XEXP (op0, 1) == CONST1_RTX (mode)
 	  && XEXP (op1, 1) == CONST1_RTX (mode)
-	  /* Verify bit positions (for cases with variable bit position). */
+	  /* Verify bit positions (for cases with variable bit position), and
+	     that each one is inside the mode so the shifts below are
+	     defined.  */
 	  && CONST_INT_P (XEXP (XEXP (op0, 0), 1))
-	  && CONST_INT_P (XEXP (XEXP (op1, 0), 1)))
+	  && CONST_INT_P (XEXP (XEXP (op1, 0), 1))
+	  && UINTVAL (XEXP (XEXP (op0, 0), 1)) < GET_MODE_PRECISION (int_mode)
+	  && UINTVAL (XEXP (XEXP (op1, 0), 1)) < GET_MODE_PRECISION (int_mode))
 	{
 	  unsigned HOST_WIDE_INT bitpos1 = INTVAL (XEXP (XEXP (op0, 0), 1));
 	  unsigned HOST_WIDE_INT bitpos2 = INTVAL (XEXP (XEXP (op1, 0), 1));
 	  unsigned HOST_WIDE_INT mask
 	    = (HOST_WIDE_INT_1U << bitpos1) | (HOST_WIDE_INT_1U << bitpos2);
 
-	  rtx m = GEN_INT (mask);
+	  rtx m = gen_int_mode (mask, mode);
 	  rtx t = gen_rtx_AND (mode, XEXP (XEXP (op0, 0), 0), m);
 	  t = gen_rtx_NE (mode, t, CONST0_RTX (mode));
 	  return t;
@@ -3916,6 +3923,9 @@ simplify_context::simplify_binary_operation_1 (rtx_code code,
 		output above. */
       if (GET_CODE (op0) == AND
 	  && GET_CODE (op1) == NE
+	  /* The combined mask is built in a HOST_WIDE_INT.  */
+	  && is_a <scalar_int_mode> (mode, &int_mode)
+	  && HWI_COMPUTABLE_MODE_P (int_mode)
 	  /* Verify AND operand is logical right shift. */
 	  && GET_CODE (XEXP (op0, 0)) == LSHIFTRT
 	  /* Verify NE operand is an AND (based on output above). */
@@ -3926,14 +3936,19 @@ simplify_context::simplify_binary_operation_1 (rtx_code code,
 	     comparison for the other operand.  */
 	  && XEXP (op0, 1) == CONST1_RTX (mode)
 	  && XEXP (op1, 1) == CONST0_RTX (mode)
-	  /* Verify bit position. */
-	  && CONST_INT_P (XEXP (XEXP (op0, 0), 1)))
+	  /* Verify bit position, and that it's inside the mode so the shift
+	     below is defined.  */
+	  && CONST_INT_P (XEXP (XEXP (op0, 0), 1))
+	  && UINTVAL (XEXP (XEXP (op0, 0), 1)) < GET_MODE_PRECISION (int_mode)
+	  /* Verify the other operand's mask is a constant (the AND can just as
+	     well test X against a register).  */
+	  && CONST_INT_P (XEXP (XEXP (op1, 0), 1)))
 	{
 	  unsigned HOST_WIDE_INT bitpos1 = INTVAL (XEXP (XEXP (op0, 0), 1));
 	  unsigned HOST_WIDE_INT mask
 	    = (HOST_WIDE_INT_1U << bitpos1) | INTVAL (XEXP (XEXP (op1, 0), 1));
 
-	  rtx m = GEN_INT (mask);
+	  rtx m = gen_int_mode (mask, mode);
 	  rtx t = gen_rtx_AND (mode, XEXP (XEXP (op0, 0), 0), m);
 	  t = gen_rtx_NE (mode, t, CONST0_RTX (mode));
 	  return t;
