@@ -8510,6 +8510,104 @@ reuse_split_load (tree /* in[0] out[1] */ ln_arg[2],
     }
 }
 
+/* Hash traits for the (TYPE, (BITPOS, BITSIZE)) queries made by
+   volatile_bits_in_range_1.  pair_hash marks empty and deleted slots through
+   the type alone, so BITPOS and BITSIZE can take any value.  */
+
+typedef pair_hash <int_hash <HOST_WIDE_INT, 0>, int_hash <HOST_WIDE_INT, 0>>
+  bit_range_hash;
+typedef pair_hash <nofree_ptr_hash <tree_node>, bit_range_hash>
+  volatile_bits_query_hash;
+
+/* Like int_bit_position, but return false if the bit position of FIELD isn't
+   constant or doesn't fit a HOST_WIDE_INT, and otherwise set *POS to it and
+   return true.  Checking bit_position for that would build trees, which adds
+   up when done for every field of a large record on every merge attempt.  */
+
+static bool
+shwi_bit_position_p (const_tree field, HOST_WIDE_INT *pos)
+{
+  if (TREE_CODE (DECL_FIELD_OFFSET (field)) != INTEGER_CST)
+    return false;
+  offset_int bits = ((wi::to_offset (DECL_FIELD_OFFSET (field))
+		      << LOG2_BITS_PER_UNIT)
+		     + wi::to_offset (DECL_FIELD_BIT_OFFSET (field)));
+  if (!wi::fits_shwi_p (bits))
+    return false;
+  *pos = bits.to_shwi ();
+  return true;
+}
+
+/* Helper for volatile_bits_in_range_p.  VISITED holds the queries that were
+   already made for records and unions, since a type that repeats a member
+   type would otherwise take exponential time.  None of them found a volatile
+   field, or else the walk would have stopped there.  */
+
+static bool
+volatile_bits_in_range_1 (tree type, HOST_WIDE_INT bitpos,
+			  HOST_WIDE_INT bitsize,
+			  hash_set<volatile_bits_query_hash> *visited)
+{
+  if (TYPE_VOLATILE (type))
+    return true;
+
+  if (RECORD_OR_UNION_TYPE_P (type))
+    {
+      /* A query for the whole object doesn't depend on BITPOS, so give all
+	 such queries the same key.  */
+      if (bitsize == 0)
+	bitpos = 0;
+      if (visited->add (std::make_pair (type, std::make_pair (bitpos,
+							       bitsize))))
+	return false;
+
+      for (tree f = TYPE_FIELDS (type); f; f = DECL_CHAIN (f))
+	{
+	  if (TREE_CODE (f) != FIELD_DECL)
+	    continue;
+	  HOST_WIDE_INT fpos;
+	  if (!shwi_bit_position_p (f, &fpos)
+	      || !DECL_SIZE (f)
+	      || !tree_fits_shwi_p (DECL_SIZE (f)))
+	    {
+	      if (TREE_THIS_VOLATILE (f)
+		  || volatile_bits_in_range_1 (TREE_TYPE (f), 0, 0, visited))
+		return true;
+	      continue;
+	    }
+	  HOST_WIDE_INT fsize = tree_to_shwi (DECL_SIZE (f));
+	  if (bitsize > 0
+	      && (fpos >= bitpos + bitsize || fpos + fsize <= bitpos))
+	    continue;
+	  if (TREE_THIS_VOLATILE (f)
+	      || volatile_bits_in_range_1 (TREE_TYPE (f), bitpos - fpos,
+					   bitsize, visited))
+	    return true;
+	}
+      return false;
+    }
+
+  /* The range can cover any element of an array, so check each element in
+     full.  A BITSIZE of zero means the whole object.  */
+  if (TREE_CODE (type) == ARRAY_TYPE)
+    return volatile_bits_in_range_1 (TREE_TYPE (type), 0, 0, visited);
+
+  return false;
+}
+
+/* Return true if bits [BITPOS, BITPOS + BITSIZE) of an object of TYPE
+   overlap a volatile field or element.  A BITSIZE of zero stands for the
+   whole object.  Fields whose position or size isn't constant count as
+   overlapping.  */
+
+static bool
+volatile_bits_in_range_p (tree type, HOST_WIDE_INT bitpos,
+			  HOST_WIDE_INT bitsize)
+{
+  hash_set<volatile_bits_query_hash> visited;
+  return volatile_bits_in_range_1 (type, bitpos, bitsize, &visited);
+}
+
 /* Find ways of folding logical expressions of LHS and RHS:
 
    Try to merge two comparisons to nearby fields.
@@ -9068,6 +9166,14 @@ fold_truth_andor_for_ifcombine (enum tree_code code, tree truth_type,
      make it wide enough to hold both.  */
   if (l_split_load)
     lnbitsize += GET_MODE_BITSIZE (lnmode2);
+
+  /* The combined load covers every bit in between and around the two
+     fields, which can include a volatile field that the source never
+     reads.  volatilep only tells us about the compared fields, so check
+     the whole range of the load.  */
+  if (volatile_bits_in_range_p (TREE_TYPE (ll_inner), lnbitpos, lnbitsize))
+    return 0;
+
   lntype = build_nonstandard_integer_type (lnbitsize, 1);
   if (!lntype)
     return NULL_TREE;
@@ -9296,6 +9402,9 @@ fold_truth_andor_for_ifcombine (enum tree_code code, tree truth_type,
       rnbitpos = first_bit & ~ (rnbitsize - 1);
       if (r_split_load)
 	rnbitsize += GET_MODE_BITSIZE (rnmode2);
+      if (volatile_bits_in_range_p (TREE_TYPE (lr_inner), rnbitpos,
+				    rnbitsize))
+	return 0;
       rntype = build_nonstandard_integer_type (rnbitsize, 1);
       if (!rntype)
 	return  0;
