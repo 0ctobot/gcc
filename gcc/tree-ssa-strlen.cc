@@ -1635,14 +1635,16 @@ zero_length_string (tree ptr, strinfo *chainsi)
    - adding ADJ to the nonzero_chars fields
    - copying full_string_p from the new ORIGSI.
 
-   STMT_WRITES says whether the current statement writes to memory.  If it
-   does, the related strinfos are exempted from the maybe_invalidate call for
-   that write.  A statement that only reads, such as a call to strlen, gets no
-   such call and must not leave the exemption behind for the next store.  */
+   EXEMPT says whether the related strinfos are exempted from the
+   maybe_invalidate call for the current statement.  A statement that only
+   reads, such as a call to strlen, gets no such call and must not leave the
+   exemption behind for the next store.  The exemption is also wrong for a call
+   whose return value is stored into the string, since the callee may have
+   written the string itself.  */
 
 static void
 adjust_related_strinfos (location_t loc, strinfo *origsi, tree adj,
-			 bool stmt_writes = true)
+			 bool exempt = true)
 {
   strinfo *si = verify_related_strinfos (origsi);
 
@@ -1669,7 +1671,7 @@ adjust_related_strinfos (location_t loc, strinfo *origsi, tree adj,
 	  si->full_string_p = origsi->full_string_p;
 
 	  si->endptr = NULL_TREE;
-	  if (stmt_writes)
+	  if (exempt)
 	    si->dont_invalidate = true;
 	}
       nsi = get_next_strinfo (si);
@@ -5039,6 +5041,11 @@ strlen_pass::handle_store (bool *zero_write)
      call.  STORETYPE is the type of the store (determined from either
      the RHS of the assignment statement or the LHS of a function call.  */
   tree lhs, rhs, storetype;
+  /* Whether the strinfos updated for the store are exempt from the
+     maybe_invalidate call for STMT.  A call doesn't get that exemption, since
+     the callee may itself write the string before its return value is stored
+     into it.  */
+  bool exempt = true;
   if (is_gimple_assign (stmt))
     {
       lhs = gimple_assign_lhs (stmt);
@@ -5050,6 +5057,7 @@ strlen_pass::handle_store (bool *zero_write)
       lhs = gimple_call_lhs (stmt);
       rhs = NULL_TREE;
       storetype = TREE_TYPE (lhs);
+      exempt = false;
     }
   else
     return true;
@@ -5280,12 +5288,12 @@ strlen_pass::handle_store (bool *zero_write)
 	  si->next = 0;
 	  si->stmt = NULL;
 	  si->writable = true;
-	  si->dont_invalidate = true;
+	  si->dont_invalidate = exempt;
 	  if (oldlen)
 	    {
 	      tree adj = fold_build2_loc (loc, MINUS_EXPR, size_type_node,
 					  si->nonzero_chars, oldlen);
-	      adjust_related_strinfos (loc, si, adj);
+	      adjust_related_strinfos (loc, si, adj, exempt);
 	    }
 	  else
 	    si->prev = 0;
@@ -5326,7 +5334,7 @@ strlen_pass::handle_store (bool *zero_write)
 	      && ssaname
 	      && !SSA_NAME_OCCURS_IN_ABNORMAL_PHI (ssaname))
 	    si->endptr = ssaname;
-	  si->dont_invalidate = true;
+	  si->dont_invalidate = exempt;
 	  si->writable = true;
 	}
     }
@@ -5345,7 +5353,7 @@ strlen_pass::handle_store (bool *zero_write)
 				build_int_cst (size_type_node, rhs_minlen),
 				full_string_p);
 	      set_strinfo (idx, si);
-	      si->dont_invalidate = true;
+	      si->dont_invalidate = exempt;
 	    }
 	}
     }
