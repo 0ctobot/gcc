@@ -2249,7 +2249,11 @@ isra_analyze_call (cgraph_edge *cs)
 					       &psize, &pmax_size, &reverse);
 	  HOST_WIDE_INT offset;
 	  unsigned HOST_WIDE_INT ds;
+	  /* The bytes of a weak variable can't be assumed readable, since an
+	     undefined weak variable resolves to address zero.  A callee
+	     reading it only under a condition must keep doing so.  */
 	  if (DECL_P (base)
+	      && !(VAR_P (base) && DECL_WEAK (base))
 	      && (poffset.is_constant (&offset))
 	      && tree_fits_uhwi_p (DECL_SIZE (base))
 	      && ((ds = tree_to_uhwi (DECL_SIZE (base)) - offset)
