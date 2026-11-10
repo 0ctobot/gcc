@@ -3313,16 +3313,19 @@ ipa_analyze_call_uses (struct ipa_func_body_info *fbi, gcall *call)
 }
 
 /* Store that that there was a store of FN to a record of type REC_TYPE and
-   FLD_OFFSET.  */
+   FLD_OFFSET.  A NULL FN means the field has no single known target, either
+   because of a conflict another translation unit already found or because of a
+   store GCC can't attribute to a single function.  */
 
 static void
 note_fnptr_in_record (tree rec_type, unsigned fld_offset, tree fn)
 {
-  gcc_assert (TREE_CODE (fn) == FUNCTION_DECL);
+  gcc_assert (!fn || TREE_CODE (fn) == FUNCTION_DECL);
   gcc_assert (TREE_CODE (rec_type) == RECORD_TYPE);
   /* Storing a function with a different signature through a cast leaves the
      field without a target that can be called directly.  */
-  if (!fntype_matches_record_field_p (TREE_TYPE (fn), rec_type, fld_offset))
+  if (fn && !fntype_matches_record_field_p (TREE_TYPE (fn), rec_type,
+					    fld_offset))
     fn = NULL_TREE;
   if (!noted_fnptrs_in_records)
     noted_fnptrs_in_records = hash_table<noted_fnptr_hasher>::create_ggc (37);
@@ -6022,25 +6025,19 @@ ipa_prop_write_jump_functions (void)
     }
   ipa_write_return_summaries (ob);
 
+  /* Write the fields with conflicting stores too, with a NULL function, so
+     that WPA doesn't take a single store in another unit as the only one.  */
   if (noted_fnptrs_in_records)
     {
-      count = 0;
+      streamer_write_uhwi (ob, noted_fnptrs_in_records->elements ());
       for (auto iter = noted_fnptrs_in_records->begin ();
 	   iter != noted_fnptrs_in_records->end();
 	   ++iter)
-	if ((*iter)->fn)
-	  count++;
-      streamer_write_uhwi (ob, count);
-
-      for (auto iter = noted_fnptrs_in_records->begin ();
-	   iter != noted_fnptrs_in_records->end();
-	   ++iter)
-	if ((*iter)->fn)
-	  {
-	    stream_write_tree (ob, (*iter)->rec_type, true);
-	    stream_write_tree (ob, (*iter)->fn, true);
-	    streamer_write_uhwi (ob, (*iter)->fld_offset);
-	  }
+	{
+	  stream_write_tree (ob, (*iter)->rec_type, true);
+	  stream_write_tree (ob, (*iter)->fn, true);
+	  streamer_write_uhwi (ob, (*iter)->fld_offset);
+	}
     }
   else
     streamer_write_uhwi (ob, 0);
