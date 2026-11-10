@@ -14270,6 +14270,52 @@ do_store_flag (const_sepops ops, rtx target, machine_mode mode)
 				 && !TYPE_UNSIGNED (ops->type)) ? -1 : 1);
 }
 
+/* Return true if the bounds check in INDEX_MODE that the casesi pattern does
+   on INDEX_EXPR minus MINVAL, truncated from INDEX_TYPE to INDEX_MODE, sends
+   exactly the same values to the default label as an unsigned check against
+   RANGE in INDEX_TYPE would.  try_casesi doesn't need its own check in the
+   wider mode when this holds.
+
+   Truncation reduces the difference D modulo 2^N, where N is the precision
+   of INDEX_MODE and INDEX_TYPE is wider than N bits.  A difference in
+   [0, 2^N - 1] keeps its value.  A difference D = -K with K in
+   [1, 2^N - 1 - RANGE] is above RANGE as an unsigned value in INDEX_TYPE,
+   and it truncates to 2^N - K, which is above RANGE as well.  Any other
+   difference could truncate to a value that is in range in INDEX_MODE while
+   it isn't in INDEX_TYPE, so the range of INDEX_EXPR must rule all of them
+   out.  */
+
+static bool
+casesi_index_fits_mode_p (tree index_type, tree index_expr, tree minval,
+			  tree range, scalar_int_mode index_mode)
+{
+  unsigned int prec = GET_MODE_PRECISION (index_mode);
+
+  if (TREE_CODE (index_expr) != SSA_NAME
+      || !types_compatible_p (TREE_TYPE (index_expr), index_type)
+      || TYPE_PRECISION (index_type) <= prec
+      || TREE_CODE (minval) != INTEGER_CST
+      || TREE_CODE (range) != INTEGER_CST)
+    return false;
+
+  int_range_max r;
+  if (!get_range_query (cfun)->range_of_expr (r, index_expr,
+					      currently_expanding_gimple_stmt)
+      || r.undefined_p ()
+      || r.varying_p ())
+    return false;
+
+  signop sgn = TYPE_SIGN (index_type);
+  widest_int lim = wi::set_bit_in_zero<widest_int> (prec);
+  widest_int rng = wi::to_widest (range);
+  widest_int lo = (widest_int::from (r.lower_bound (), sgn)
+		   - wi::to_widest (minval));
+  widest_int hi = (widest_int::from (r.upper_bound (), sgn)
+		   - wi::to_widest (minval));
+
+  return rng >= 0 && rng < lim && hi < lim && lo > rng - lim;
+}
+
 /* Attempt to generate a casesi instruction.  Returns true if successful,
    false otherwise (i.e. if there is no casesi instruction).
 
@@ -14293,12 +14339,17 @@ try_casesi (tree index_type, tree index_expr, tree minval, tree range,
     {
       rtx rangertx = expand_normal (range);
 
-      /* We must handle the endpoints in the original mode.  */
+      /* We must handle the endpoints in the original mode, unless the range
+	 of the index makes the casesi pattern's own check sufficient.  */
+      bool wide_check = (default_label
+			 && !casesi_index_fits_mode_p (index_type, index_expr,
+						       minval, range,
+						       index_mode));
       index_expr = build2 (MINUS_EXPR, index_type,
 			   index_expr, minval);
       minval = integer_zero_node;
       index = expand_normal (index_expr);
-      if (default_label)
+      if (wide_check)
         emit_cmp_and_jump_insns (rangertx, index, LTU, NULL_RTX,
 				 omode, 1, default_label,
                                  default_probability);
