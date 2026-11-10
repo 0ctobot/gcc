@@ -1017,6 +1017,7 @@ int aarch64_vec_fpconst_pow_of_2 (rtx);
 rtx aarch64_mask_from_zextract_ops (rtx, rtx);
 rtx aarch64_return_addr_rtx (void);
 rtx aarch64_return_addr (int, rtx);
+void aarch64_split_load_return_addr (rtx);
 rtx aarch64_simd_gen_const_vector_dup (machine_mode, HOST_WIDE_INT);
 rtx aarch64_gen_shareable_zero (machine_mode);
 bool aarch64_split_simd_shift_p (rtx_insn *);
