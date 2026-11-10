@@ -1608,6 +1608,37 @@ nonoverlapping_array_refs_p (tree ref1, tree ref2)
   return 0;
 }
 
+/* Return true if the access path of REF, up to but not including STOP,
+   indexes an array that has no upper bound or at most one element with a
+   non-constant index.  Such an array is often a header's variable-length
+   tail, or a zero-length marker, that isn't the last member: a header
+   embedded ahead of the storage for its elements, or a [0] marker followed
+   by more members.  Indexing it reaches past its declared end into the
+   members that follow, so the access can overlap a sibling member of any
+   structure that contains the array, and different FIELD_DECLs on the two
+   paths prove nothing.  */
+
+static bool
+ref_indexes_short_array_p (tree ref, tree stop)
+{
+  for (; handled_component_p (ref) && ref != stop;
+       ref = TREE_OPERAND (ref, 0))
+    {
+      if ((TREE_CODE (ref) != ARRAY_REF
+	   && TREE_CODE (ref) != ARRAY_RANGE_REF)
+	  || TREE_CODE (TREE_OPERAND (ref, 1)) == INTEGER_CST)
+	continue;
+      tree low = array_ref_low_bound (ref);
+      tree high = array_ref_up_bound (ref);
+      if (!high
+	  || TREE_CODE (low) != INTEGER_CST
+	  || TREE_CODE (high) != INTEGER_CST
+	  || !tree_int_cst_lt (low, high))
+	return true;
+    }
+  return false;
+}
+
 /* Try to disambiguate REF1 and REF2 under the assumption that MATCH1 and
    MATCH2 either point to the same address or are disjoint.
    MATCH1 and MATCH2 are assumed to be ref in the access path of REF1 and REF2
@@ -1647,6 +1678,19 @@ nonoverlapping_refs_since_match_p (tree match1, tree ref1,
   if (match1 == ref1 || !handled_component_p (ref1)
       || match2 == ref2 || !handled_component_p (ref2))
     return -1;
+
+  /* The walk below concludes "no overlap" from two different FIELD_DECLs
+     of one RECORD_TYPE, or from different constant indices of one array,
+     which assumes that every variable index stays inside its array.  Don't
+     assume that for an array whose declared size can't hold the index;
+     callers have already compared the offsets and max sizes, which stay
+     right for members ahead of such an array.  */
+  if (ref_indexes_short_array_p (ref1, match1)
+      || ref_indexes_short_array_p (ref2, match2))
+    {
+      ++alias_stats.nonoverlapping_refs_since_match_p_may_alias;
+      return -1;
+    }
 
   auto_vec<tree, 16> component_refs1;
   auto_vec<tree, 16> component_refs2;

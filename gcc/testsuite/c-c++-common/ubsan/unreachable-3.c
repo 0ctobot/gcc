@@ -8,13 +8,13 @@ struct vnic_wq_ctrl {
 };
 struct snic {
     unsigned int wq_count;
-    struct vnic_wq_ctrl *wq[1];
+    struct vnic_wq_ctrl *wq[2];
     int wq_lock[1];
 };
 void snic_log_q_error(struct snic *snic)
 {
     unsigned int i;
-#pragma GCC unroll 1
+#pragma GCC unroll 2
     for (i = 0; i < snic->wq_count; i++)
       ioread32(&snic->wq[i]->error_status);
 }
