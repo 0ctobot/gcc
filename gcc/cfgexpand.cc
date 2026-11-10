@@ -810,11 +810,37 @@ vars_ssa_cache::operator() (tree name)
 	{
 	  /* operand 0 is the lhs. */
 	  for (unsigned i = 1; i < gimple_num_ops (g); i++)
-	    work_list.safe_push (std::make_pair (gimple_op (a, i), use));
+	    {
+	      tree op = gimple_op (a, i);
+	      /* A const call can return the address inside a complex or vector
+		 value, as .ADD_OVERFLOW does, and then the call is only reached
+		 through one of these wrapped around its result.  */
+	      if (TREE_CODE (op) == REALPART_EXPR
+		  || TREE_CODE (op) == IMAGPART_EXPR
+		  || TREE_CODE (op) == BIT_FIELD_REF
+		  || TREE_CODE (op) == VIEW_CONVERT_EXPR)
+		op = TREE_OPERAND (op, 0);
+	      work_list.safe_push (std::make_pair (op, use));
+	    }
 	}
       else if (gphi *p = dyn_cast <gphi *> (g))
 	for (unsigned i = 0; i < gimple_phi_num_args (p); ++i)
 	  work_list.safe_push (std::make_pair (gimple_phi_arg_def (p, i), use));
+      /* A const call can return a pointer derived from one of its
+	 arguments, as in an accessor returning &p->f.  LIM can hoist such a
+	 call out of a loop just like &p->f itself, which leaves the result
+	 as the only mention of the variable inside the loop, so walk the
+	 arguments too.  Pure and other calls may read memory reachable from
+	 their arguments, so they can't move across the clobber that ends the
+	 variable's scope, and their arguments stay mentioned at the call
+	 itself.  */
+      else if (gcall *c = dyn_cast <gcall *> (g))
+	{
+	  if (gimple_call_flags (c) & ECF_CONST)
+	    for (unsigned i = 0; i < gimple_call_num_args (c); ++i)
+	      work_list.safe_push (std::make_pair (gimple_call_arg (c, i),
+						   use));
+	}
     }
 
   /* Update the cache. Note a loop is needed as phi nodes could
