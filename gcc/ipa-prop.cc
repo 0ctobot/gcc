@@ -4318,12 +4318,20 @@ ipa_find_agg_cst_from_init (tree scalar, HOST_WIDE_INT offset, bool by_ref)
 
   if (!VAR_P (scalar)
       || !is_global_var (scalar)
-      || !TREE_READONLY (scalar)
-      || !DECL_INITIAL (scalar)
-      || TREE_CODE (DECL_INITIAL (scalar)) != CONSTRUCTOR)
+      || !TREE_READONLY (scalar))
     return NULL;
 
-  return find_constructor_constant_at_offset (DECL_INITIAL (scalar), offset);
+  /* Don't read DECL_INITIAL directly: at WPA it's error_mark_node until the
+     initializer is read in on demand, and an alias has no initializer of its
+     own.  ctor_for_folding reads the initializer in, looks through aliases
+     and refuses an initializer that can be replaced at link time.  It
+     returns NULL for a variable known to be all zeros, which isn't a
+     CONSTRUCTOR and so isn't looked into here.  */
+  tree init = ctor_for_folding (scalar);
+  if (!init || TREE_CODE (init) != CONSTRUCTOR)
+    return NULL;
+
+  return find_constructor_constant_at_offset (init, offset);
 }
 
 /* Retrieve value from AGG_JFUNC for the given OFFSET or return NULL if there
