@@ -1908,6 +1908,10 @@ do_simple_agr_dse (gassign *stmt, bool full_walk)
 	      eh to work.  */
 	  if (stmt_unremovable_because_of_non_call_eh_p (cfun, ostmt))
 	    return;
+	  /* A volatile load in the call's aggregate argument is a side
+	     effect even when the call's result is dead.  */
+	  if (gimple_has_volatile_ops (ostmt))
+	    return;
 	  /* If we delete a stmt that could throw, mark the block
 	     in to_purge to cleanup afterwards.  */
 	  if (stmt_could_throw_p (cfun, ostmt))
@@ -1958,6 +1962,11 @@ do_simple_agr_dse (gassign *stmt, bool full_walk)
 	  /* Don't remove stores/statements that are needed for non-call
 	      eh to work.  */
 	  if (stmt_unremovable_because_of_non_call_eh_p (cfun, ostmt))
+	    return;
+	  /* The copy is dead but a volatile load from its source, as in a
+	     READ_ONCE of a struct whose result is unused, still has to
+	     happen.  */
+	  if (gimple_has_volatile_ops (ostmt))
 	    return;
 	  /* If we delete a stmt that could throw, mark the block
 	     in to_purge to cleanup afterwards.  */
