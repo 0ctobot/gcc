@@ -30,6 +30,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "lto-streamer.h"
 #include "opts.h"
 #include "toplev.h"
+#include "output.h"
 
 /* Append the option piece OPT to the COLLECT_GCC_OPTIONS string
    set up by OB, appropriately quoted and separated by spaces
@@ -171,6 +172,37 @@ lto_write_options (void)
       if ((cl_options[option->opt_index].flags & CL_TARGET)
 	  && lto_stream_offload_p)
        continue;
+
+      /* Register names are target-specific too, and lto-wrapper passes these
+	 on to the compiler it runs.  It finds the options that name the same
+	 register by comparing their names as strings, so write each register
+	 as its number, in one option per register for a name that covers
+	 several.  Leave a name that doesn't decode as written, so that the
+	 link-time compiler still diagnoses it.  */
+      if (option->opt_index == OPT_ffixed_
+	  || option->opt_index == OPT_fcall_used_
+	  || option->opt_index == OPT_fcall_saved_)
+	{
+	  int regno, nregs;
+
+	  if (lto_stream_offload_p)
+	    continue;
+
+	  regno = decode_reg_name_and_count (option->arg, &nregs);
+	  if (regno >= 0)
+	    {
+	      for (int k = 0; k < nregs; ++k)
+		{
+		  char *opt
+		    = xasprintf ("%s%d", cl_options[option->opt_index].opt_text,
+				 regno + k);
+		  append_to_collect_gcc_options (&temporary_obstack, &first_p,
+						 opt);
+		  free (opt);
+		}
+	      continue;
+	    }
+	}
 
       /* Drop options created from the gcc driver that will be rejected
 	 when passed on to the driver again.  */
