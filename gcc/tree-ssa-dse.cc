@@ -28,6 +28,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "ssa.h"
 #include "gimple-pretty-print.h"
 #include "fold-const.h"
+#include "stor-layout.h"
 #include "gimple-iterator.h"
 #include "tree-cfg.h"
 #include "tree-dfa.h"
@@ -402,6 +403,53 @@ setup_live_bytes_from_ref (ao_ref *ref, sbitmap live_bytes)
   return false;
 }
 
+/* Return true if REF was built by ao_ref_init_from_ptr_and_size or
+   ao_ref_init_from_ptr_and_range from a pointer that isn't the address of
+   a declaration, in which case the type of its base is just char.  */
+
+static bool
+ao_ref_from_ptr_p (ao_ref *ref)
+{
+  return (!ref->ref
+	  && TREE_CODE (ref->base) == MEM_REF
+	  && TREE_TYPE (ref->base) == char_type_node);
+}
+
+/* REF is a store whose alignment ao_ref_alignment doesn't know, like a
+   store through a pointer argument.  Assume that the object it stores into
+   is aligned for its type, and store that alignment in *ALIGN and the
+   offset of REF from a multiple of it in *BITPOS, both in bits.  Return
+   false if there's no object type to go by.  */
+
+static bool
+ao_ref_type_alignment (ao_ref *ref, unsigned int *align,
+		       unsigned HOST_WIDE_INT *bitpos)
+{
+  /* get_object_alignment_1 already falls back to the alignment of the type
+     of a dereference when the pointer's alignment is unknown.  It just
+     doesn't report it as known, since nothing guarantees it.  */
+  if (ref->ref)
+    {
+      get_object_alignment_1 (ref->ref, align, bitpos);
+      return true;
+    }
+
+  HOST_WIDE_INT offset;
+  if (TREE_CODE (ref->base) != MEM_REF || !ref->offset.is_constant (&offset))
+    return false;
+
+  /* The char base of a reference built from a pointer says nothing about
+     the object, so use the type that the pointer points to instead.  */
+  tree type = TREE_TYPE (ref->base);
+  if (ao_ref_from_ptr_p (ref))
+    type = TREE_TYPE (TREE_TYPE (TREE_OPERAND (ref->base, 0)));
+  *align = BITS_PER_UNIT;
+  if (COMPLETE_TYPE_P (type))
+    *align = MAX (*align, min_align_of_type (type) * BITS_PER_UNIT);
+  *bitpos = (unsigned HOST_WIDE_INT) offset & (*align - 1);
+  return true;
+}
+
 /* Compute the number of stored bytes that we can trim from the head and
    tail of REF.  LIVE is the bitmap of stores to REF that are still live.
 
@@ -444,8 +492,11 @@ compute_trims (ao_ref *ref, sbitmap live, int *trim_head, int *trim_tail,
 	 proper warnings.
 
 	 We could have a type with no TYPE_SIZE_UNIT or we could have a VLA
-	 where TYPE_SIZE_UNIT is not a constant.  */
+	 where TYPE_SIZE_UNIT is not a constant.  A reference built from a
+	 pointer and a size has a char base with no relation to the size of
+	 the object the pointer points to, so it says nothing about bounds.  */
       if (*trim_tail
+	  && !ao_ref_from_ptr_p (ref)
 	  && TYPE_SIZE_UNIT (TREE_TYPE (ref->base))
 	  && TREE_CODE (TYPE_SIZE_UNIT (TREE_TYPE (ref->base))) == INTEGER_CST
 	  && compare_tree_int (TYPE_SIZE_UNIT (TREE_TYPE (ref->base)),
@@ -458,13 +509,16 @@ compute_trims (ao_ref *ref, sbitmap live, int *trim_head, int *trim_tail,
   int first_live = bitmap_first_set_bit (live);
   *trim_head = first_live - first_orig;
 
+  if (!*trim_head && !*trim_tail)
+    return;
+
   /* If REF is aligned, try to maintain this alignment if it reduces
      the number of (power-of-two sized aligned) writes to memory.  */
   unsigned int align_bits;
   unsigned HOST_WIDE_INT bitpos;
-  if ((*trim_head || *trim_tail)
+  bool align_known = ao_ref_alignment (ref, &align_bits, &bitpos);
+  if (align_known
       && last_live - first_live >= 2
-      && ao_ref_alignment (ref, &align_bits, &bitpos)
       && align_bits >= 32
       && bitpos == 0
       && align_bits % BITS_PER_UNIT == 0)
@@ -506,6 +560,44 @@ compute_trims (ao_ref *ref, sbitmap live, int *trim_head, int *trim_tail,
 		  break;
 		}
 	    }
+	}
+    }
+  /* We don't know where REF lies relative to an aligned address, which is
+     the case for a store through a pointer.  Trimming whatever is dead then
+     turns a clear of whole words into one at an odd offset or with an odd
+     length, which takes extra stores or even a memset call.  Assume that
+     the object is aligned for its type, keep both ends of the trimmed store
+     aligned to that (up to a word), and don't trim at all unless a whole
+     number of words remains.  */
+  else if (!align_known
+	   && ao_ref_type_alignment (ref, &align_bits, &bitpos)
+	   && bitpos % BITS_PER_UNIT == 0)
+    {
+      unsigned int align_units = MIN (align_bits / BITS_PER_UNIT,
+				      (unsigned int) UNITS_PER_WORD);
+      unsigned int misalign = (bitpos / BITS_PER_UNIT) & (align_units - 1);
+
+      if (*trim_head)
+	{
+	  unsigned int start = misalign + *trim_head;
+	  *trim_head = (start < align_units
+			? 0 : ROUND_DOWN (start, align_units) - misalign);
+	}
+
+      if (*trim_tail)
+	{
+	  unsigned int end = misalign + last_live + 1;
+	  unsigned int new_end = ROUND_UP (end, align_units);
+	  unsigned int orig_end = end + *trim_tail;
+	  *trim_tail = orig_end > new_end ? orig_end - new_end : 0;
+	}
+
+      if (ref->size.is_constant (&const_size)
+	  && (const_size / BITS_PER_UNIT - *trim_head - *trim_tail)
+	     % UNITS_PER_WORD != 0)
+	{
+	  *trim_head = 0;
+	  *trim_tail = 0;
 	}
     }
 
@@ -588,12 +680,34 @@ maybe_trim_constructor_store (ao_ref *ref, sbitmap live, gimple *stmt, bool was_
   if (head_trim || tail_trim)
     {
       /* We want &lhs for the MEM_REF expression.  */
-      tree lhs_addr = build_fold_addr_expr (gimple_assign_lhs (stmt));
+      tree lhs = gimple_assign_lhs (stmt);
+      tree lhs_addr = build_fold_addr_expr (lhs);
+      poly_int64 offset = head_trim;
+      unsigned int align = 0;
 
       STRIP_USELESS_TYPE_CONVERSION (lhs_addr);
 
+      /* For a store through a pointer, address the trimmed store from
+	 the pointer plus a constant offset instead.  */
       if (! is_gimple_min_invariant (lhs_addr))
-	return;
+	{
+	  poly_int64 off;
+	  tree base = get_addr_base_and_unit_offset (lhs, &off);
+	  if (!base
+	      || TREE_CODE (base) != MEM_REF
+	      || TREE_CODE (TREE_OPERAND (base, 0)) != SSA_NAME)
+	    return;
+	  lhs_addr = TREE_OPERAND (base, 0);
+	  offset += mem_ref_offset (base).force_shwi () + off;
+
+	  /* The char array built below only has byte alignment, and the
+	     pointer alone usually doesn't tell more than that.  Keep the
+	     alignment that the original store had, as far as it holds at
+	     the first byte that isn't trimmed.  */
+	  align = get_object_alignment (lhs);
+	  if (head_trim)
+	    align = MIN (align, least_bit_hwi (head_trim) * BITS_PER_UNIT);
+	}
 
       /* The number of bytes for the new constructor.  */
       poly_int64 ref_bytes = exact_div (ref->size, BITS_PER_UNIT);
@@ -605,19 +719,23 @@ maybe_trim_constructor_store (ao_ref *ref, sbitmap live, gimple *stmt, bool was_
 	 so that we know how many bytes to clear when expanding the
 	 CONSTRUCTOR.  */
       tree type = build_array_type_nelts (char_type_node, count);
+      tree mem_type = type;
+      if (align > TYPE_ALIGN (type))
+	mem_type = build_aligned_type (type, align);
 
       /* Build a suitable alias type rather than using alias set zero
 	 to avoid pessimizing.  */
-      tree alias_type = reference_alias_ptr_type (gimple_assign_lhs (stmt));
+      tree alias_type = reference_alias_ptr_type (lhs);
 
       /* Build a MEM_REF representing the whole accessed area, starting
 	 at the first byte not trimmed.  */
-      tree exp = fold_build2 (MEM_REF, type, lhs_addr,
-			      build_int_cst (alias_type, head_trim));
+      tree exp = fold_build2 (MEM_REF, mem_type, lhs_addr,
+			      build_int_cst (alias_type, offset));
 
       /* Now update STMT with a new RHS and LHS.  */
       gimple_assign_set_lhs (stmt, exp);
       gimple_assign_set_rhs1 (stmt, build_constructor (type, NULL));
+      update_stmt (stmt);
     }
 }
 
