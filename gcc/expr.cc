@@ -7161,7 +7161,7 @@ categorize_ctor_elements_1 (const_tree ctor, HOST_WIDE_INT *p_nz_elts,
 {
   unsigned HOST_WIDE_INT idx;
   HOST_WIDE_INT nz_elts, unique_nz_elts, init_elts, num_fields;
-  tree value, purpose, elt_type;
+  tree value, purpose, elt_type, elt_field, elt_size;
 
   /* Whether CTOR is a valid constant initializer, in accordance with what
      initializer_constant_valid_p does.  If inferred from the constructor
@@ -7174,6 +7174,8 @@ categorize_ctor_elements_1 (const_tree ctor, HOST_WIDE_INT *p_nz_elts,
   init_elts = 0;
   num_fields = 0;
   elt_type = NULL_TREE;
+  elt_field = NULL_TREE;
+  elt_size = NULL_TREE;
 
   FOR_EACH_CONSTRUCTOR_ELT (CONSTRUCTOR_ELTS (ctor), idx, purpose, value)
     {
@@ -7190,6 +7192,11 @@ categorize_ctor_elements_1 (const_tree ctor, HOST_WIDE_INT *p_nz_elts,
 	}
       num_fields += mult;
       elt_type = TREE_TYPE (value);
+      /* Measure an initialized member by its FIELD_DECL rather than by the
+	 type of its value, since a bit-field is narrower than its type.  */
+      elt_field = (purpose && TREE_CODE (purpose) == FIELD_DECL
+		   ? purpose : NULL_TREE);
+      elt_size = elt_field ? DECL_SIZE (elt_field) : TYPE_SIZE (elt_type);
 
       switch (TREE_CODE (value))
 	{
@@ -7293,7 +7300,9 @@ categorize_ctor_elements_1 (const_tree ctor, HOST_WIDE_INT *p_nz_elts,
     }
 
   if (!p_complete->sparse && !complete_ctor_at_level_p (TREE_TYPE (ctor),
-						num_fields, elt_type))
+						num_fields,
+						elt_field ? elt_field
+							  : elt_type))
     p_complete->sparse = true;
   else if (TREE_CODE (TREE_TYPE (ctor)) == UNION_TYPE
 	   || TREE_CODE (TREE_TYPE (ctor)) == QUAL_UNION_TYPE)
@@ -7302,13 +7311,13 @@ categorize_ctor_elements_1 (const_tree ctor, HOST_WIDE_INT *p_nz_elts,
 	  && CONSTRUCTOR_ZERO_PADDING_BITS (ctor)
 	  && (num_fields
 	      ? simple_cst_equal (TYPE_SIZE (TREE_TYPE (ctor)),
-				  TYPE_SIZE (elt_type)) != 1
+				  elt_size) != 1
 	      : type_has_padding_at_level_p (TREE_TYPE (ctor))))
 	p_complete->sparse = true;
       else if (!p_complete->sparse && !p_complete->padded_union
 	       && (num_fields
 		   ? simple_cst_equal (TYPE_SIZE (TREE_TYPE (ctor)),
-				       TYPE_SIZE (elt_type)) != 1
+				       elt_size) != 1
 		   : type_has_padding_at_level_p (TREE_TYPE (ctor))))
 	p_complete->padded_union = true;
     }
@@ -7409,7 +7418,9 @@ immediate_const_decl_ctor (tree decl, unsigned int words)
    of which had type LAST_TYPE.  Each element was itself a complete
    initializer, in the sense that every meaningful byte was explicitly
    given a value.  Return true if the same is true for the constructor
-   as a whole.  */
+   as a whole.  For a union, LAST_TYPE is the type of the initialized
+   member's value, or the member's FIELD_DECL when it is known, so that a
+   bit-field member is measured by its width rather than by its type.  */
 
 bool
 complete_ctor_at_level_p (const_tree type, HOST_WIDE_INT num_elts,
@@ -7438,7 +7449,10 @@ complete_ctor_at_level_p (const_tree type, HOST_WIDE_INT num_elts,
 	   largest element.  Which would avoid comparing the size of the
 	   initialized element against any tail padding in the union.
 	   Doesn't seem worth the effort...  */
-	return simple_cst_equal (TYPE_SIZE (type), TYPE_SIZE (last_type)) == 1;
+	return simple_cst_equal (TYPE_SIZE (type),
+				 TREE_CODE (last_type) == FIELD_DECL
+				 ? DECL_SIZE (last_type)
+				 : TYPE_SIZE (last_type)) == 1;
 
       return true;
     }
