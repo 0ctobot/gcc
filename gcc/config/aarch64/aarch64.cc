@@ -30031,6 +30031,36 @@ aarch64_expand_setmem_mops (rtx *operands)
   return true;
 }
 
+/* Return the source operand for a setmem with the QImode fill value VAL
+   done in general registers, where no store is wider than SIZE bytes:
+   const0_rtx for a zero fill, which gets stored from XZR, and otherwise
+   a register holding VAL in each of its low SIZE bytes.  The register is
+   DImode when SIZE is 8 and SImode otherwise.  */
+
+static rtx
+aarch64_setmem_gpr_value (rtx val, unsigned size)
+{
+  if (val == const0_rtx)
+    return const0_rtx;
+
+  /* Only replicate VAL across the bytes that get stored, since a short
+     fill doesn't need the full 64-bit pattern and building it can take
+     extra instructions.  */
+  scalar_int_mode mode = size > 4 ? DImode : SImode;
+  unsigned HOST_WIDE_INT ones
+    = HOST_WIDE_INT_UC (0x0101010101010101) >> (64 - size * BITS_PER_UNIT);
+  if (CONST_INT_P (val))
+    return force_reg (mode, gen_int_mode ((UINTVAL (val) & 0xff) * ones,
+					  mode));
+
+  /* Replicate a variable byte by multiplying its zero extension by ONES.
+     expand_mult picks a MUL or a sequence of shifted ORRs, whichever is
+     cheaper.  */
+  rtx x = convert_modes (mode, QImode, val, true);
+  x = expand_mult (mode, x, gen_int_mode (ones, mode), NULL_RTX, true);
+  return force_reg (mode, x);
+}
+
 /* Expand setmem, as if from a __builtin_memset.  Return true if
    we succeed, otherwise return false.  */
 
@@ -30045,14 +30075,28 @@ aarch64_expand_setmem (rtx *operands)
   rtx base;
   machine_mode mode = BLKmode, next_mode;
 
-  /* Variable-sized or strict-align memset may use the MOPS expansion.  */
-  if (!CONST_INT_P (operands[1]) || !TARGET_SIMD
-      || (STRICT_ALIGNMENT && align < 16))
+  /* Variable-sized or strict-align memset may use the MOPS expansion.
+     Without SIMD, the general-register path below needs unaligned
+     accesses for its overlapping tail stores.  With -mstrict-align we
+     don't need it anyway, since CLEAR_RATIO and SET_RATIO then let the
+     middle end expand small memsets by pieces with the same
+     general-register stores.  */
+  if (!CONST_INT_P (operands[1])
+      || (STRICT_ALIGNMENT && (align < 16 || !TARGET_SIMD)))
     return aarch64_expand_setmem_mops (operands);
 
   /* Set inline limits for memset.  MOPS has a separate threshold.  */
-  unsigned max_set_size = MAX_SET_SIZE (optimize_function_for_speed_p (cfun));
+  bool speed_p = optimize_function_for_speed_p (cfun);
+  unsigned max_set_size = MAX_SET_SIZE (speed_p);
   unsigned mops_threshold = aarch64_mops_memset_size_threshold;
+
+  /* A general-register STP stores 16 bytes rather than 32, so halve the
+     -Os limit to keep the same number of stores as the SIMD path.  When
+     optimizing for speed, the 256-byte limit costs 16 STPs, about as many
+     instructions as the 128-byte limit for a general-register memcpy, and
+     fewer than a call to memset executes for the same fill.  */
+  if (!TARGET_SIMD && !speed_p)
+    max_set_size /= 2;
 
   len = UINTVAL (operands[1]);
 
@@ -30067,9 +30111,20 @@ aarch64_expand_setmem (rtx *operands)
   base = copy_to_mode_reg (Pmode, XEXP (dst, 0));
   dst = adjust_automodify_address (dst, VOIDmode, base, 0);
 
-  /* Prepare the val using a DUP/MOVI v0.16B, val.  */
-  val = expand_vector_broadcast (V16QImode, val);
-  val = force_reg (V16QImode, val);
+  if (TARGET_SIMD)
+    {
+      /* Prepare the val using a DUP/MOVI v0.16B, val.  */
+      val = expand_vector_broadcast (V16QImode, val);
+      val = force_reg (V16QImode, val);
+    }
+  else
+    {
+      /* The first store below is the widest one.  It covers the largest
+	 power of two not above LEN, capped at 8 bytes since 16 bytes get
+	 stored from two X registers.  */
+      unsigned size = len >= 8 ? 8 : len >= 4 ? 4 : len >= 2 ? 2 : 1;
+      val = aarch64_setmem_gpr_value (val, size);
+    }
 
   int offset = 0;
   while (len > 0)
@@ -30087,13 +30142,23 @@ aarch64_expand_setmem (rtx *operands)
 
       src = val;
 
-      /* Prefer Q-register accesses.  */
-      if (mode_bytes == 16)
-	mode = V16QImode;
+      if (!TARGET_SIMD && mode_bytes == 16)
+	{
+	  /* Store 16 bytes as two X-register stores, which the LDP/STP
+	     fusion pass pairs into an STP.  */
+	  emit_move_insn (adjust_address (dst, DImode, offset), src);
+	  emit_move_insn (adjust_address (dst, DImode, offset + 8), src);
+	}
       else
-	src = lowpart_subreg (mode, src, GET_MODE (val));
+	{
+	  /* Prefer Q-register accesses.  */
+	  if (mode_bytes == 16)
+	    mode = V16QImode;
+	  else if (src != const0_rtx)
+	    src = lowpart_subreg (mode, src, GET_MODE (val));
 
-      emit_move_insn (adjust_address (dst, mode, offset), src);
+	  emit_move_insn (adjust_address (dst, mode, offset), src);
+	}
       len -= mode_bytes;
       offset += mode_bytes;
 
