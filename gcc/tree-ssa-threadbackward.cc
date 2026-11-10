@@ -596,6 +596,18 @@ back_threader::maybe_thread_block (basic_block bb)
       && code != GIMPLE_GOTO)
     return;
 
+  // Leave a condition on a __builtin_expect hint of a PHI node to the
+  // threaders that run after the profile is guessed.  Threading it
+  // now removes the PHI node and with it the only link between the
+  // hint and the branches that pick the PHI node's constants, so the
+  // hint would never reach those branches.
+  if (!(m_flags & BT_SPEED)
+      && flag_guess_branch_prob
+      && profile_status_for_fn (m_fun) == PROFILE_ABSENT
+      && code == GIMPLE_COND
+      && expect_phi_cond_p (as_a <gcond *> (stmt)))
+    return;
+
   m_last_stmt = stmt;
   m_path.truncate (0);
 
