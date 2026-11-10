@@ -2314,6 +2314,11 @@ decl_constant_value_1 (tree decl, bool in_init)
 	 If it has either a function call, a memory reference,
 	 or a variable, then re-evaluating it could give different results.  */
       && TREE_CONSTANT (DECL_INITIAL (decl))
+      /* A weak definition can be replaced by a strong one from another
+	 translation unit at link time, so its initializer isn't
+	 necessarily the value the program sees.  This matches
+	 ctor_useable_for_folding_p in the middle end.  */
+      && !(VAR_P (decl) && DECL_WEAK (decl) && !DECL_COMDAT (decl))
       /* Check for cases where this is sub-optimal, even though valid.  */
       && (in_init || TREE_CODE (DECL_INITIAL (decl)) != CONSTRUCTOR))
     return DECL_INITIAL (decl);
