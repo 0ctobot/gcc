@@ -383,6 +383,7 @@ get_ref_base_and_extent (tree exp, poly_int64 *poffset,
   tree size_tree = NULL_TREE;
   poly_offset_int bit_offset = 0;
   bool seen_variable_array_ref = false;
+  bool seen_open_array_ref = false;
 
   /* First get the final access size and the storage order from just the
      outermost expression.  */
@@ -515,16 +516,38 @@ get_ref_base_and_extent (tree exp, poly_int64 *poffset,
 	      }
 	    else
 	      {
-		tree asize = TYPE_SIZE (TREE_TYPE (TREE_OPERAND (exp, 0)));
+		tree atype = TREE_TYPE (TREE_OPERAND (exp, 0));
+		tree asize = TYPE_SIZE (atype);
+		tree esize = TYPE_SIZE (TREE_TYPE (atype));
+		bool inner_unbounded = !known_size_p (maxsize);
 		/* We need to adjust maxsize to the whole array bitsize.
 		   But we can subtract any constant offset seen so far,
-		   because that would get us outside of the array otherwise.  */
+		   because that would get us outside of the array otherwise.
+
+		   Don't do that for an array declared with zero elements or
+		   a single element though.  Such an array is commonly a
+		   marker for the storage after it, or a trailing array in a
+		   struct that is itself embedded in another struct, and a
+		   variable index into it is expected to reach past its
+		   declared end.  Its declared size is then no bound on the
+		   access, and a zero maxsize would even be smaller than the
+		   access itself.  */
+		bool open_p
+		  = (!asize
+		     || (poly_int_tree_p (asize)
+			 && (known_eq (wi::to_poly_offset (asize), 0)
+			     || (esize
+				 && poly_int_tree_p (esize)
+				 && known_le (wi::to_poly_offset (asize),
+					      wi::to_poly_offset (esize))))));
 		if (known_size_p (maxsize)
-		    && asize
+		    && !open_p
 		    && poly_int_tree_p (asize))
 		  maxsize = wi::to_poly_offset (asize) - bit_offset;
 		else
 		  maxsize = -1;
+		if (open_p)
+		  seen_open_array_ref = true;
 
 		/* Remember that we have seen an array ref with a variable
 		   index.  */
@@ -557,10 +580,16 @@ get_ref_base_and_extent (tree exp, poly_int64 *poffset,
 		  {
 		    wide_int min = vr.lower_bound ();
 		    wide_int max = vr.upper_bound ();
-		    /* Try to constrain maxsize with range information.  */
+		    /* Try to constrain maxsize with range information.  The
+		       range only bounds this index though.  If the access
+		       within an element was already unbounded, such as a [1]
+		       array at the end of the element that runs into the
+		       storage after the last element, then the index range
+		       doesn't bound the access.  */
 		    offset_int omax
 		      = offset_int::from (max, TYPE_SIGN (TREE_TYPE (index)));
-		    if (wi::get_precision (max) <= ADDR_MAX_BITSIZE
+		    if (!inner_unbounded
+			&& wi::get_precision (max) <= ADDR_MAX_BITSIZE
 			&& omax >= 0)
 		      {
 			offset_int rmaxsize
@@ -705,8 +734,16 @@ get_ref_base_and_extent (tree exp, poly_int64 *poffset,
 	    maxsize = -1;
 	}
       /* If maxsize is unknown adjust it according to the size of the
-         base decl.  */
+	 base decl.  The size of an extern declaration doesn't include
+	 the elements a definition can give a flexible array member, and
+	 a variable index into a flexible, [0] or [1] array may reach
+	 them.  The same goes for a weak definition that isn't COMDAT,
+	 since a strong definition with more elements can replace it at
+	 link time.  */
       else if (!known_size_p (maxsize)
+	       && !((DECL_EXTERNAL (exp)
+		     || (VAR_P (exp) && DECL_WEAK (exp) && !DECL_COMDAT (exp)))
+		    && seen_open_array_ref)
 	       && DECL_SIZE (exp)
 	       && poly_int_tree_p (DECL_SIZE (exp)))
 	maxsize = wi::to_poly_offset (DECL_SIZE (exp)) - bit_offset;

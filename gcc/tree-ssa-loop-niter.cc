@@ -4312,7 +4312,7 @@ idx_infer_loop_bounds (tree base, tree *idx, void *dta)
   struct ilb_data *data = (struct ilb_data *) dta;
   tree ev, init, step;
   tree low, high, type, next;
-  bool sign, upper = true, has_flexible_size = false;
+  bool sign, upper = true;
   class loop *loop = data->loop;
 
   if (TREE_CODE (base) != ARRAY_REF)
@@ -4321,10 +4321,7 @@ idx_infer_loop_bounds (tree base, tree *idx, void *dta)
   /* For arrays that might have flexible sizes, it is not guaranteed that they
      do not really extend over their declared size.  */
   if (array_ref_flexible_size_p (base))
-    {
-      has_flexible_size = true;
-      upper = false;
-    }
+    upper = false;
 
   class loop *dloop = loop_containing_stmt (data->stmt);
   if (!dloop)
@@ -4355,10 +4352,16 @@ idx_infer_loop_bounds (tree base, tree *idx, void *dta)
   sign = tree_int_cst_sign_bit (step);
   type = TREE_TYPE (step);
 
-  /* The array that might have flexible size most likely extends
-     beyond its bounds.  */
-  if (has_flexible_size
-      && operand_equal_p (low, high, 0))
+  /* A struct member declared with a single element (or none) is commonly a
+     marker for the storage after it, or a trailing array in a struct that's
+     itself embedded in another struct, wherever it sits in its struct.  Such
+     an array most likely extends beyond its bounds, the same as an array that
+     might have flexible size, so don't derive a bound from it.  Indexing
+     past any other array of this size, such as a declared variable or an
+     inner dimension of a multidimensional array, is out of bounds, so its
+     bound still holds.  */
+  if ((!upper || TREE_CODE (TREE_OPERAND (base, 0)) == COMPONENT_REF)
+      && !tree_int_cst_lt (low, high))
     return true;
 
   /* In case the relevant bound of the array does not fit in type, or
