@@ -36,6 +36,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "reload.h"
 #include "cfgloop.h"
 #include "lra.h"
+#include "shrink-wrap.h"
 
 /* To prevent soft conflict detection becoming quadratic in the
    loop depth.  Only for very pathological cases, so it hardly
@@ -1787,18 +1788,222 @@ check_hard_reg_p (ira_allocno_t a, int hard_regno,
   return j == nregs;
 }
 
-/* Record that we have allocated NREGS registers starting at HARD_REGNO.  */
+/* The blocks where each allocated callee-saved register is expected to be
+   saved, indexed by hard register number.  No block in a register's list
+   dominates another block in it.  The lists are only used while
+   REGNO_SAVE_BB exists.  */
+static vec<basic_block> callee_save_bbs[FIRST_PSEUDO_REGISTER];
+
+/* A cache for allocno_save_bb, indexed by pseudo register number.  It only
+   exists during coloring, and only when the function's callee-saved registers
+   can be shrink-wrapped separately.  */
+static vec<basic_block> regno_save_bb;
+
+/* Return true if the callee-saved registers of the current function can be
+   saved and restored away from the prologue and epilogue, one register at a
+   time, and if allocno_save_bb has the dominators it needs to estimate where
+   each save goes.  */
+
+static bool
+separate_shrink_wrap_p (void)
+{
+  return (use_shrink_wrapping_separate ()
+	  && dom_info_available_p (CDI_DOMINATORS));
+}
+
+/* Return the block where a callee-saved register would be saved if A were its
+   only user.
+
+   Separate shrink-wrapping doesn't have to save a register in the prologue:
+   when everything that uses the register is dominated by a block that runs
+   less often than the function is entered, the save goes there instead.  Model
+   this by finding the nearest block that dominates every reference to A's
+   pseudo and picking the least frequently executed block among it and its
+   dominators, since the save can be placed in any of them.  A tie goes to the
+   block closest to the entry because it dominates more of the register's other
+   potential users.
+
+   The entry block is returned when REGNO_SAVE_BB doesn't exist, which prices
+   the save at the function's entry.  */
+
+static basic_block
+allocno_save_bb (ira_allocno_t a)
+{
+  basic_block entry_bb = ENTRY_BLOCK_PTR_FOR_FN (cfun);
+  unsigned int regno = ALLOCNO_REGNO (a);
+
+  if (regno >= regno_save_bb.length ())
+    return entry_bb;
+
+  if (!regno_save_bb[regno])
+    {
+      basic_block bb = NULL, best = entry_bb;
+      df_ref ref;
+
+      for (ref = DF_REG_DEF_CHAIN (regno); ref; ref = DF_REF_NEXT_REG (ref))
+	bb = (bb
+	      ? nearest_common_dominator (CDI_DOMINATORS, bb, DF_REF_BB (ref))
+	      : DF_REF_BB (ref));
+      for (ref = DF_REG_USE_CHAIN (regno); ref; ref = DF_REF_NEXT_REG (ref))
+	if (!DF_REF_INSN_INFO (ref) || !DEBUG_INSN_P (DF_REF_INSN (ref)))
+	  bb = (bb
+		? nearest_common_dominator (CDI_DOMINATORS, bb,
+					    DF_REF_BB (ref))
+		: DF_REF_BB (ref));
+
+      /* The walk goes towards the entry block, so letting an equally cold
+	 block replace the current choice gives a tie to the block closest to
+	 the entry.  The entry block itself is only replaced by a block that
+	 is strictly colder.  */
+      for (; bb && bb != entry_bb;
+	   bb = get_immediate_dominator (CDI_DOMINATORS, bb))
+	if (best == entry_bb
+	    ? REG_FREQ_FROM_BB (bb) < REG_FREQ_FROM_BB (best)
+	    : REG_FREQ_FROM_BB (bb) <= REG_FREQ_FROM_BB (best))
+	  best = bb;
+      regno_save_bb[regno] = best;
+    }
+  return regno_save_bb[regno];
+}
+
+/* Return true if one of the saves already expected for HARD_REGNO is in
+   SAVE_BB or in a block that dominates it, which makes a save in SAVE_BB
+   redundant.  */
+
+static bool
+callee_save_covered_p (int hard_regno, basic_block save_bb)
+{
+  for (basic_block bb : callee_save_bbs[hard_regno])
+    if (bb == save_bb || dominated_by_p (CDI_DOMINATORS, save_bb, bb))
+      return true;
+  return false;
+}
+
+/* Return the callee-saved registers that are already expected to be saved in
+   SAVE_BB.  The target can price a new save in SAVE_BB as sharing instructions
+   with their saves, such as an STP that saves a pair of registers on aarch64.
+   A register that only colder code needs is left out, since separate
+   shrink-wrapping saves it elsewhere, and pairing with it would move its save
+   into SAVE_BB as well.  */
+
+static HARD_REG_SET
+callee_saves_in_bb (basic_block save_bb)
+{
+  if (!regno_save_bb.exists ())
+    return allocated_callee_save_regs;
+
+  HARD_REG_SET regs = {};
+  for (int regno = 0; regno < FIRST_PSEUDO_REGISTER; regno++)
+    if (TEST_HARD_REG_BIT (allocated_callee_save_regs, regno)
+	&& callee_save_bbs[regno].contains (save_bb))
+      SET_HARD_REG_BIT (regs, regno);
+  return regs;
+}
+
+/* Return the frequency that saving HARD_REGNO in SAVE_BB adds to the saves
+   already expected for the register.  A save in a block dominated by one of
+   the existing saves is redundant, while a save in a block that dominates
+   existing saves replaces them.  */
+
+static int
+callee_save_extra_freq (int hard_regno, basic_block save_bb)
+{
+  if (callee_save_covered_p (hard_regno, save_bb))
+    return 0;
+
+  int freq = REG_FREQ_FROM_BB (save_bb);
+
+  for (basic_block bb : callee_save_bbs[hard_regno])
+    if (dominated_by_p (CDI_DOMINATORS, bb, save_bb))
+      freq -= REG_FREQ_FROM_BB (bb);
+  return MAX (freq, 0);
+}
+
+/* Return the cost of the extra saves and restores of already allocated
+   callee-saved registers that are needed for HARD_REGNO to hold a value of
+   MODE that is live below SAVE_BB.  The cost is nonzero when the registers'
+   earlier users only require them to be saved in colder or unrelated parts of
+   the function.  */
+
+static int
+callee_save_extra_cost (int hard_regno, machine_mode mode, basic_block save_bb)
+{
+  int nregs = hard_regno_nregs (hard_regno, mode);
+  enum reg_class rclass = REGNO_REG_CLASS (hard_regno);
+  const HARD_REG_SET no_saves = {};
+  int cost = 0;
+
+  if (!regno_save_bb.exists ())
+    return 0;
+
+  for (int i = 0; i < nregs; i++)
+    {
+      int regno = hard_regno + i;
+      int freq;
+
+      if (!TEST_HARD_REG_BIT (allocated_callee_save_regs, regno)
+	  || (freq = callee_save_extra_freq (regno, save_bb)) == 0)
+	continue;
+
+      /* Pass an empty set of saved registers, which prices the save and the
+	 restore as a separate store and load.  Passing the registers saved in
+	 the prologue would let the target price them as sharing instructions
+	 with other saves there, which is unlikely for a save that
+	 shrink-wrapping places elsewhere.  */
+      int save_cost = targetm.callee_save_cost
+	(spill_cost_type::SAVE, regno, mode, 1,
+	 ira_memory_move_cost[mode][rclass][0] / nregs, no_saves, true);
+      /* Apply the same bias that assign_hard_reg gives to the save of a
+	 callee-saved register that nothing uses yet.  Otherwise the bias
+	 makes that register cheaper than one that is only saved in an
+	 unrelated part of the function, even though both need a save of
+	 their own, and every such part gets its own registers and frame
+	 slots.  */
+      if (save_cost > 1)
+	save_cost -= 1;
+      cost += freq * save_cost;
+      cost += freq * targetm.callee_save_cost
+	(spill_cost_type::RESTORE, regno, mode, 1,
+	 ira_memory_move_cost[mode][rclass][1] / nregs, no_saves, true);
+    }
+  return cost;
+}
+
+/* Record that we have allocated NREGS registers starting at HARD_REGNO to an
+   allocno that needs callee-saved registers to be saved in SAVE_BB.  */
 
 static void
-record_allocation (int hard_regno, int nregs)
+record_allocation (int hard_regno, int nregs, basic_block save_bb)
 {
   for (int i = 0; i < nregs; ++i)
-    if (!allocated_hardreg_p[hard_regno + i])
-      {
-	allocated_hardreg_p[hard_regno + i] = true;
-	if (!crtl->abi->clobbers_full_reg_p (hard_regno + i))
-	  SET_HARD_REG_BIT (allocated_callee_save_regs, hard_regno + i);
-      }
+    {
+      int regno = hard_regno + i;
+
+      if (!allocated_hardreg_p[regno])
+	{
+	  allocated_hardreg_p[regno] = true;
+	  if (!crtl->abi->clobbers_full_reg_p (regno))
+	    SET_HARD_REG_BIT (allocated_callee_save_regs, regno);
+	}
+
+      /* Only skip a save that an existing one already covers.  A save that
+	 dominates existing saves replaces them even when it adds nothing to
+	 their frequency, since a later user that only the new save covers
+	 would otherwise be charged for a save of its own.  */
+      if (!regno_save_bb.exists ()
+	  || !TEST_HARD_REG_BIT (allocated_callee_save_regs, regno)
+	  || callee_save_covered_p (regno, save_bb))
+	continue;
+
+      /* Drop the saves that the new one makes redundant.  */
+      unsigned int j = 0;
+      while (j < callee_save_bbs[regno].length ())
+	if (dominated_by_p (CDI_DOMINATORS, callee_save_bbs[regno][j], save_bb))
+	  callee_save_bbs[regno].unordered_remove (j);
+	else
+	  j++;
+      callee_save_bbs[regno].safe_push (save_bb);
+    }
 }
 
 /* Return number of registers needed to be saved and restored at
@@ -1821,21 +2026,33 @@ calculate_saved_nregs (int hard_regno, machine_mode mode)
 }
 
 /* Return the cost of saving and restoring SAVED_NREGS callee-saved
-   registers in the prologue and epilogue if we allocate HARD_REGNO to
-   hold a value of MODE, given the callee-saved registers allocated so
-   far.  The cost is TARGET_CALLEE_SAVE_COST weighted by the entry and
-   exit block frequencies.  */
+   registers if we allocate HARD_REGNO to hold a value of MODE, given the
+   callee-saved registers allocated so far.  The registers are saved in
+   SAVE_BB, which is the entry block unless they can be shrink-wrapped
+   separately, and restored at the matching exits.  The cost is
+   TARGET_CALLEE_SAVE_COST weighted by the frequencies of those blocks.  */
 static int
-calculate_saved_regs_cost (int hard_regno, machine_mode mode, int saved_nregs)
+calculate_saved_regs_cost (int hard_regno, machine_mode mode, int saved_nregs,
+			   basic_block save_bb)
 {
   int nregs = hard_regno_nregs (hard_regno, mode);
   enum reg_class rclass = REGNO_REG_CLASS (hard_regno);
   bool existing_spills_p = allocated_memory_p || caller_save_needed;
+  int entry_freq = REG_FREQ_FROM_BB (ENTRY_BLOCK_PTR_FOR_FN (cfun));
+  int exit_freq = REG_FREQ_FROM_BB (EXIT_BLOCK_PTR_FOR_FN (cfun));
+  int save_freq = REG_FREQ_FROM_BB (save_bb);
+  /* The restores matching a save in SAVE_BB run at most as often as SAVE_BB,
+     but a register saved in the prologue is restored in the epilogue, whose
+     frequency an inconsistent profile can put above the entry frequency.  */
+  int restore_freq = (save_bb == ENTRY_BLOCK_PTR_FOR_FN (cfun)
+		      ? exit_freq : MIN (exit_freq, save_freq));
+  /* The callee-saved registers that a save in SAVE_BB can pair with.  */
+  HARD_REG_SET save_bb_regs = callee_saves_in_bb (save_bb);
 
   auto entry_cost = targetm.callee_save_cost
     (spill_cost_type::SAVE, hard_regno, mode, saved_nregs,
      ira_memory_move_cost[mode][rclass][0] * saved_nregs / nregs,
-     allocated_callee_save_regs, existing_spills_p);
+     save_bb_regs, existing_spills_p);
   /* In the event of a tie between caller-save and callee-save,
      prefer callee-save.  We apply this to the entry cost rather
      than the exit cost since the entry frequency must be at
@@ -1846,10 +2063,10 @@ calculate_saved_regs_cost (int hard_regno, machine_mode mode, int saved_nregs)
   auto exit_cost = targetm.callee_save_cost
     (spill_cost_type::RESTORE, hard_regno, mode, saved_nregs,
      ira_memory_move_cost[mode][rclass][1] * saved_nregs / nregs,
-     allocated_callee_save_regs, existing_spills_p);
+     save_bb_regs, existing_spills_p);
 
-  return (entry_cost * REG_FREQ_FROM_BB (ENTRY_BLOCK_PTR_FOR_FN (cfun))
-	  + exit_cost * REG_FREQ_FROM_BB (EXIT_BLOCK_PTR_FOR_FN (cfun)));
+  return (entry_cost * MIN (entry_freq, save_freq)
+	  + exit_cost * restore_freq);
 }
 
 /* Allocnos A1 and A2 are known to conflict.  Check whether, in some loop L
@@ -2056,6 +2273,7 @@ assign_hard_reg (ira_allocno_t a, bool retry_p)
   HARD_REG_SET soft_conflict_regs = {};
   int entry_freq = REG_FREQ_FROM_BB (ENTRY_BLOCK_PTR_FOR_FN (cfun));
   int exit_freq = REG_FREQ_FROM_BB (EXIT_BLOCK_PTR_FOR_FN (cfun));
+  basic_block save_bb = allocno_save_bb (a);
   int spill_cost = 0;
   /* Whether we have spilled pseudos or used caller-saved registers for values
      that are live across a call.  */
@@ -2290,13 +2508,21 @@ assign_hard_reg (ira_allocno_t a, bool retry_p)
 	{
 	  if ((saved_nregs = calculate_saved_nregs (hard_regno, mode)) != 0)
 	  /* We need to save/restore the hard register in
-	     epilogue/prologue.  Therefore we increase the cost.  */
+	     epilogue/prologue, or in SAVE_BB and at the matching exits when
+	     the register can be shrink-wrapped separately.  Therefore we
+	     increase the cost.  */
 	  {
 	    add_cost = calculate_saved_regs_cost (hard_regno, mode,
-						  saved_nregs);
+						  saved_nregs, save_bb);
 	    cost += add_cost;
 	    full_cost += add_cost;
 	  }
+
+	  /* A register that's already used by colder code is saved more often
+	     once A uses it as well.  */
+	  add_cost = callee_save_extra_cost (hard_regno, mode, save_bb);
+	  cost += add_cost;
+	  full_cost += add_cost;
 	}
       if (ira_need_caller_save_p (a, hard_regno))
 	{
@@ -2330,7 +2556,7 @@ assign_hard_reg (ira_allocno_t a, bool retry_p)
   if (best_hard_regno >= 0)
     {
       record_allocation (best_hard_regno,
-			 hard_regno_nregs (best_hard_regno, mode));
+			 hard_regno_nregs (best_hard_regno, mode), save_bb);
       spill_soft_conflicts (a, allocnos_to_spill, soft_conflict_regs,
 			    best_hard_regno);
     }
@@ -3344,10 +3570,17 @@ improve_allocation (void)
 	  if ((saved_nregs = calculate_saved_nregs (hregno, mode)) != 0)
 	  {
 	    /* We need to save/restore the hard register in
-	       epilogue/prologue.  Therefore we increase the cost.  */
-	    add_cost = calculate_saved_regs_cost (hregno, mode, saved_nregs);
+	       epilogue/prologue.  Therefore we increase the cost.
+	       The frequency of the block where the save is expected to be
+	       placed is considered while computing the cost, which is the
+	       entry BB unless the register can be shrink-wrapped
+	       separately.  */
+	    add_cost = calculate_saved_regs_cost (hregno, mode, saved_nregs,
+						  allocno_save_bb (a));
 	    costs[hregno] += add_cost;
 	  }
+	  costs[hregno] += callee_save_extra_cost (hregno, mode,
+						   allocno_save_bb (a));
 
 	  costs[hregno] -= base_cost;
 	  if (costs[hregno] < 0)
@@ -3469,7 +3702,7 @@ improve_allocation (void)
       /* Assign the best chosen hard register to A.  */
       ALLOCNO_HARD_REGNO (a) = best;
 
-      record_allocation (best, nregs);
+      record_allocation (best, nregs, allocno_save_bb (a));
 
       if (internal_flag_ira_verbose > 2 && ira_dump_file != NULL)
 	fprintf (ira_dump_file, "Assigning %d to a%dr%d\n",
@@ -5300,9 +5533,14 @@ color (void)
   allocno_stack_vec.create (ira_allocnos_num);
   memset (allocated_hardreg_p, 0, sizeof (allocated_hardreg_p));
   CLEAR_HARD_REG_SET (allocated_callee_save_regs);
+  if (separate_shrink_wrap_p ())
+    regno_save_bb.safe_grow_cleared (max_reg_num (), true);
   ira_initiate_assign ();
   do_coloring ();
   ira_finish_assign ();
+  regno_save_bb.release ();
+  for (int i = 0; i < FIRST_PSEUDO_REGISTER; i++)
+    callee_save_bbs[i].release ();
   allocno_stack_vec.release ();
   move_spill_restore ();
 }
