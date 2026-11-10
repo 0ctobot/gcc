@@ -667,6 +667,13 @@ get_constraint_for_component_ref (tree t, vec<ce_s> *results,
 	  varinfo_t curr;
 	  results->pop ();
 	  cexpr.offset = 0;
+	  /* A variable index into an array that has no upper bound or at
+	     most one element, such as a [1] member that isn't the last one,
+	     can reach the fields that follow the array.  An address formed
+	     that way can then be used to access any of them, so it has to
+	     point to all of them rather than only to the first.  */
+	  bool all_fields_p
+	    = address_p && ref_indexes_short_array_p (orig_t, NULL_TREE);
 	  for (curr = get_varinfo (cexpr.var); curr; curr = vi_next (curr))
 	    {
 	      if (ranges_maybe_overlap_p (poly_int64 (curr->offset),
@@ -674,7 +681,7 @@ get_constraint_for_component_ref (tree t, vec<ce_s> *results,
 		{
 		  cexpr.var = curr->id;
 		  results->safe_push (cexpr);
-		  if (address_p)
+		  if (address_p && !all_fields_p)
 		    break;
 		}
 	    }
