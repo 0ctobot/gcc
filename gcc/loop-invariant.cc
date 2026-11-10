@@ -1128,6 +1128,25 @@ find_invariant_insn (rtx_insn *insn, bool always_reached, bool always_executed)
   if (!always_reached && asm_noperands (PATTERN (insn)) >= 0)
     return;
 
+  /* An asm with a "memory" clobber may read or write any memory through
+     the addresses in its register operands.  single_set skips the clobber,
+     and the checks above only look at the operands of SET, so they treat
+     such an asm as a pure function of its inputs.  Don't move it, since
+     the loop may store to the memory it reads or overwrite the memory it
+     writes.  */
+  if (GET_CODE (PATTERN (insn)) == PARALLEL
+      && asm_noperands (PATTERN (insn)) >= 0)
+    {
+      rtx pat = PATTERN (insn);
+      for (int i = 0; i < XVECLEN (pat, 0); i++)
+	{
+	  rtx x = XVECEXP (pat, 0, i);
+	  if ((GET_CODE (x) == CLOBBER || GET_CODE (x) == SET)
+	      && MEM_P (XEXP (x, 0)))
+	    return;
+	}
+    }
+
   depends_on = BITMAP_ALLOC (NULL);
   if (!check_dependencies (insn, depends_on))
     {
