@@ -6788,13 +6788,20 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
   (if (wi::popcount (wi::to_wide (@1)) == 1)
    @2))
 
-/* A clear bit version of the above: "if a bitmask is
-   set, clear it". In this case always clear the bitmask
-   (see PR 64567).  */
+/* A clear bit version of the above: "if a bitmask is set, clear it".  In this
+   case always clear the bitmask (see PR 64567).  The test may look at the value
+   through a conversion to a type no wider than its own, as happens when the
+   bits are tested by a helper returning int, in which case the bitmask is the
+   test's mask zero-extended to the value's type.  */
 (simplify
- (cond (ne (bit_and @0 INTEGER_CST@1) integer_zerop)
+ (cond (ne (bit_and (convert? @0) INTEGER_CST@1) integer_zerop)
        (bit_and@3 @0 INTEGER_CST@2) @0)
-  (if (wi::to_wide (@2) == ~wi::to_wide (@1))
+  (if (INTEGRAL_TYPE_P (type)
+       && INTEGRAL_TYPE_P (TREE_TYPE (@1))
+       && TYPE_PRECISION (TREE_TYPE (@1)) <= TYPE_PRECISION (type)
+       && wi::to_wide (@2) == ~wide_int::from (wi::to_wide (@1),
+					     TYPE_PRECISION (type),
+					     UNSIGNED))
    @3))
 
 /* PR124667: Similar to PR64567 above but with the bit given
@@ -6898,6 +6905,24 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
     (bit_and:c (rshift @0 @1) INTEGER_CST@2)
      @1)
   (bit_and @0 (lshift @2 @1)))
+
+/* A copy bit version of the above: "if a bit is set in A, set it in B".  Copy
+   the bit unconditionally, as B | (A & BIT).  As above, the test may look at A
+   through a conversion to a type no wider than A's.  This only works for a
+   single bit, since with a wider mask, any of its bits being set in A sets the
+   whole mask in B rather than just the bits that A has.  */
+(simplify
+ (cond (ne (bit_and (convert? @0) INTEGER_CST@1) integer_zerop)
+       (bit_ior @2 INTEGER_CST@3) @2)
+  (if (INTEGRAL_TYPE_P (type)
+       && INTEGRAL_TYPE_P (TREE_TYPE (@0))
+       && INTEGRAL_TYPE_P (TREE_TYPE (@1))
+       && TYPE_PRECISION (TREE_TYPE (@1)) <= TYPE_PRECISION (TREE_TYPE (@0))
+       && wi::popcount (wi::to_wide (@3)) == 1
+       && wi::popcount (wi::to_wide (@1)) == 1
+       && (wi::exact_log2 (wi::to_wide (@3))
+	   == wi::exact_log2 (wi::to_wide (@1))))
+   (bit_ior @2 (bit_and (convert @0) @3))))
 
 #if GIMPLE
 (match (nop_atomic_bit_test_and_p @0 @1 @4)
