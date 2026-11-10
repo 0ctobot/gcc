@@ -1618,7 +1618,28 @@ jump_table_cluster::emit (tree index_expr, tree,
   gimple_set_location (s, loc);
   gsi_insert_after (&gsi, s, GSI_NEW_STMT);
 
-  /* Set up even probabilities for all cases.  */
+  /* The share of the default probability that reaches this cluster.
+     emit_case_nodes stores it in m_default_prob.  When this cluster
+     handles the whole switch, everything that isn't a case goes to the
+     default.  */
+  profile_probability default_prob = m_default_prob;
+  if (!default_prob.initialized_p ())
+    default_prob = m_prob.invert ();
+
+  /* Keep the probabilities of the cases and the default when they're
+     known, normalized to their total.  Table slot counts say nothing
+     about how often each case runs, and they make the default the likely
+     destination of any sparse table even when the profile says it's
+     unlikely.  */
+  profile_probability total = default_prob;
+  bool use_profile = default_prob.initialized_p ();
+  for (unsigned i = 0; i < m_cases.length (); i++)
+    {
+      use_profile &= m_cases[i]->m_prob.initialized_p ();
+      total += m_cases[i]->m_prob;
+    }
+  use_profile &= total.nonzero_p ();
+
   for (unsigned i = 0; i < m_cases.length (); i++)
     {
       simple_cluster *sc = static_cast<simple_cluster *> (m_cases[i]);
@@ -1630,24 +1651,41 @@ jump_table_cluster::emit (tree index_expr, tree,
       /* case_edge->aux is number of values in a jump-table that are covered
 	 by the case_edge.  */
       case_edge->aux = (void *) ((intptr_t) (case_edge->aux) + case_range);
+      case_edge->probability = profile_probability::never ();
     }
 
   edge default_edge = gimple_switch_default_edge (cfun, s);
   default_edge->probability = profile_probability::never ();
 
-  for (unsigned i = 0; i < m_cases.length (); i++)
+  if (use_profile)
     {
-      simple_cluster *sc = static_cast<simple_cluster *> (m_cases[i]);
-      edge case_edge = find_edge (case_bb, sc->m_case_bb);
-      case_edge->probability
-	= profile_probability::always ().apply_scale ((intptr_t)case_edge->aux,
-						      range);
+      /* Several cases can share an edge, so accumulate.  */
+      for (unsigned i = 0; i < m_cases.length (); i++)
+	{
+	  simple_cluster *sc = static_cast<simple_cluster *> (m_cases[i]);
+	  edge case_edge = find_edge (case_bb, sc->m_case_bb);
+	  case_edge->probability += sc->m_prob / total;
+	}
+      default_edge->probability += default_prob / total;
     }
+  else
+    {
+      /* Without a profile, fall back to even probabilities for all table
+	 slots.  */
+      for (unsigned i = 0; i < m_cases.length (); i++)
+	{
+	  simple_cluster *sc = static_cast<simple_cluster *> (m_cases[i]);
+	  edge case_edge = find_edge (case_bb, sc->m_case_bb);
+	  case_edge->probability
+	    = profile_probability::always ().apply_scale
+		((intptr_t) case_edge->aux, range);
+	}
 
-  /* Number of non-default values is probability of default edge.  */
-  default_edge->probability
-    += profile_probability::always ().apply_scale (nondefault_range,
-						   range).invert ();
+      /* Number of non-default values is probability of default edge.  */
+      default_edge->probability
+	+= profile_probability::always ().apply_scale (nondefault_range,
+						       range).invert ();
+    }
 
   switch_decision_tree::reset_out_edges_aux (s);
 }
@@ -2866,8 +2904,10 @@ switch_decision_tree::emit_case_nodes (basic_block bb, tree index,
 
 	  default_prob /= parts;
 	  node->m_c->m_subtree_prob -= right_prob;
-	  if (is_bt)
-	    node->m_c->m_default_prob = default_prob;
+	  /* Bit tests and jump tables use this share of the default
+	     probability for the values inside their range that aren't
+	     cases.  */
+	  node->m_c->m_default_prob = default_prob;
 
 	   /* Value belongs to this node or to the left-hand subtree.  */
 	   p = node->m_c->m_prob / (node->m_c->m_subtree_prob + default_prob);
