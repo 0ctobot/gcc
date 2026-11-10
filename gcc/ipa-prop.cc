@@ -4291,8 +4291,18 @@ find_constructor_constant_at_offset (tree constructor, HOST_WIDE_INT req_offset)
 	return NULL;
 
       if (TREE_CODE (val) == CONSTRUCTOR)
-	return find_constructor_constant_at_offset (val,
-						    req_offset - elt_offset);
+	{
+	  /* Only look into the element that contains REQ_OFFSET.  The first
+	     aggregate element that starts at or before REQ_OFFSET can end
+	     before it, in which case the constant is in a later element.  */
+	  tree elt_size = TYPE_SIZE (TREE_TYPE (val));
+	  if (elt_size
+	      && tree_fits_shwi_p (elt_size)
+	      && req_offset - elt_offset >= tree_to_shwi (elt_size))
+	    continue;
+	  return find_constructor_constant_at_offset (val,
+						      req_offset - elt_offset);
+	}
 
       if (elt_offset == req_offset
 	  && is_gimple_reg_type (TREE_TYPE (val))
