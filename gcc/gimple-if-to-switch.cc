@@ -444,6 +444,15 @@ find_conditions (basic_block bb,
 	    || info->m_ranges[i].in_p != in_p)
 	  goto exit;
 
+      /* A BIT_IOR_EXPR of two range tests can only become case ranges when
+	 both tests are "EXPR in range".  The union of the ranges then takes
+	 the true edge and everything else takes the false edge.  With two
+	 "EXPR not in range" tests, the condition is false only on the
+	 intersection of the ranges, not on their union, so sending both
+	 ranges to the false edge would be wrong code.  */
+      if (info->m_ranges.length () > 1 && !in_p)
+	goto exit;
+
       info->record_phi_mapping (info->m_true_edge,
 				&info->m_true_edge_phi_mapping);
       info->record_phi_mapping (info->m_false_edge,
