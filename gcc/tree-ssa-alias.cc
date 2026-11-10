@@ -1618,7 +1618,7 @@ nonoverlapping_array_refs_p (tree ref1, tree ref2)
    structure that contains the array, and different FIELD_DECLs on the two
    paths prove nothing.  */
 
-static bool
+bool
 ref_indexes_short_array_p (tree ref, tree stop)
 {
   for (; handled_component_p (ref) && ref != stop;
