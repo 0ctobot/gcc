@@ -131,6 +131,7 @@ extern bool ptrs_compare_unequal (tree, tree);
 extern bool ref_may_alias_global_p (tree, bool);
 extern bool ref_may_alias_global_p (ao_ref *, bool);
 extern bool refs_may_alias_p (tree, tree, bool = true);
+extern bool ref_indexes_short_array_p (tree, tree);
 extern bool refs_may_alias_p_1 (ao_ref *, ao_ref *, bool);
 extern bool refs_anti_dependent_p (tree, tree);
 extern bool refs_output_dependent_p (tree, tree);
