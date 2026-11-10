@@ -2232,7 +2232,10 @@ simplify_builtin_memcpy_memset (gimple_stmt_iterator *gsi_p, gcall *stmt2)
 	 assignment.  */
       ptr1 = gimple_assign_lhs (stmt1);
       src1 = gimple_assign_rhs1 (stmt1);
+      /* A volatile byte store can't be folded into a plain string copy,
+	 which may write it in a wider access or not at all.  */
       if (TREE_CODE (ptr1) != MEM_REF
+	  || gimple_has_volatile_ops (stmt1)
 	  || TYPE_MODE (TREE_TYPE (ptr1)) != TYPE_MODE (char_type_node)
 	  || !tree_fits_shwi_p (src1))
 	return false;
