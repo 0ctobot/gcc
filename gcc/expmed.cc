@@ -1140,6 +1140,23 @@ store_integral_bit_field (rtx op0, opt_scalar_int_mode op0_mode,
       rtx xop0 = adjust_bit_field_mem_for_reg (EP_insv, op0, bitsize, bitnum,
 					       bitregion_start, bitregion_end,
 					       fieldmode, &bitpos);
+
+      /* Don't load a volatile XOP0 that the field covers completely, since
+	 none of its bits need to be preserved and the load can't be deleted
+	 later.  Store the field straight into XOP0 instead, which keeps the
+	 access width chosen above even when XOP0 is less aligned than its
+	 mode.  */
+      if (xop0
+	  && MEM_VOLATILE_P (xop0)
+	  && bitpos == 0
+	  && known_eq (GET_MODE_BITSIZE (GET_MODE (xop0)), bitsize))
+	{
+	  scalar_int_mode xmode = as_a <scalar_int_mode> (GET_MODE (xop0));
+	  store_fixed_bit_field_1 (xop0, xmode, bitsize, 0, value, value_mode,
+				   false);
+	  return true;
+	}
+
       if (xop0)
 	{
 	  rtx tempreg = copy_to_reg (xop0);
