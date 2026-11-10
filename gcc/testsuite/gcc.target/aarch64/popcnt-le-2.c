@@ -1,9 +1,13 @@
 /* { dg-do compile } */
 /* { dg-options "-O2 -mgeneral-regs-only -fdump-tree-optimized" } */
-/* { dg-final { scan-tree-dump-not "POPCOUNT \\\(" "optimized" } } */
+/* { dg-final { scan-tree-dump-times {\.POPCOUNT \([^,]+, -1\)} 2 "optimized" } } */
 /* { dg-final { scan-tree-dump-not "__builtin_popcount \\\(" "optimized" } } */
 /* { dg-final { check-function-bodies "**" "" } } */
 /* PR middle-end/90693 */
+
+/* -mgeneral-regs-only has a popcount expansion in the general registers,
+   so the comparisons reach expand_POPCOUNT as .POPCOUNT (a, -1) rather
+   than being rewritten in gimple.  */
 
 #pragma GCC target "+nocssc"
 
