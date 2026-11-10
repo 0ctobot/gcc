@@ -930,6 +930,33 @@ visit_bb (basic_block bb, basic_block return_bb,
 			       "Cannot split: builtin_eh_pointer.\n");
 		    can_split = false;
 		    break;
+		  /* These read the frame of the function executing them.  The
+		     split part runs in a frame of its own, called from the
+		     header, so in the part they would report the header's
+		     frame and an address inside the header instead of the
+		     original function's frame and caller.  The header may
+		     keep them, since it runs in the original frame (or in
+		     the caller's when it's inlined, which is what inlining
+		     the whole function would give).  A call whose result is
+		     never used reads nothing and can go anywhere; inlined
+		     logging stubs that ignore a return address passed to them
+		     leave such calls behind.  */
+		  case BUILT_IN_RETURN_ADDRESS:
+		  case BUILT_IN_FRAME_ADDRESS:
+		  case BUILT_IN_STACK_ADDRESS:
+		  case BUILT_IN_DWARF_CFA:
+		    {
+		      tree lhs = gimple_call_lhs (stmt);
+		      if (!lhs
+			  || (TREE_CODE (lhs) == SSA_NAME
+			      && has_zero_uses (lhs)))
+			break;
+		    }
+		    if (dump_file && (dump_flags & TDF_DETAILS))
+		      fprintf (dump_file,
+			       "Cannot split: builtin reading the frame.\n");
+		    can_split = false;
+		    break;
 		  default:
 		    break;
 		  }
