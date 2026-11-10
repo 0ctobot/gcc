@@ -2907,7 +2907,8 @@ find_func_clobbers (struct function *fn, gimple *origt)
 	}
 
       /* For callees without function info (that's external functions),
-	 ESCAPED is clobbered and used.  */
+	 ESCAPED is clobbered and used, and so is what the functions they
+	 can call back use and clobber.  */
       if (cfi->decl
 	  && TREE_CODE (cfi->decl) == FUNCTION_DECL
 	  && !cfi->is_fn_info)
@@ -2915,9 +2916,15 @@ find_func_clobbers (struct function *fn, gimple *origt)
 	  varinfo_t vi;
 
 	  if (gimple_vdef (t))
-	    make_copy_constraint (first_vi_for_offset (fi, fi_clobbers),
-				  escaped_id);
+	    {
+	      make_copy_constraint (first_vi_for_offset (fi, fi_clobbers),
+				    escaped_id);
+	      make_constraint_from (first_vi_for_offset (fi, fi_clobbers),
+				    ipa_callback_marker->id);
+	    }
 	  make_copy_constraint (first_vi_for_offset (fi, fi_uses), escaped_id);
+	  make_constraint_from (first_vi_for_offset (fi, fi_uses),
+				ipa_callback_marker->id);
 
 	  /* Also honor the call statement use/clobber info.  */
 	  if ((vi = lookup_call_clobber_vi (call_stmt)) != NULL)
@@ -2941,6 +2948,19 @@ find_func_clobbers (struct function *fn, gimple *origt)
       lhs = get_function_part_constraint (fi, fi_uses);
       rhs = get_function_part_constraint (cfi, fi_uses);
       process_constraint (new_constraint (lhs, rhs));
+
+      /* An indirect call can reach a function outside of the partition,
+	 which can call back into the partition just like a direct call to
+	 an external function can.  The callees aren't known until the
+	 points-to sets are solved, so assume the worst.  */
+      if (!cfi->is_fn_info)
+	{
+	  if (gimple_vdef (t))
+	    make_constraint_from (first_vi_for_offset (fi, fi_clobbers),
+				  ipa_callback_marker->id);
+	  make_constraint_from (first_vi_for_offset (fi, fi_uses),
+				ipa_callback_marker->id);
+	}
     }
   else if (gimple_code (t) == GIMPLE_ASM)
     {
@@ -3734,7 +3754,16 @@ create_variable_info_for (tree decl, const char *name, bool add_id)
 	  /* While we can in theory walk references for the varpool
 	     node that does not cover zero-initialization or references
 	     to the constant pool.  */
-	  if (DECL_INITIAL (decl))
+	  tree init = DECL_INITIAL (decl);
+	  /* In an LTRANS unit the initializer of a variable defined in the
+	     partition is only read in on demand.  */
+	  if (init == error_mark_node
+	      && vnode
+	      && vnode->definition
+	      && !vnode->alias
+	      && !vnode->body_removed)
+	    init = vnode->get_constructor ();
+	  if (init)
 	    {
 	      auto_vec<ce_s> rhsc;
 	      struct constraint_expr lhs, *rhsp;
@@ -3742,7 +3771,7 @@ create_variable_info_for (tree decl, const char *name, bool add_id)
 	      lhs.var = vi->id;
 	      lhs.offset = 0;
 	      lhs.type = SCALAR;
-	      get_constraint_for (DECL_INITIAL (decl), &rhsc);
+	      get_constraint_for (init, &rhsc);
 	      FOR_EACH_VEC_ELT (rhsc, i, rhsp)
 		process_constraint (new_constraint (lhs, *rhsp));
 	      /* If this is a variable that escapes from the unit
@@ -4077,7 +4106,11 @@ make_function_info_opaque (varinfo_t fi)
   varinfo_t escaped = get_varinfo (escaped_id);
   for (varinfo_t part = vi_next (fi); part; part = vi_next (part))
     if (part->offset == fi_clobbers || part->offset == fi_uses)
-      make_copy_constraint (part, nonlocal_id);
+      {
+	make_copy_constraint (part, nonlocal_id);
+	/* The replacement can call back into this partition too.  */
+	make_constraint_from (part, ipa_callback_marker->id);
+      }
     else
       {
 	make_copy_constraint (escaped, part->id);
@@ -4106,6 +4139,41 @@ ipa_create_function_infos (void)
 {
   struct cgraph_node *node;
   unsigned int constr_count = constraints.length ();
+
+  /* A call that leaves the partition can call back into any function that
+     code outside of the partition can call, so it uses and clobbers what
+     those functions do, on top of ESCAPED.  Collect that in two sets which
+     only the use and clobber sets of such calls include.  Adding it to
+     ESCAPED instead would make the memory escape, which is a lot less
+     precise: a local whose address a callback can reach through a static
+     variable would then be considered reachable from any pointer that
+     points to escaped memory.  */
+  ipa_callback_uses = new_var_info (NULL_TREE, "CALLBACKUSED", false);
+  ipa_callback_clobbers = new_var_info (NULL_TREE, "CALLBACKCLOBBERED", false);
+  for (varinfo_t vi : { ipa_callback_uses, ipa_callback_clobbers })
+    {
+      vi->offset = 0;
+      vi->size = 1;
+      vi->fullsize = 1;
+      vi->is_full_var = true;
+      vi->is_reg_var = true;
+      vi->is_global_var = false;
+    }
+
+  /* The function infos of functions that make such calls don't include the
+     callback sets, since a function that calls such a function would then
+     get them in the clobber set of the call without the filter that
+     ipa_pta_execute applies to the use and clobber sets of the calls that
+     leave the partition.  The fi_uses and fi_clobbers parts point to
+     CALLBACKS instead, which tells ipa_pta_execute to add the filtered
+     callback sets to the calls of those functions as well.  */
+  ipa_callback_marker = new_var_info (NULL_TREE, "CALLBACKS", false);
+  ipa_callback_marker->offset = 0;
+  ipa_callback_marker->size = 1;
+  ipa_callback_marker->fullsize = 1;
+  ipa_callback_marker->is_full_var = true;
+  ipa_callback_marker->may_have_pointers = false;
+  ipa_callback_marker->is_global_var = false;
 
   FOR_EACH_DEFINED_FUNCTION (node)
     {
@@ -4140,6 +4208,13 @@ ipa_create_function_infos (void)
       vi = create_function_info_for (node->decl,
 				     alias_get_name (node->decl), false,
 				     nonlocal_p, opaque_p);
+      if (nonlocal_p)
+	{
+	  make_copy_constraint (ipa_callback_uses,
+				first_vi_for_offset (vi, fi_uses)->id);
+	  make_copy_constraint (ipa_callback_clobbers,
+				first_vi_for_offset (vi, fi_clobbers)->id);
+	}
       if (opaque_p)
 	make_function_info_opaque (vi);
       if (dump_file && (dump_flags & TDF_DETAILS)
@@ -4205,6 +4280,10 @@ ipa_create_global_variable_infos (void)
 
 
 namespace pointer_analysis {
+
+varinfo_t ipa_callback_uses;
+varinfo_t ipa_callback_clobbers;
+varinfo_t ipa_callback_marker;
 
 /* Find the variable info for tree T in VI_FOR_TREE.  If T does not
    exist in the map, return NULL, otherwise, return the varinfo we found.  */

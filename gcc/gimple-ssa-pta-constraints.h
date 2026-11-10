@@ -28,6 +28,16 @@ varinfo_t lookup_call_use_vi (gcall *);
 varinfo_t lookup_call_clobber_vi (gcall *);
 varinfo_t get_fi_for_callee (gcall *);
 
+/* In IPA mode, the union of what the functions that code outside of the
+   partition can call use and clobber.  */
+extern varinfo_t ipa_callback_uses;
+extern varinfo_t ipa_callback_clobbers;
+
+/* In IPA mode, the variable that the use and clobber parts of a function
+   info point to when the function can leave the partition, directly or
+   through its callees.  */
+extern varinfo_t ipa_callback_marker;
+
 void init_constraint_builder (void);
 void delete_constraint_builder (void);
 void intra_build_constraints (void);
