@@ -24,7 +24,7 @@
 
 static const struct cpu_regmove_cost neoversen3_regmove_cost =
 {
-  3, /* GP2GP  */
+  1, /* GP2GP  */
   /* Spilling to int<->fp instead of memory is recommended so set
      realistic costs compared to memmov_cost.  */
   5, /* GP2FP  */
