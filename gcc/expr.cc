@@ -5516,20 +5516,17 @@ emit_push_insn (rtx x, machine_mode mode, tree type, rtx size,
 
 	  /* If source is a constant VAR_DECL with a simple constructor,
              store the constructor to the stack instead of moving it.  */
-	  const_tree decl;
+	  tree decl, ctor;
 	  HOST_WIDE_INT sz;
 	  if (partial == 0
 	      && MEM_P (xinner)
 	      && SYMBOL_REF_P (XEXP (xinner, 0))
 	      && (decl = SYMBOL_REF_DECL (XEXP (xinner, 0))) != NULL_TREE
-	      && VAR_P (decl)
-	      && TREE_READONLY (decl)
-	      && !TREE_SIDE_EFFECTS (decl)
-	      && immediate_const_ctor_p (DECL_INITIAL (decl), 2)
-	      && (sz = int_expr_size (DECL_INITIAL (decl))) > 0
+	      && (ctor = immediate_const_decl_ctor (decl, 2)) != NULL_TREE
+	      && (sz = int_expr_size (ctor)) > 0
 	      && CONST_INT_P (size)
 	      && INTVAL (size) == sz)
-	    store_constructor (DECL_INITIAL (decl), target, 0, sz, false);
+	    store_constructor (ctor, target, 0, sz, false);
 	  else
 	    emit_block_move (target, xinner, size, BLOCK_OP_CALL_PARM);
 	}
@@ -7380,6 +7377,32 @@ immediate_const_ctor_p (const_tree ctor, unsigned int words)
 	 && TREE_CODE (TREE_TYPE (ctor)) != ARRAY_TYPE
 	 && int_expr_size (ctor) <= words * UNITS_PER_WORD
 	 && initializer_constant_valid_for_bitfield_p (ctor);
+}
+
+/* Return DECL_INITIAL of the read-only variable DECL if immediate_const_ctor_p
+   accepts it with WORDS and it's known to be DECL's value, otherwise return
+   NULL_TREE.  A weak definition's initializer isn't necessarily the value the
+   program sees, since a strong definition from another translation unit can
+   replace it at link time.  ctor_for_folding knows when an initializer can be
+   trusted, so require it to agree with DECL_INITIAL.
+
+   Check DECL_INITIAL before calling ctor_for_folding, and don't use what it
+   returns in place of DECL_INITIAL.  In LTO, ctor_for_folding streams in a
+   constructor that hasn't been read yet, which also sets DECL_INITIAL, and for
+   an alias it returns the target's initializer.  Either would change the code
+   for variables that aren't weak.  */
+
+tree
+immediate_const_decl_ctor (tree decl, unsigned int words)
+{
+  if (!VAR_P (decl) || !TREE_READONLY (decl) || TREE_SIDE_EFFECTS (decl))
+    return NULL_TREE;
+
+  tree ctor = DECL_INITIAL (decl);
+  if (!immediate_const_ctor_p (ctor, words) || ctor_for_folding (decl) != ctor)
+    return NULL_TREE;
+
+  return ctor;
 }
 
 /* TYPE is initialized by a constructor with NUM_ELTS elements, the last
@@ -11742,18 +11765,18 @@ expand_expr_real_1 (tree exp, rtx target, machine_mode tmode,
 	}
       /* Expand const VAR_DECLs with CONSTRUCTOR initializers that
 	 have scalar integer modes to a reg via store_constructor.  */
-      if (TREE_READONLY (exp)
-	  && !TREE_SIDE_EFFECTS (exp)
-	  && (modifier == EXPAND_NORMAL || modifier == EXPAND_STACK_PARM)
-	  && immediate_const_ctor_p (DECL_INITIAL (exp))
+      if ((modifier == EXPAND_NORMAL || modifier == EXPAND_STACK_PARM)
 	  && SCALAR_INT_MODE_P (TYPE_MODE (TREE_TYPE (exp)))
 	  && crtl->emit.regno_pointer_align_length
 	  && !target)
 	{
-	  target = gen_reg_rtx (TYPE_MODE (TREE_TYPE (exp)));
-	  store_constructor (DECL_INITIAL (exp), target, 0,
-			     int_expr_size (DECL_INITIAL (exp)), false);
-	  return target;
+	  tree ctor = immediate_const_decl_ctor (exp);
+	  if (ctor)
+	    {
+	      target = gen_reg_rtx (TYPE_MODE (TREE_TYPE (exp)));
+	      store_constructor (ctor, target, 0, int_expr_size (ctor), false);
+	      return target;
+	    }
 	}
       /* ... fall through ...  */
 

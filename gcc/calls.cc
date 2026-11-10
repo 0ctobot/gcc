@@ -2166,6 +2166,7 @@ load_register_parameters (struct arg_data *args, int num_actuals,
 	  rtx_insn *before_arg = get_last_insn ();
 	  tree tree_value = args[i].tree_value;
 	  tree type = TREE_TYPE (tree_value);
+	  tree ctor;
 	  if (RECORD_OR_UNION_TYPE_P (type) && TYPE_TRANSPARENT_AGGR (type))
 	    type = TREE_TYPE (first_field (type));
 	  /* Set non-negative if we must move a word at a time, even if
@@ -2249,15 +2250,12 @@ load_register_parameters (struct arg_data *args, int num_actuals,
 	  else if (nregs == 1
 		   && partial == 0
 		   && !args[i].pass_on_stack
-		   && VAR_P (tree_value)
-		   && TREE_READONLY (tree_value)
-		   && !TREE_SIDE_EFFECTS (tree_value)
-		   && immediate_const_ctor_p (DECL_INITIAL (tree_value)))
+		   && ((ctor = immediate_const_decl_ctor (tree_value))
+		       != NULL_TREE))
 	    {
-	      HOST_WIDE_INT size = int_expr_size (DECL_INITIAL (tree_value));
+	      HOST_WIDE_INT size = int_expr_size (ctor);
 	      rtx target = gen_reg_rtx (word_mode);
-	      store_constructor (DECL_INITIAL (tree_value), target, 0,
-				 size, false);
+	      store_constructor (ctor, target, 0, size, false);
 	      /* On big-endian targets, store_constructor places fields
 		 from the MSB, which places any padding bits in the least
 		 significant bytes.  If required, use a logical right shift
