@@ -2729,6 +2729,130 @@ reinit_possible_p (tree decl)
   return !place || last_jump > *place;
 }
 
+/* Walk state for find_self_read_r.  */
+
+struct self_read_walk
+{
+  tree decl;
+  hash_set<tree> visited;
+  /* Whether the initializer takes the address of the variable, or a nested
+     function refers to the variable.  */
+  bool addr_taken;
+  /* Whether the initializer has something that can read memory through a
+     pointer.  */
+  bool ptr_read;
+};
+
+/* Callback for walk_tree from init_reads_decl_p.  DATA is the walk state.  */
+
+static tree
+find_self_read_r (tree *tp, int *walk_subtrees, void *data)
+{
+  auto w = static_cast<self_read_walk *> (data);
+  tree t = *tp;
+
+  if (t == w->decl)
+    return t;
+
+  switch (TREE_CODE (t))
+    {
+    case ADDR_EXPR:
+      {
+	/* Taking the address of the variable doesn't read it, but the
+	   indices of an element whose address gets taken can.  */
+	tree op = TREE_OPERAND (t, 0);
+	tree base = op;
+	while (handled_component_p (base))
+	  base = TREE_OPERAND (base, 0);
+	if (base != w->decl)
+	  break;
+	w->addr_taken = true;
+	*walk_subtrees = 0;
+	for (; handled_component_p (op); op = TREE_OPERAND (op, 0))
+	  for (int i = 1; i < TREE_OPERAND_LENGTH (op); i++)
+	    if (TREE_OPERAND (op, i)
+		&& walk_tree (&TREE_OPERAND (op, i), find_self_read_r, data,
+			      &w->visited))
+	      return t;
+	break;
+      }
+
+    case INDIRECT_REF:
+    case MEM_REF:
+    case VA_ARG_EXPR:
+    case ASM_EXPR:
+      w->ptr_read = true;
+      break;
+
+    case CALL_EXPR:
+      if (!(call_expr_flags (t) & ECF_CONST))
+	w->ptr_read = true;
+      break;
+
+    case DECL_EXPR:
+      /* See find_reinit_read_r.  */
+      if (VAR_P (DECL_EXPR_DECL (t)))
+	return walk_tree (&DECL_INITIAL (DECL_EXPR_DECL (t)),
+			  find_self_read_r, data, &w->visited);
+      break;
+
+    default:
+      break;
+    }
+
+  return NULL_TREE;
+}
+
+/* Return true if INIT, the initializer of DECL, can read DECL before anything
+   has been stored to it.  That's either a read by name, as in "int x = x;",
+   which used to be a common way to silence a -Wmaybe-uninitialized warning,
+   or a read through the address of DECL taken in INIT itself.  Code outside
+   of INIT can only have that address by then when a goto or a case label
+   skipped the declaration and code below it took the address, which isn't
+   counted here.  A GNU C nested function that refers to DECL doesn't need
+   that address, though, since it reaches DECL through its static chain
+   whenever it's called, so count DECL as having its address taken then.  */
+
+static bool
+init_reads_decl_p (tree decl, tree init)
+{
+  self_read_walk w;
+  w.decl = decl;
+  w.addr_taken = DECL_NONLOCAL (decl);
+  w.ptr_read = false;
+  if (walk_tree (&init, find_self_read_r, &w, &w.visited))
+    return true;
+  return w.addr_taken && w.ptr_read;
+}
+
+/* Add the automatic initialization of DECL ahead of an initializer that reads
+   DECL to *SEQ_P, limited to the first run of the initializer by the flag of
+   reinit_auto_init when FIRST_RUN_ONLY.
+
+   Unless -Winit-self is enabled, the front end turns off -Wuninitialized for
+   a self-initialized DECL such as "int x = x;".  The uninit pass checks that
+   on DECL, but once DECL is gone and its value only lives in the result of
+   .DEFERRED_INIT, it checks the call instead.  A DECL that isn't a register
+   when it's gimplified gets that result in a temporary first, which is all
+   that's left of DECL after its address is folded away, so carry the
+   suppression over to the call.  */
+
+static void
+add_self_read_auto_init (tree decl, bool first_run_only, gimple_seq *seq_p)
+{
+  gimple_seq seq = NULL;
+  if (first_run_only)
+    reinit_auto_init (decl, &seq);
+  else
+    gimple_add_init_for_auto_var (decl, flag_auto_var_init, &seq);
+  if (warning_suppressed_p (decl, OPT_Wuninitialized))
+    for (gimple_stmt_iterator gsi = gsi_start (seq); !gsi_end_p (gsi);
+	 gsi_next (&gsi))
+      if (gimple_call_internal_p (gsi_stmt (gsi), IFN_DEFERRED_INIT))
+	suppress_warning (gsi_stmt (gsi), OPT_Wuninitialized);
+  gimplify_seq_add_seq (seq_p, seq);
+}
+
 /* Gimplify a DECL_EXPR node *STMT_P by making any necessary allocation
    and initialization explicit.  */
 
@@ -2832,6 +2956,14 @@ gimplify_decl_expr (tree *stmt_p, gimple_seq *seq_p)
 		 function reads through its static chain.  */
 	      tree old_reinit_decl = gimplify_ctxp->reinit_decl;
 	      bool clear_padding = false;
+	      /* An initializer that reads DECL itself sees whatever the stack
+		 held, so DECL needs the automatic initialization that it would
+		 get without an initializer before the initializer runs, unless
+		 DECL can hold a value by then.  */
+	      bool auto_init_first = var_needs_auto_init_p (decl)
+				     && !decl_had_value_expr_p
+				     && init_reads_decl_p (decl, init)
+				     && !value_before_decl_p (decl);
 	      gimplify_ctxp->reinit_decl = NULL_TREE;
 	      if (reinit_possible_p (decl)
 		  && (lang_GNU_C () || lang_GNU_OBJC ()))
@@ -2849,14 +2981,29 @@ gimplify_decl_expr (tree *stmt_p, gimple_seq *seq_p)
 			  && !value_before_decl_p (decl)
 			  && var_needs_auto_init_p (decl)
 			  && !decl_had_value_expr_p)
-			reinit_auto_init (decl, seq_p);
+			{
+			  reinit_auto_init (decl, seq_p);
+			  auto_init_first = false;
+			}
 		      gimple_seq tmp_seq = NULL;
 		      init = get_initialized_tmp_var (init, &tmp_seq);
 		      clear_padding
 			= reinit_zero_padding_p (decl, init, tmp_seq);
 		      gimplify_seq_add_seq (seq_p, tmp_seq);
 		    }
+		  /* A run of the initializer after a jump back has to see the
+		     value of the previous run, so only the first run gets the
+		     automatic initialization.  Without a flag to tell the runs
+		     apart, leave DECL alone.  */
+		  if (auto_init_first)
+		    {
+		      if (reinit_auto_init_vars)
+			add_self_read_auto_init (decl, true, seq_p);
+		      auto_init_first = false;
+		    }
 		}
+	      if (auto_init_first)
+		add_self_read_auto_init (decl, false, seq_p);
 	      init = build2 (INIT_EXPR, void_type_node, decl, init);
 	      gimplify_and_add (init, seq_p);
 	      ggc_free (init);
@@ -23110,18 +23257,23 @@ gimplify_body (tree fndecl, bool do_parms)
 
   /* This must come before gimplification takes the body apart.  C++ ends the
      lifetime of a variable on a jump back past its declaration and needs copy
-     elision, so re-run initializations only exist in C and Objective-C.  */
+     elision, so re-run initializations only exist in C and Objective-C.
+     value_before_decl_p needs the walk in any language, though.  */
   hash_map<tree, unsigned> places, bounds;
   hash_map<tree, tree> auto_init_vars;
   auto_vec<reinit_flag> block_flags;
   bypass_info bypass;
-  if (lang_GNU_C () || lang_GNU_OBJC ())
+  if (lang_GNU_C () || lang_GNU_OBJC ()
+      || flag_auto_var_init != AUTO_INIT_UNINITIALIZED)
     {
       reinit_all_labels = find_back_jump_labels (fndecl, &places, &bounds,
 						 &bypass);
-      reinit_places = &places;
       reinit_bounds = &bounds;
       reinit_bypass = &bypass;
+    }
+  if (lang_GNU_C () || lang_GNU_OBJC ())
+    {
+      reinit_places = &places;
       reinit_auto_init_vars = &auto_init_vars;
       reinit_block_flags = &block_flags;
       reinit_computed_gotos = 0;
