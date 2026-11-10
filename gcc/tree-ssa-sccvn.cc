@@ -496,10 +496,13 @@ VN_INFO (tree name)
 
       case PARM_DECL:
 	/* Parameters are VARYING but we can record a condition
-	   if we know it is a non-NULL pointer.  */
+	   if we know it is a non-NULL pointer.  Null pointer checks
+	   must stay under -fno-delete-null-pointer-checks, even for an
+	   argument the "nonnull" attribute says can't be null.  */
 	newinfo->visited = true;
 	newinfo->valnum = name;
 	if (POINTER_TYPE_P (TREE_TYPE (name))
+	    && flag_delete_null_pointer_checks
 	    && nonnull_arg_p (SSA_NAME_VAR (name)))
 	  {
 	    tree ops[2];
