@@ -3661,7 +3661,9 @@ expand_DEFERRED_INIT (internal_fn, gcall *stmt)
    function have been converted from the incomplete array type to
    the corresponding pointer type.
 
-   For each call to a .ACCESS_WITH_SIZE, replace it with its 1st argument.  */
+   For each call to a .ACCESS_WITH_SIZE, replace it with its 1st argument.
+   When optimizing, the late objsz pass has already done that, so only
+   unoptimized code gets here.  */
 
 static void
 expand_ACCESS_WITH_SIZE (internal_fn, gcall *stmt)

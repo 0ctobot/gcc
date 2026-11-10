@@ -4322,6 +4322,7 @@ object_sizes_execute (function *fun, bool early)
   todo = 0;
   object_sizes_early = early;
   auto_bitmap sdce_worklist;
+  bool access_with_size_p = false;
 
   basic_block bb;
   FOR_EACH_BB_FN (bb, fun)
@@ -4333,6 +4334,11 @@ object_sizes_execute (function *fun, bool early)
 	  bool dynamic = false;
 
 	  gimple *call = gsi_stmt (i);
+	  if (gimple_call_internal_p (call, IFN_ACCESS_WITH_SIZE))
+	    {
+	      access_with_size_p = true;
+	      continue;
+	    }
 	  if (gimple_call_builtin_p (call, BUILT_IN_DYNAMIC_OBJECT_SIZE))
 	    dynamic = true;
 	  else if (!gimple_call_builtin_p (call, BUILT_IN_OBJECT_SIZE))
@@ -4436,6 +4442,26 @@ object_sizes_execute (function *fun, bool early)
   index_below_stmt = NULL;
   fini_object_sizes ();
   object_sizes_early = false;
+
+  /* .ACCESS_WITH_SIZE only exists to tell this pass the size of a counted_by
+     array, and its result is just its first argument.  It's a pure call, so
+     until expand removes it, every other pass has to assume it reads memory
+     and that any store can change its result.  That makes a loop over the
+     array reload the counter after each store into it, keeps a clearing loop
+     from becoming a memset and stops loads from being reused across a store
+     into the array.  No __builtin_object_size call is left to read it once
+     the late pass has folded them all, so replace each call with its first
+     argument here.  */
+  if (!early && access_with_size_p)
+    FOR_EACH_BB_FN (bb, fun)
+      for (gimple_stmt_iterator i = gsi_start_bb (bb); !gsi_end_p (i);
+	   gsi_next (&i))
+	{
+	  gimple *call = gsi_stmt (i);
+	  if (gimple_call_internal_p (call, IFN_ACCESS_WITH_SIZE))
+	    replace_call_with_value (&i, gimple_call_arg (call, 0));
+	}
+
   simple_dce_from_worklist (sdce_worklist);
   return todo;
 }

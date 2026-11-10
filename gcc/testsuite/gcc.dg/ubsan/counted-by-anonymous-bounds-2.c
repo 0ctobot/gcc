@@ -1,7 +1,7 @@
 /* Testing the attribute counted_by for anonymous structures as plan9-extensions.
    used in bounds sanitizer.  */
 /* { dg-do run } */
-/* { dg-options "-O2 -fplan9-extensions -fsanitize=bounds" } */
+/* { dg-options "-O2 -fplan9-extensions -fsanitize=bounds -Wno-stringop-overflow" } */
 /* { dg-output "index 12 out of bounds for type 'char \\\[\\\*\\\]'\[^\n\r]*(\n|\r\n|\r)" } */
 /* { dg-output "\[^\n\r]*index 22 out of bounds for type 'char \\\[\\\*\\\]'\[^\n\r]*(\n|\r\n|\r)" } */
 /* { dg-output "\[^\n\r]*index 31 out of bounds for type 'char \\\[\\\*\\\]'\[^\n\r]*(\n|\r\n|\r)" } */
