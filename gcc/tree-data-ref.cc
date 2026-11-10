@@ -1389,12 +1389,14 @@ dr_analyze_indices (struct indices *dri, tree ref, edge nest, loop_p loop,
 
 	  /* A variable index into an array that has no upper bound or at
 	     most one element, such as a [1] or [0] member that isn't the
-	     last one, can reach the members that follow the array.  The
-	     offsets of the enclosing components then don't separate this
-	     access from one to a later member, so make the array itself
-	     the base object.  References into two different arrays then
-	     have different bases and get compared by their addresses, and
-	     dr_may_alias_p compares the objects that enclose the arrays.  */
+	     last one, can reach the members that follow the array, and a
+	     constant index outside the bounds of any array member can reach
+	     the memory on either side of it.  The offsets of the enclosing
+	     components then don't separate this access from one to another
+	     member, so make the array itself the base object.  References
+	     into two different arrays then have different bases and get
+	     compared by their addresses, and dr_may_alias_p compares the
+	     objects that enclose the arrays.  */
 	  if (handled_component_p (TREE_OPERAND (ref, 0))
 	      && ref_indexes_short_array_p (ref, TREE_OPERAND (ref, 0)))
 	    {
