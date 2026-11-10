@@ -5950,6 +5950,22 @@ get_bit_range (poly_uint64 *bitstart, poly_uint64 *bitend, tree exp,
   *bitend = *bitstart + tree_to_poly_uint64 (DECL_SIZE (repr)) - 1;
 }
 
+/* Return true if the record or union holding the field of any COMPONENT_REF
+   in the reference EXP, from EXP down to its base, has a volatile member.
+   A bit-field in a nested or anonymous record can sit right next to a
+   volatile member of an enclosing record.  */
+
+static bool
+ref_has_volatile_member_p (tree exp)
+{
+  for (tree t = exp; handled_component_p (t); t = TREE_OPERAND (t, 0))
+    if (TREE_CODE (t) == COMPONENT_REF
+	&& type_has_volatile_member_p (DECL_CONTEXT (TREE_OPERAND (t, 1))))
+      return true;
+
+  return false;
+}
+
 /* Returns true if BASE is a DECL that does not reside in memory and
    has non-BLKmode.  DECL_RTL must not be a MEM; if
    DECL_RTL was not set yet, return false.  */
@@ -12422,6 +12438,23 @@ expand_expr_real_1 (tree exp, rtx target, machine_mode tmode,
 	    bitpos = num_trailing_bits (bitpos);
 	  }
 
+	/* Reading a bit-field normally loads the widest aligned chunk of
+	   memory around it, which may include neighboring members.  That's
+	   harmless unless a neighbor is volatile, since every read of a
+	   volatile object is a side effect (e.g., a read of a device register
+	   can clear its status bits).  So when the record or one enclosing
+	   it in the reference has a volatile member, limit the read to the
+	   bit-field's representative the same way that a store is limited.
+	   The representative lies within the bit-field's own record, which
+	   doesn't overlap the members of an enclosing record outside a
+	   union.  */
+	poly_uint64 bitregion_start = 0, bitregion_end = 0;
+	if (TREE_CODE (exp) == COMPONENT_REF
+	    && DECL_BIT_FIELD_TYPE (TREE_OPERAND (exp, 1))
+	    && ref_has_volatile_member_p (exp))
+	  get_bit_range (&bitregion_start, &bitregion_end, exp, &bitpos,
+			 &offset);
+
 	/* If we have either an offset, a BLKmode result, or a reference
 	   outside the underlying object, we must force it to memory.
 	   Such a case can occur in Ada if we have unchecked conversion
@@ -12604,6 +12637,9 @@ expand_expr_real_1 (tree exp, rtx target, machine_mode tmode,
 		&& MEM_ALIGN (op0) >= GET_MODE_ALIGNMENT (mode1))
 	      {
 		op0 = adjust_address (op0, mode1, bytepos);
+		bitregion_start = 0;
+		if (known_ge (bitregion_end, poly_uint64 (bitpos)))
+		  bitregion_end -= bitpos;
 		bitpos = 0;
 	      }
 
@@ -12740,7 +12776,8 @@ expand_expr_real_1 (tree exp, rtx target, machine_mode tmode,
 	    op0 = extract_bit_field (op0, bitsize, bitpos, unsignedp,
 				     (modifier == EXPAND_STACK_PARM
 				      ? NULL_RTX : target),
-				     ext_mode, ext_mode, reversep, alt_rtl);
+				     ext_mode, ext_mode, reversep, alt_rtl,
+				     bitregion_start, bitregion_end);
 
 	    /* The extraction extends the value from BITSIZE bits, which for a
 	       _BitInt that isn't a bit-field covers all of its storage,
