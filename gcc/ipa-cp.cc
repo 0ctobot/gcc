@@ -207,6 +207,57 @@ ipcp_lattice<valtype>::is_single_const ()
     return true;
 }
 
+/* Return true if the references X and Y, whose addresses operand_equal_p
+   takes for the same value, name members of the same size at each level.
+   Two members at the same offset in one object, like the two arrays of a
+   union, have different object sizes when their sizes differ.  The members
+   compared can be different FIELD_DECLs of one member though, since LTO
+   leaves the copies of a structure from two translation units unshared when
+   the units see its types differently, e.g., when an array of pointers in it
+   points to a structure that only one unit completes.  A trailing member can
+   be sized as a flexible array, so a member at the end of its structure is
+   only taken for one that's also at the end.  The object size of a member
+   whose structure or union type ends in a flexible array member extends to
+   the end of the enclosing object, so the members' types have to agree on
+   TYPE_INCLUDES_FLEXARRAY too.  Whether a trailing array is sized as a
+   flexible array also depends on DECL_NOT_FLEXARRAY and, when the object
+   has room past the array's end, on whether a whole element fits there, so
+   two arrays have to agree on both of those.  */
+
+static bool
+ipcp_same_member_sizes_p (tree x, tree y)
+{
+  while (handled_component_p (x))
+    {
+      if (TREE_CODE (x) != TREE_CODE (y))
+	return false;
+      if (TREE_CODE (x) == COMPONENT_REF
+	  && TREE_OPERAND (x, 1) != TREE_OPERAND (y, 1))
+	{
+	  tree fx = TREE_OPERAND (x, 1), fy = TREE_OPERAND (y, 1);
+	  if (TREE_CODE (fx) != FIELD_DECL
+	      || TREE_CODE (fy) != FIELD_DECL
+	      || !DECL_SIZE (fx)
+	      || !DECL_SIZE (fy)
+	      || !operand_equal_p (DECL_SIZE (fx), DECL_SIZE (fy), 0)
+	      || !DECL_CHAIN (fx) != !DECL_CHAIN (fy)
+	      || TREE_CODE (TREE_TYPE (fx)) != TREE_CODE (TREE_TYPE (fy))
+	      || (RECORD_OR_UNION_TYPE_P (TREE_TYPE (fx))
+		  && (TYPE_INCLUDES_FLEXARRAY (TREE_TYPE (fx))
+		      != TYPE_INCLUDES_FLEXARRAY (TREE_TYPE (fy))))
+	      || (TREE_CODE (TREE_TYPE (fx)) == ARRAY_TYPE
+		  && (DECL_NOT_FLEXARRAY (fx) != DECL_NOT_FLEXARRAY (fy)
+		      || !operand_equal_p
+			   (TYPE_SIZE (TREE_TYPE (TREE_TYPE (fx))),
+			    TYPE_SIZE (TREE_TYPE (TREE_TYPE (fy))), 0))))
+	    return false;
+	}
+      x = TREE_OPERAND (x, 0);
+      y = TREE_OPERAND (y, 0);
+    }
+  return true;
+}
+
 /* Return true iff X and Y should be considered equal values by IPA-CP.  */
 
 bool
@@ -228,8 +279,16 @@ values_equal_for_ipcp_p (tree x, tree y)
     return TREE_OPERAND (x, 0) == TREE_OPERAND (y, 0)
 	   || operand_equal_p (DECL_INITIAL (TREE_OPERAND (x, 0)),
 			       DECL_INITIAL (TREE_OPERAND (y, 0)), 0);
-  else
-    return operand_equal_p (x, y, 0);
+  else if (!operand_equal_p (x, y, 0))
+    return false;
+  /* The addresses of two members at the same offset compare equal, but
+     their object sizes can differ.  Since IPA-CP runs before the object
+     sizes are computed, keep such addresses apart.  */
+  return (TREE_CODE (x) != ADDR_EXPR
+	  || TREE_CODE (y) != ADDR_EXPR
+	  || operand_equal_p (x, y, OEP_ADDRESS_OF_SAME_FIELD)
+	  || ipcp_same_member_sizes_p (TREE_OPERAND (x, 0),
+				       TREE_OPERAND (y, 0)));
 }
 
 /* Print V which is extracted from a value in a lattice to F.  This overloaded
