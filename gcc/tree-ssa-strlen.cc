@@ -3381,6 +3381,9 @@ strlen_pass::handle_builtin_memcpy (built_in_function bcode)
     return;
 
   bool full_string_p;
+  /* Whether the copy reads every byte SI describes, including the nul when
+     SI covers the full string.  */
+  bool src_covered = false;
   if (idx > 0)
     {
       gimple *def_stmt;
@@ -3404,6 +3407,7 @@ strlen_pass::handle_builtin_memcpy (built_in_function bcode)
 	      /* Copying the whole of the analyzed part of SI.  */
 	      newlen = si->nonzero_chars;
 	      full_string_p = si->full_string_p;
+	      src_covered = true;
 	    }
 	}
       else
@@ -3421,6 +3425,7 @@ strlen_pass::handle_builtin_memcpy (built_in_function bcode)
 	  /* Copying variable-length string SI (and no more).  */
 	  newlen = si->nonzero_chars;
 	  full_string_p = true;
+	  src_covered = true;
 	}
     }
   else
@@ -3501,9 +3506,12 @@ strlen_pass::handle_builtin_memcpy (built_in_function bcode)
       else
 	dsi->prev = 0;
     }
-  /* memcpy src may not overlap dst, so src doesn't need to be
-     invalidated either.  */
-  if (si != NULL)
+  /* memcpy src may not overlap dst, so src doesn't need to be invalidated
+     either, but only if the copy read all of the bytes SI describes.  A
+     shorter copy can still write to the rest of the same string, e.g., its
+     nul in memcpy (b + 4, b, 3) when strlen (b) is 6, so leave that case to
+     maybe_invalidate and the alias oracle.  */
+  if (si != NULL && src_covered)
     si->dont_invalidate = true;
 
   if (full_string_p)
