@@ -256,6 +256,55 @@ merge_flto_options (vec<cl_decoded_option> &decoded_options,
     }
 }
 
+/* Replace the options in OPTS that decide whether signed and pointer
+   arithmetic wraps on overflow (-fwrapv, -fwrapv-pointer, -fstrict-overflow
+   and the -ftrapv side effect on -fwrapv) with a plain -fwrapv and
+   -fwrapv-pointer for whatever the TU ended up with.  A TU can spell the same
+   setting several ways, so the merge needs one canonical form to union.  */
+
+static void
+canonicalize_wrapv_options (vec<cl_decoded_option> &opts)
+{
+  bool wrapv = false, wrapv_pointer = false;
+  unsigned int i, j = 0;
+
+  for (i = 0; i < opts.length (); ++i)
+    {
+      switch (opts[i].opt_index)
+	{
+	case OPT_fwrapv:
+	  wrapv = opts[i].value;
+	  continue;
+	case OPT_fwrapv_pointer:
+	  wrapv_pointer = opts[i].value;
+	  continue;
+	case OPT_fstrict_overflow:
+	  wrapv = wrapv_pointer = !opts[i].value;
+	  continue;
+	case OPT_ftrapv:
+	  if (opts[i].value)
+	    wrapv = false;
+	  break;
+	default:
+	  break;
+	}
+      opts[j++] = opts[i];
+    }
+  opts.truncate (j);
+
+  cl_decoded_option opt;
+  if (wrapv)
+    {
+      generate_option (OPT_fwrapv, NULL, 1, CL_COMMON, &opt);
+      opts.safe_push (opt);
+    }
+  if (wrapv_pointer)
+    {
+      generate_option (OPT_fwrapv_pointer, NULL, 1, CL_COMMON, &opt);
+      opts.safe_push (opt);
+    }
+}
+
 /* Try to merge and complain about options FDECODED_OPTIONS when applied
    on top of DECODED_OPTIONS.  */
 
@@ -349,6 +398,12 @@ merge_and_complain (vec<cl_decoded_option> &decoded_options,
 	case OPT_fopenacc:
 	case OPT_fasynchronous_unwind_tables:
 	case OPT_funwind_tables:
+	/* The IPA passes fold arithmetic in jump functions and inline
+	   predicates using the link-wide -fwrapv and -fwrapv-pointer, so
+	   they must wrap if any TU's functions do.  Both lists went through
+	   canonicalize_wrapv_options, so these only appear with value 1.  */
+	case OPT_fwrapv:
+	case OPT_fwrapv_pointer:
 	  /* For selected options we can merge conservatively.  */
 	  if (existing_opt == -1)
 	    decoded_options.safe_push (*foption);
@@ -752,6 +807,8 @@ append_compiler_options (obstack *argv_obstack, vec<cl_decoded_option> opts)
 	case OPT_fpie:
 	case OPT_fcommon:
 	case OPT_fgnu_tm:
+	case OPT_fwrapv:
+	case OPT_fwrapv_pointer:
 	case OPT_fopenmp:
 	case OPT_fopenacc:
 	case OPT_fopenacc_dim_:
@@ -1183,6 +1240,7 @@ find_and_merge_options (int fd, off_t file_offset, const char *prefix,
     {
       vec<cl_decoded_option> f2decoded_options
 	= get_options_from_collect_gcc_options (collect_gcc, fopts);
+      canonicalize_wrapv_options (f2decoded_options);
       if (first)
 	{
 	  fdecoded_options = f2decoded_options;
