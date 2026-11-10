@@ -1653,7 +1653,7 @@ access_with_size_object_size (const gcall *call, int object_size_type)
   {
     tree cond_expr = fold_build2 (LT_EXPR, boolean_type_node,
 				  unshare_expr (size), build_zero_cst (type));
-    size = fold_build3 (COND_EXPR, integer_type_node, cond_expr,
+    size = fold_build3 (COND_EXPR, type, cond_expr,
 			build_zero_cst (type), size);
   }
 
