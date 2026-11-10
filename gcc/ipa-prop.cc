@@ -4069,7 +4069,6 @@ ipa_make_edge_direct_to_target (struct cgraph_edge *ie, tree target,
 				bool speculative)
 {
   struct cgraph_node *callee;
-  bool unreachable = false;
 
   if (TREE_CODE (target) == ADDR_EXPR)
     target = TREE_OPERAND (target, 0);
@@ -4078,40 +4077,18 @@ ipa_make_edge_direct_to_target (struct cgraph_edge *ie, tree target,
       target = canonicalize_constructor_val (target, NULL);
       if (!target || TREE_CODE (target) != FUNCTION_DECL)
 	{
-	  cgraph_simple_indirect_info *sii
-	    = dyn_cast <cgraph_simple_indirect_info *> (ie->indirect_info);
-	  /* Member pointer call that goes through a VMT lookup.  */
-	  if ((sii && sii->member_ptr)
-	      /* Or if target is not an invariant expression and we do not
-		 know if it will evaluate to function at runtime.
-		 This can happen when folding through &VAR, where &VAR
-		 is IP invariant, but VAR itself is not.
-
-		 TODO: It seems that we may try to fold the expression and see
-		 if VAR is readonly.  */
-	      || !is_gimple_ip_invariant (target))
-	    {
-	      if (dump_enabled_p ())
-		{
-		  dump_printf_loc (MSG_OPTIMIZED_LOCATIONS, ie->call_stmt,
-				   "discovered direct call non-invariant %s\n",
-				   ie->caller->dump_name ());
-		}
-	      return NULL;
-	    }
-
-
-          if (dump_enabled_p ())
-	    {
-	      dump_printf_loc (MSG_OPTIMIZED_LOCATIONS, ie->call_stmt,
-			       "discovered direct call to non-function in %s, "
-			       "making it __builtin_unreachable\n",
-			       ie->caller->dump_name ());
-	    }
-
-	  target = builtin_decl_unreachable ();
-	  callee = cgraph_node::get_create (target);
-	  unreachable = true;
+	  /* The target is a known value but not a known function: the
+	     address of a variable, a member pointer resolved through a VMT,
+	     or a constant such as a fixed code address or a null pointer.
+	     GCC supports calling a fixed address, and a call through a null
+	     pointer must still fault when null pointer checks are kept, so
+	     nothing proves the call unreachable.  Leave it indirect.  */
+	  if (dump_enabled_p ())
+	    dump_printf_loc (MSG_MISSED_OPTIMIZATION, ie->call_stmt,
+			     "discovered direct call to non-function in %s, "
+			     "leaving it indirect\n",
+			     ie->caller->dump_name ());
+	  return NULL;
 	}
       else
 	callee = cgraph_node::get (target);
@@ -4177,7 +4154,7 @@ ipa_make_edge_direct_to_target (struct cgraph_edge *ie, tree target,
      the cgraph node too early.  */
   gcc_assert (!callee->inlined_to);
 
-  if (dump_file && !unreachable)
+  if (dump_file)
     {
       fprintf (dump_file, "ipa-prop: Discovered %s call to a %s target "
 	       "(%s -> %s), for stmt ",
