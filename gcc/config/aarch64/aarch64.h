@@ -1501,9 +1501,7 @@ typedef struct
 #define CASE_VECTOR_PC_RELATIVE	1
 
 #define CASE_VECTOR_SHORTEN_MODE(min, max, body)	\
-  ((min < -0x1fff0 || max > 0x1fff0) ? SImode		\
-   : (min < -0x1f0 || max > 0x1f0) ? HImode		\
-   : QImode)
+  aarch64_case_vector_shorten_mode (min, max, body)
 
 /* Jump table alignment is explicit in ASM_OUTPUT_CASE_LABEL.  */
 #define ADDR_VEC_ALIGN(JUMPTABLE) 0
