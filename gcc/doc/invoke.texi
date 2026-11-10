@@ -16145,13 +16145,15 @@ and trying to override this at link time with a conflicting value
 is ignored.  This includes options such as @option{-freg-struct-return}
 and @option{-fpcc-struct-return}.
 
-Other options such as @option{-ffp-contract}, @option{-fno-strict-overflow},
-@option{-fwrapv}, @option{-fno-trapv} or @option{-fno-strict-aliasing}
-are passed through to the link stage and merged conservatively for
-conflicting translation units.  Specifically
-@option{-fno-strict-overflow}, @option{-fwrapv} and @option{-fno-trapv} take
-precedence; and for example @option{-ffp-contract=off} takes precedence
-over @option{-ffp-contract=fast}.  You can override them at link time.
+Optimization options such as @option{-ffp-contract}, @option{-ftrapv}
+or @option{-fno-strict-aliasing} are recorded for each function and keep
+the setting of the translation unit the function came from.
+@option{-fwrapv}, @option{-fwrapv-pointer} and @option{-fno-strict-overflow}
+are recorded the same way and are also passed through to the link stage,
+merged conservatively for conflicting translation units: if any unit was
+compiled with wrapping overflow, the link stage uses it too, since
+interprocedural optimizations use the link-wide setting.  You can override
+them at link time.
 
 Diagnostic options such as @option{-Wstringop-overflow} are passed
 through to the link stage and their setting matches that of the
