@@ -8203,11 +8203,19 @@ decl_binds_to_current_def_p (const_tree decl)
   if (!TREE_PUBLIC (decl))
     return true;
 
-  /* When resolution is available, just use it.  */
+  /* When resolution is available, just use it.  The exception is a weak
+     definition in an incremental link: the linker resolves it as prevailing
+     within that link, but it stays weak in the output, so a strong
+     definition in an object added to the final link can still replace it.
+     That holds for every resolution, including LDPR_PREVAILING_DEF_IRONLY,
+     which -fwhole-program gives to symbols that stay externally visible
+     (externally_visible, used, noipa).  A symbol that was made local
+     isn't TREE_PUBLIC or DECL_WEAK anymore and never gets here.  */
   if (symtab_node *node = symtab_node::get (decl))
     {
       if (node->resolution != LDPR_UNKNOWN
-	  && !node->can_be_discarded_p ())
+	  && !node->can_be_discarded_p ()
+	  && !(flag_incremental_link && DECL_WEAK (decl)))
 	return resolution_to_local_definition_p (node->resolution);
     }
 
