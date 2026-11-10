@@ -1031,16 +1031,15 @@ crc_optimization::loop_calculates_crc (gphi *output_crc,
   bool is_crc = true;
   crc_symbolic_execution loop_executor (m_crc_loop, output_crc);
 
-  /* The data's bits are symbolic during the execution unless its initial
-     value is a constant, in which case its bits are tracked as known
-     values.  Only symbolic data can appear in the CRC's condition.  */
-  tree data_origin = NULL_TREE;
-  if (m_phi_for_data && TREE_CODE (m_data_arg) != INTEGER_CST)
-    data_origin = gimple_phi_result (m_phi_for_data);
+  /* Keep the data symbolic even when its initial value is constant.  The
+     replacement consumes one data bit per iteration, so the verifier has to
+     distinguish that bit from a different expression with the same value.  */
+  tree data_origin = m_phi_for_data ? gimple_phi_result (m_phi_for_data)
+				    : NULL_TREE;
 
   while (!loop_executor.is_last_iteration ())
     {
-      if (!loop_executor.symb_execute_crc_loop ())
+      if (!loop_executor.symb_execute_crc_loop (m_phi_for_data))
 	{
 	  if (dump_file)
 	    fprintf (dump_file, "\nCRC verification didn't succeed "

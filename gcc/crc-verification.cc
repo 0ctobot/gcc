@@ -444,11 +444,11 @@ crc_symbolic_execution::execute_bb_statements (basic_block bb,
   return execute_bb_gimple_statements (bb, stack);
 }
 
-/* If the phi statements' result variables have initial constant value in the
-   beginning of the loop, initialize those variables.  */
+/* Keep DATA_PHI symbolic when initializing the loop header */
 
 void
-assign_known_vals_to_header_phis (state *state, class loop *crc_loop)
+assign_known_vals_to_header_phis (state *state, class loop *crc_loop,
+				  gphi *data_phi)
 {
   basic_block bb = crc_loop->header;
   for (gphi_iterator gsi = gsi_start_phis (bb); !gsi_end_p (gsi);
@@ -458,8 +458,7 @@ assign_known_vals_to_header_phis (state *state, class loop *crc_loop)
       gphi *phi = gsi.phi ();
       tree lhs = gimple_phi_result (phi);
 
-      /* Don't consider virtual operands.  */
-      if (virtual_operand_p (lhs))
+      if (virtual_operand_p (lhs) || phi == data_phi)
 	continue;
 
       tree inital_val = PHI_ARG_DEF_FROM_EDGE (phi,
@@ -479,14 +478,13 @@ assign_known_vals_to_header_phis (state *state, class loop *crc_loop)
     }
 }
 
-/* If the phi statements' result variables have initial constant value in the
-   beginning of the loop, initialize those variables with
-   the value calculated during the previous iteration.  */
+/* Advance loop-header phis with constant inputs to their values from the
+   previous iteration, leaving DATA_PHI symbolic.  */
 
 bool
 assign_calc_vals_to_header_phis (const vec<state *> &prev_states,
 				 state *curr_state,
-				 class loop *crc_loop)
+				 class loop *crc_loop, gphi *data_phi)
 {
   basic_block bb = crc_loop->header;
   for (gphi_iterator gsi = gsi_start_phis (bb); !gsi_end_p (gsi);
@@ -495,8 +493,7 @@ assign_calc_vals_to_header_phis (const vec<state *> &prev_states,
       gphi *phi = gsi.phi ();
       tree lhs = gimple_phi_result (phi);
 
-      /* Don't consider virtual operands.  */
-      if (virtual_operand_p (lhs))
+      if (virtual_operand_p (lhs) || phi == data_phi)
 	continue;
       tree inital_val = PHI_ARG_DEF_FROM_EDGE (phi,
 					       loop_preheader_edge (crc_loop));
@@ -546,37 +543,34 @@ assign_calc_vals_to_header_phis (const vec<state *> &prev_states,
   return true;
 }
 
-/* Create initial state of the CRC_LOOP's header BB variables which have
-   constant values.
-   If it is the first iteration of the loop, initialise variables with the
-   initial values, otherwise initialise the variable with the value calculated
-   during the previous execution.  */
+/* Initialize the loop header for one iteration.  Keep DATA_PHI symbolic so
+   the condition can be checked against the input bit it should use.  */
 
 state *
-crc_symbolic_execution::create_initial_state (class loop *crc_loop)
+crc_symbolic_execution::create_initial_state (gphi *data_phi)
 {
   state *curr_state = new state;
   if (!m_final_states.is_empty ())
     {
       if (!assign_calc_vals_to_header_phis (m_final_states, curr_state,
-					    crc_loop))
+					    m_crc_loop, data_phi))
 	return nullptr;
       state::remove_states (&m_final_states);
     }
   else
-    assign_known_vals_to_header_phis (curr_state, crc_loop);
+    assign_known_vals_to_header_phis (curr_state, m_crc_loop, data_phi);
   return curr_state;
 }
 
 /* Symbolically execute the CRC loop, doing one iteration.  */
 
 bool
-crc_symbolic_execution::symb_execute_crc_loop ()
+crc_symbolic_execution::symb_execute_crc_loop (gphi *data_phi)
 {
   if (dump_file && (dump_flags & TDF_DETAILS))
     fprintf (dump_file, "\n\nExecuting the loop with symbolic values.\n\n");
 
-  state *curr_state = create_initial_state (m_crc_loop);
+  state *curr_state = create_initial_state (data_phi);
   if (!curr_state)
     return false;
 
@@ -893,8 +887,8 @@ is_a_valid_xor_one (value_bit *bit, tree crc_origin, size_t lfsr_bit_index)
    Otherwise, return false.
 
    DATA_ORIGIN is the data variable whose bit DATA_INDEX the loop mixes into
-   the checked bit, or NULL_TREE when the loop has no data variable or the
-   data's bits are known constants during symbolic execution.  The condition
+   the checked bit, or NULL_TREE when the loop has no data variable.  The
+   condition
    must test exactly the CRC's significant bit when there's no symbolic data,
    and exactly that bit xor-ed with the data's bit otherwise.  The CRC
    expansion feeds data bit DATA_INDEX into the register on each iteration,
@@ -1277,8 +1271,7 @@ get_crc_val (tree calculated_crc, state *curr_state)
 /* Return true if all states from the FINAL_STATES match the LFSR,
    otherwise - false.
    DATA_ORIGIN is the data variable (the result of the data's loop header
-   phi) when its bits are symbolic during the execution, otherwise
-   NULL_TREE.  */
+   phi), or NULL_TREE if the loop has no data variable.  */
 
 bool
 all_states_match_lfsr (value *lfsr, bool is_bit_forward, tree calculated_crc,

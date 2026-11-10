@@ -97,12 +97,8 @@ class crc_symbolic_execution {
     Keeping values of variables in the state.  */
   bool execute_bb_statements (basic_block, edge, auto_vec<edge> &);
 
-  /* Create initial state of the loop's header BB variables which have constant
-   values.
-   If it is the first iteration of the loop, initialise variables with the
-   initial values, otherwise initialise the variable with the value calculated
-   during the previous execution.  */
-  state *create_initial_state (class loop *);
+  /* Initialize the loop header, leaving the data phi symbolic */
+  state *create_initial_state (gphi *);
 
 /* Traverse function fun's all paths from the first basic block to the last.
    Each time iterate loops only once.
@@ -123,7 +119,7 @@ class crc_symbolic_execution {
   extract_polynomial (gphi *, gphi *, tree, bool);
 
   /* Symbolically execute the CRC loop, doing one iteration.  */
-  bool symb_execute_crc_loop ();
+  bool symb_execute_crc_loop (gphi *);
 
   const vec<state *> &get_final_states ()
   {
