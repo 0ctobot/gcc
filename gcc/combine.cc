@@ -2514,10 +2514,10 @@ count_auto_inc (rtx, rtx, rtx, rtx, rtx, void *arg)
   return 0;
 }
 
-/* Return true if insn pattern X reads volatile memory.  */
+/* Return the number of volatile memory reads in insn pattern X.  */
 
-static bool
-volatile_reads_p (rtx x)
+static int
+count_volatile_reads (rtx x)
 {
   /* Only a MEM that is itself the destination of a SET or CLOBBER is not
      read.  Its address still is, and so is a MEM under a ZERO_EXTRACT
@@ -2526,6 +2526,7 @@ volatile_reads_p (rtx x)
      store counts too.  */
   bool is_asm = asm_noperands (x) >= 0;
   int n = GET_CODE (x) == PARALLEL ? XVECLEN (x, 0) : 1;
+  int count = 0;
   subrtx_iterator::array_type array;
   FOR_EACH_SUBRTX (iter, array, x, NONCONST)
     if (MEM_P (*iter) && MEM_VOLATILE_P (*iter))
@@ -2538,9 +2539,9 @@ volatile_reads_p (rtx x)
 		      && SET_DEST (elt) == *iter);
 	  }
 	if (!stored)
-	  return true;
+	  count++;
       }
-  return false;
+  return count;
 }
 
 /* Try to combine the insns I0, I1 and I2 into I3.
@@ -2742,13 +2743,21 @@ try_combine (rtx_insn *i3, rtx_insn *i2, rtx_insn *i1, rtx_insn *i0,
   /* Refuse to combine insns of which more than one reads volatile memory.
      Their reads would end up in one insn, which gives them no order, or
      be split back into two insns in an order nothing guarantees: combine
-     may reassociate (a + x) + y into (a + y) + x and put y first.  */
+     may reassociate (a + x) + y into (a + y) + x and put y first.
+
+     Also count the volatile reads, so that a combination which loses one
+     can be refused below.  */
+  int n_vol_reads = 0;
   {
     rtx_insn *insns[4] = { i0, i1, i2, i3 };
     int n_vol_insns = 0;
     for (int k = 0; k < 4; k++)
-      if (insns[k] && volatile_reads_p (PATTERN (insns[k])))
-	n_vol_insns++;
+      if (insns[k])
+	{
+	  int n = count_volatile_reads (PATTERN (insns[k]));
+	  n_vol_insns += n > 0;
+	  n_vol_reads += n;
+	}
     if (n_vol_insns > 1)
       {
 	if (dump_file && (dump_flags & TDF_DETAILS))
@@ -4188,6 +4197,25 @@ try_combine (rtx_insn *i3, rtx_insn *i2, rtx_insn *i1, rtx_insn *i0,
 	  undo_all ();
 	  return 0;
 	}
+    }
+
+  /* Refuse to drop a volatile read.  rtx_equal_p doesn't compare
+     MEM_VOLATILE_P, so once a volatile load is substituted into an insn that
+     reads the same location through a plain MEM, simplify_rtx can take the
+     two reads for one value.  A fold that keeps one copy and drops the other
+     then loses the volatile read unless it checks the dropped copy for side
+     effects, and several folds of nested expressions check only the kept
+     one.  Only I0 to I3 count here, since other_insn just has its CC
+     comparison changed.  */
+  if (n_vol_reads
+      && (count_volatile_reads (newpat)
+	  + (newi2pat ? count_volatile_reads (newi2pat) : 0)) < n_vol_reads)
+    {
+      if (dump_file && (dump_flags & TDF_DETAILS))
+	fprintf (dump_file, "Can't combine, since a volatile read would be "
+		 "dropped\n");
+      undo_all ();
+      return 0;
     }
 
   /* Reject this combination if insn_cost reports that the replacement

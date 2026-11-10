@@ -3388,7 +3388,8 @@ simplify_context::simplify_binary_operation_1 (rtx_code code,
 	    }
 
 	  /* Don't merge operands that have side effects.  */
-	  if (rtx_equal_p (lhs, rhs) && !side_effects_p (lhs))
+	  if (rtx_equal_p (lhs, rhs) && !side_effects_p (lhs)
+	      && !side_effects_p (rhs))
 	    {
 	      rtx orig = gen_rtx_PLUS (int_mode, op0, op1);
 	      rtx coeff;
@@ -3529,6 +3530,7 @@ simplify_context::simplify_binary_operation_1 (rtx_code code,
 	 rounding mode x - x may be -0.0.  c.f. PR middle-end/98420.  */
       if (rtx_equal_p (trueop0, trueop1)
 	  && ! side_effects_p (op0)
+	  && ! side_effects_p (op1)
 	  && (!FLOAT_MODE_P (mode)
 	      || (!HONOR_NANS (mode)
 		  && !HONOR_INFINITIES (mode)
@@ -3615,7 +3617,8 @@ simplify_context::simplify_binary_operation_1 (rtx_code code,
 	      rhs = XEXP (rhs, 0);
 	    }
 
-	  if (rtx_equal_p (lhs, rhs) && !side_effects_p (lhs))
+	  if (rtx_equal_p (lhs, rhs) && !side_effects_p (lhs)
+	      && !side_effects_p (rhs))
 	    {
 	      rtx orig = gen_rtx_MINUS (int_mode, op0, op1);
 	      rtx coeff;
@@ -3868,12 +3871,14 @@ simplify_context::simplify_binary_operation_1 (rtx_code code,
 	  && trueop1 == CONSTM1_RTX (mode)
 	  && !side_effects_p (op0))
 	return op1;
-      if (rtx_equal_p (trueop0, trueop1) && ! side_effects_p (op0))
+      if (rtx_equal_p (trueop0, trueop1) && ! side_effects_p (op0)
+	  && ! side_effects_p (op1))
 	return op0;
       /* A | (~A) -> -1 */
       if (((GET_CODE (op0) == NOT && rtx_equal_p (XEXP (op0, 0), op1))
 	   || (GET_CODE (op1) == NOT && rtx_equal_p (XEXP (op1, 0), op0)))
 	  && ! side_effects_p (op0)
+	  && ! side_effects_p (op1)
 	  && GET_MODE_CLASS (mode) != MODE_CC)
 	return CONSTM1_RTX (mode);
 
@@ -4107,6 +4112,7 @@ simplify_context::simplify_binary_operation_1 (rtx_code code,
 	return simplify_gen_unary (NOT, mode, op0, mode);
       if (rtx_equal_p (trueop0, trueop1)
 	  && ! side_effects_p (op0)
+	  && ! side_effects_p (op1)
 	  && GET_MODE_CLASS (mode) != MODE_CC)
 	 return CONST0_RTX (mode);
 
@@ -4476,12 +4482,14 @@ simplify_context::simplify_binary_operation_1 (rtx_code code,
 	    return CONST0_RTX (mode);
 	}
       if (rtx_equal_p (trueop0, trueop1) && ! side_effects_p (op0)
+	  && ! side_effects_p (op1)
 	  && GET_MODE_CLASS (mode) != MODE_CC)
 	return op0;
       /* A & (~A) -> 0 */
       if (((GET_CODE (op0) == NOT && rtx_equal_p (XEXP (op0, 0), op1))
 	   || (GET_CODE (op1) == NOT && rtx_equal_p (XEXP (op1, 0), op0)))
 	  && ! side_effects_p (op0)
+	  && ! side_effects_p (op1)
 	  && GET_MODE_CLASS (mode) != MODE_CC)
 	return CONST0_RTX (mode);
 
@@ -5130,7 +5138,8 @@ simplify_ashift:
 	  && mode_signbit_p (mode, trueop1)
 	  && ! side_effects_p (op0))
 	return op1;
-      if (rtx_equal_p (trueop0, trueop1) && ! side_effects_p (op0))
+      if (rtx_equal_p (trueop0, trueop1) && ! side_effects_p (op0)
+	  && ! side_effects_p (op1))
 	return op0;
       tem = simplify_associative_operation (code, mode, op0, op1);
       if (tem)
@@ -5143,7 +5152,8 @@ simplify_ashift:
 	  && (UINTVAL (trueop1) == GET_MODE_MASK (mode) >> 1)
 	  && ! side_effects_p (op0))
 	return op1;
-      if (rtx_equal_p (trueop0, trueop1) && ! side_effects_p (op0))
+      if (rtx_equal_p (trueop0, trueop1) && ! side_effects_p (op0)
+	  && ! side_effects_p (op1))
 	return op0;
       if (INTEGRAL_MODE_P (mode))
 	{
@@ -5160,7 +5170,8 @@ simplify_ashift:
     case UMIN:
       if (trueop1 == CONST0_RTX (mode) && ! side_effects_p (op0))
 	return op1;
-      if (rtx_equal_p (trueop0, trueop1) && ! side_effects_p (op0))
+      if (rtx_equal_p (trueop0, trueop1) && ! side_effects_p (op0)
+	  && ! side_effects_p (op1))
 	return op0;
       tem = simplify_associative_operation (code, mode, op0, op1);
       if (tem)
@@ -5170,7 +5181,8 @@ simplify_ashift:
     case UMAX:
       if (trueop1 == constm1_rtx && ! side_effects_p (op0))
 	return op1;
-      if (rtx_equal_p (trueop0, trueop1) && ! side_effects_p (op0))
+      if (rtx_equal_p (trueop0, trueop1) && ! side_effects_p (op0)
+	  && ! side_effects_p (op1))
 	return op0;
       tem = simplify_associative_operation (code, mode, op0, op1);
       if (tem)
@@ -5256,7 +5268,8 @@ simplify_ashift:
       return 0;
 
     case COPYSIGN:
-      if (rtx_equal_p (trueop0, trueop1) && ! side_effects_p (op0))
+      if (rtx_equal_p (trueop0, trueop1) && ! side_effects_p (op0)
+	  && ! side_effects_p (op1))
 	return op0;
       if (CONST_DOUBLE_AS_FLOAT_P (trueop1))
 	{
@@ -7368,7 +7381,8 @@ simplify_const_relational_operation (enum rtx_code code,
        || ((code == LT || code == GT || code == LTGT)
 	   && ! HONOR_SNANS (trueop0)))
       && rtx_equal_p (trueop0, trueop1)
-      && ! side_effects_p (trueop0))
+      && ! side_effects_p (trueop0)
+      && ! side_effects_p (trueop1))
     return comparison_result (code, CMP_EQ);
 
   /* If the operands are floating-point constants, see if we can fold
