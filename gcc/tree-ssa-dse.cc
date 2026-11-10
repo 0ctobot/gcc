@@ -1977,3 +1977,215 @@ make_pass_dse (gcc::context *ctxt)
 {
   return new pass_dse (ctxt);
 }
+
+/* Return true if STMT is a .DEFERRED_INIT that zero initializes its
+   variable.  */
+
+static bool
+zero_init_marker_p (gimple *stmt)
+{
+  return (gimple_call_internal_p (stmt, IFN_DEFERRED_INIT)
+	  && ((tree_to_uhwi (gimple_call_arg (stmt, 1)) & ~AUTO_INIT_CXX26)
+	      == AUTO_INIT_ZERO));
+}
+
+/* Return the constant that SSA name NAME is known to hold through its
+   definition, or NULL_TREE if there isn't one.  This only recognizes what
+   lowering a zero initialization marker can expose: the marker itself, a
+   copy of a constant and a PHI whose arguments are all the same constant.  */
+
+static tree
+zero_init_ssa_value (tree name)
+{
+  if (SSA_NAME_OCCURS_IN_ABNORMAL_PHI (name))
+    return NULL_TREE;
+
+  gimple *def = SSA_NAME_DEF_STMT (name);
+  if (zero_init_marker_p (def))
+    return build_zero_cst (TREE_TYPE (name));
+  if (gimple_assign_single_p (def)
+      && is_gimple_min_invariant (gimple_assign_rhs1 (def)))
+    return gimple_assign_rhs1 (def);
+  if (gphi *phi = dyn_cast <gphi *> (def))
+    {
+      tree val = degenerate_phi_result (phi);
+      if (val && is_gimple_min_invariant (val))
+	return val;
+    }
+  return NULL_TREE;
+}
+
+namespace {
+
+const pass_data pass_data_lower_zero_init =
+{
+  GIMPLE_PASS, /* type */
+  "zinit", /* name */
+  OPTGROUP_NONE, /* optinfo_flags */
+  TV_TREE_DSE, /* tv_id */
+  ( PROP_cfg | PROP_ssa ), /* properties_required */
+  0, /* properties_provided */
+  0, /* properties_destroyed */
+  0, /* todo_flags_start */
+  0, /* todo_flags_finish */
+};
+
+/* With -ftrivial-auto-var-init=zero, the .DEFERRED_INIT markers have to
+   stay opaque until the late uninitialized warnings have run: those
+   warnings look for the markers, and the uses they warn about must not be
+   folded away first.  Once the warnings are done, nothing needs the markers
+   to be opaque anymore.  Since hardly any GIMPLE pass runs after this
+   point, this pass folds what the known zero makes constant on its own.
+
+   A marker whose result is an SSA name is replaced by a zero constant,
+   which is then propagated through copies and PHIs; a condition that
+   depends on the zero is folded and the dead arm is removed.  A marker that
+   initializes memory stays for expansion, but a later store of zeros to
+   the same memory is redundant and gets deleted, the same way DSE deletes
+   a zero store that follows a memset.  Only the stores that directly use the
+   marker's virtual definition are checked, so a zero store that comes
+   after a call or after another store that stays isn't deleted.  */
+
+class pass_lower_zero_init : public gimple_opt_pass
+{
+public:
+  pass_lower_zero_init (gcc::context *ctxt)
+    : gimple_opt_pass (pass_data_lower_zero_init, ctxt)
+  {}
+
+  /* opt_pass methods: */
+  opt_pass * clone () final override
+  {
+    return new pass_lower_zero_init (m_ctxt);
+  }
+  bool gate (function *) final override
+  {
+    return optimize && flag_auto_var_init != AUTO_INIT_UNINITIALIZED;
+  }
+  unsigned int execute (function *) final override;
+}; // class pass_lower_zero_init
+
+unsigned int
+pass_lower_zero_init::execute (function *fun)
+{
+  unsigned todo = 0;
+  auto_vec<tree> worklist;
+  auto_vec<gimple *> mem_markers;
+  basic_block bb;
+
+  need_eh_cleanup = BITMAP_ALLOC (NULL);
+  need_ab_cleanup = BITMAP_ALLOC (NULL);
+
+  FOR_EACH_BB_FN (bb, fun)
+    for (gimple_stmt_iterator gsi = gsi_start_bb (bb); !gsi_end_p (gsi);
+	 gsi_next (&gsi))
+      {
+	gimple *stmt = gsi_stmt (gsi);
+	if (!zero_init_marker_p (stmt))
+	  continue;
+
+	tree lhs = gimple_call_lhs (stmt);
+	if (TREE_CODE (lhs) == SSA_NAME)
+	  {
+	    if (!SSA_NAME_OCCURS_IN_ABNORMAL_PHI (lhs))
+	      worklist.safe_push (lhs);
+	  }
+	else if (gimple_vdef (stmt))
+	  mem_markers.safe_push (stmt);
+      }
+
+  /* Replace each name with its constant, then look at the statements that
+     used it: those that became a constant themselves are next.  Their
+     results are collected before the replacement since folding may replace
+     the statements.  */
+  while (!worklist.is_empty ())
+    {
+      tree name = worklist.pop ();
+      if (SSA_NAME_IN_FREE_LIST (name))
+	continue;
+      gimple *def = SSA_NAME_DEF_STMT (name);
+      tree val = zero_init_ssa_value (name);
+      if (!val)
+	continue;
+
+      auto_vec<tree, 8> results;
+      imm_use_iterator iter;
+      gimple *use_stmt;
+      FOR_EACH_IMM_USE_STMT (use_stmt, iter, name)
+	{
+	  if (is_gimple_debug (use_stmt))
+	    continue;
+	  if (stmt_ends_bb_p (use_stmt))
+	    todo |= TODO_cleanup_cfg;
+	  tree res = gimple_get_lhs (use_stmt);
+	  if (res && TREE_CODE (res) == SSA_NAME)
+	    results.safe_push (res);
+	}
+
+      replace_uses_by (name, val);
+
+      gimple_stmt_iterator gsi = gsi_for_stmt (def);
+      if (gimple_code (def) == GIMPLE_PHI)
+	remove_phi_node (&gsi, true);
+      else
+	{
+	  gsi_remove (&gsi, true);
+	  release_defs (def);
+	}
+
+      for (tree res : results)
+	if (!SSA_NAME_IN_FREE_LIST (res) && zero_init_ssa_value (res))
+	  worklist.safe_push (res);
+    }
+
+  /* Look for redundant zero stores only now.  SRA writes its scalar
+     replacements back to the aggregate, and those stores only become
+     stores of zero once the propagation above is done.  */
+  for (gimple *stmt : mem_markers)
+    {
+      /* dse_optimize_redundant_stores only looks at the statements that
+	 use the marker's virtual definition directly.  Deleting one of them
+	 makes the store after it a direct user, so repeat until a round
+	 deletes nothing.  */
+      tree vdef = gimple_vdef (stmt);
+      for (unsigned round = 0; round < 64; round++)
+	{
+	  auto_vec<gimple *, 8> users;
+	  imm_use_iterator iter;
+	  gimple *use_stmt;
+	  FOR_EACH_IMM_USE_STMT (use_stmt, iter, vdef)
+	    users.safe_push (use_stmt);
+	  dse_optimize_redundant_stores (stmt);
+	  bool deleted = false;
+	  for (gimple *user : users)
+	    if (!gimple_bb (user))
+	      deleted = true;
+	  if (!deleted)
+	    break;
+	}
+    }
+
+  if (!bitmap_empty_p (need_eh_cleanup))
+    {
+      gimple_purge_all_dead_eh_edges (need_eh_cleanup);
+      todo |= TODO_cleanup_cfg;
+    }
+  if (!bitmap_empty_p (need_ab_cleanup))
+    {
+      gimple_purge_all_dead_abnormal_call_edges (need_ab_cleanup);
+      todo |= TODO_cleanup_cfg;
+    }
+
+  BITMAP_FREE (need_eh_cleanup);
+  BITMAP_FREE (need_ab_cleanup);
+
+  return todo;
+}
+
+} // anon namespace
+
+gimple_opt_pass *
+make_pass_lower_zero_init (gcc::context *ctxt)
+{
+  return new pass_lower_zero_init (ctxt);
+}
