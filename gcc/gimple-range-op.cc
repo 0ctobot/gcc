@@ -944,6 +944,11 @@ public:
       range_cast (tmp, unsigned_type_for (tmp.type ()));
     wide_int max = tmp.upper_bound ();
     maxi = wi::floor_log2 (max) + 1;
+    // An internal call can have a result type narrower than its operand.
+    // Don't truncate a maximum that doesn't fit, since a wrapped bound
+    // would make the range wrong.
+    if (!wi::fits_to_tree_p (maxi, type))
+      return false;
     r.set (type,
 	   wi::shwi (mini, TYPE_PRECISION (type)),
 	   wi::shwi (maxi, TYPE_PRECISION (type)));
