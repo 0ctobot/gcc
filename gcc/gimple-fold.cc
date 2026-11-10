@@ -10335,6 +10335,15 @@ fold_array_ctor_reference (tree type, tree ctor,
       return native_interpret_expr (type, buf, size / BITS_PER_UNIT);
     }
 
+  /* A read that starts inside one element and runs into the next one needs
+     the bytes of both.  Everything below only looks at the element the read
+     starts in, whether that's an explicit element or the implicit zero for
+     one that isn't mentioned, so give up.  The outermost fold_ctor_reference
+     then falls back to native_encode_initializer, which encodes adjacent
+     elements together.  */
+  if (size && inner_offset + size > elt_sz * BITS_PER_UNIT)
+    return NULL_TREE;
+
   unsigned ctor_idx;
   if (tree val = get_array_ctor_element_at_index (ctor, access_index,
 						  &ctor_idx))
@@ -10359,13 +10368,6 @@ fold_array_ctor_reference (tree type, tree ctor,
 	  type = TREE_TYPE (val);
 	  size = elt_sz * BITS_PER_UNIT;
 	}
-      else if (size && access_index < CONSTRUCTOR_NELTS (ctor) - 1
-	       && TREE_CODE (val) == CONSTRUCTOR
-	       && (elt_sz * BITS_PER_UNIT - inner_offset) < size)
-	/* If this isn't the last element in the CTOR and a CTOR itself
-	   and it does not cover the whole object we are requesting give up
-	   since we're not set up for combining from multiple CTORs.  */
-	return NULL_TREE;
 
       *suboff += access_index.to_uhwi () * elt_sz * BITS_PER_UNIT;
       return fold_ctor_reference (type, val, inner_offset, size, from_decl,
