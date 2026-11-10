@@ -3097,8 +3097,9 @@ struct refs_hasher : free_ptr_hash<ref_to_bb>
   static inline bool equal (const ref_to_bb *, const ref_to_bb *);
 };
 
-/* Used for quick clearing of the hash-table when we see calls.
-   Hash entries with phase < nt_call_phase are invalid.  */
+/* Used for quick clearing of the hash-table when we see calls or
+   volatile accesses.  Hash entries with phase < nt_call_phase are
+   invalid.  */
 static unsigned int nt_call_phase;
 
 /* The hash function.  */
@@ -3173,6 +3174,14 @@ nontrapping_dom_walker::before_dom_children (basic_block bb)
       if ((gimple_code (stmt) == GIMPLE_ASM && gimple_vdef (stmt))
 	  || (is_gimple_call (stmt)
 	      && (!nonfreeing_call_p (stmt) || !nonbarrier_call_p (stmt))))
+	nt_call_phase++;
+      /* A dominating access also lets cselim store unconditionally without
+	 introducing a data race, since the location is already accessed on
+	 every path.  That no longer holds across a volatile access, which can
+	 hand the location over to another thread just like a barrier, as in
+	 a WRITE_ONCE followed by a READ_ONCE that checks it was handed
+	 back.  */
+      else if (!flag_store_data_races && gimple_has_volatile_ops (stmt))
 	nt_call_phase++;
       else if (gimple_assign_single_p (stmt) && !gimple_has_volatile_ops (stmt))
 	{
