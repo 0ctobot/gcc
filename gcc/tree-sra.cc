@@ -2932,9 +2932,19 @@ analyze_access_subtree (struct access *root, struct access *parent,
   if (!totally && root->grp_result_of_prop_from_lhs)
     allow_replacements = false;
 
+  /* Total scalarization treats the gaps between fields as covered, since
+     padding normally has no value worth keeping.  That isn't the case when
+     padding is supposed to be zeroed: a copy of the aggregate rebuilt from
+     the field replacements would leave whatever the destination held in
+     the gaps.  Count the gaps as holes then, so the aggregate stays in
+     memory and is copied as a whole.  */
+  bool keep_padding
+    = totally && ((flag_auto_var_init & (AUTO_INIT_PATTERN | AUTO_INIT_ZERO))
+		  || flag_zero_init_padding_bits == ZERO_INIT_PADDING_BITS_ALL);
+
   for (child = root->first_child; child; child = child->next_sibling)
     {
-      if (totally)
+      if (totally && !keep_padding)
 	covered_to = child->offset;
       else
 	hole |= covered_to < child->offset;
@@ -2948,7 +2958,7 @@ analyze_access_subtree (struct access *root, struct access *parent,
 	covered_to += child->size;
       else
 	hole = true;
-      if (totally && !hole)
+      if (totally && !keep_padding && !hole)
 	covered_to = limit;
     }
 
