@@ -2112,6 +2112,120 @@ view_converted_memref_p (tree base)
 	  != 1);
 }
 
+/* Return true if PTR may hold an address below the start of DECL, which
+   is what a container_of () pointer built from the address of DECL looks
+   like.  Linux's list code does this to treat a list head that is a
+   variable as a fake entry of the containing type, and accesses through
+   such a pointer at a positive offset land in the head itself.
+
+   Only a bounded walk over SSA copies, pointer conversions, PHIs and
+   constant pointer offsets is done, which is enough for the container_of ()
+   forms GIMPLE produces.  A derivation through anything else, such as a
+   parameter, a call result, a load or integer arithmetic, isn't found, in
+   which case the pointer is assumed to point at or above DECL as before.
+
+   A name can be reached along several paths with different offsets, and
+   the lower the offset it is reached with, the lower the totals it leads
+   to.  A name is therefore expanded again when it's reached with a lower
+   offset than it was last expanded with, and skipped otherwise.  A PHI
+   cycle that steps upwards is expanded once, while one that steps
+   downwards lowers the offset on every turn until the budget runs out.
+   When the walk runs out of budget before it has seen every definition,
+   the pointer may still come from DECL, so the answer is true.  */
+
+static bool
+ptr_may_point_below_decl_p (tree ptr, tree decl)
+{
+  auto_vec<std::pair<tree, offset_int>, 8> worklist;
+  auto_vec<std::pair<tree, offset_int>, 16> visited;
+  unsigned steps = 0;
+
+  worklist.safe_push (std::make_pair (ptr, offset_int (0)));
+  while (!worklist.is_empty ())
+    {
+      if (++steps > 16)
+	return true;
+      std::pair<tree, offset_int> item = worklist.pop ();
+      tree p = item.first;
+      offset_int off = item.second;
+
+      if (TREE_CODE (p) == ADDR_EXPR)
+	{
+	  poly_int64 unit_off;
+	  tree base = get_addr_base_and_unit_offset (TREE_OPERAND (p, 0),
+						     &unit_off);
+	  if (!base || !unit_off.is_constant ())
+	    continue;
+	  off += unit_off.to_constant ();
+	  if (base == decl)
+	    {
+	      if (wi::neg_p (off))
+		return true;
+	      continue;
+	    }
+
+	  /* Keep following &PTR2->FIELD, where PTR2 is an SSA name.  */
+	  if (TREE_CODE (base) != MEM_REF
+	      || TREE_CODE (TREE_OPERAND (base, 0)) != SSA_NAME)
+	    continue;
+	  off += offset_int::from (wi::to_wide (TREE_OPERAND (base, 1)),
+				   SIGNED);
+	  p = TREE_OPERAND (base, 0);
+	}
+
+      if (TREE_CODE (p) != SSA_NAME)
+	continue;
+
+      /* Nothing new can be found from a name that was already expanded
+	 with the same or a lower offset.  */
+      unsigned i;
+      for (i = 0; i < visited.length (); i++)
+	if (visited[i].first == p)
+	  break;
+      if (i == visited.length ())
+	visited.safe_push (std::make_pair (p, off));
+      else if (wi::les_p (visited[i].second, off))
+	continue;
+      else
+	visited[i].second = off;
+
+      /* The MEM_EXPR of an RTL access can still refer to a name that was
+	 released during or after out-of-SSA.  Its definition is gone, so
+	 nothing is known about where it points.  */
+      gimple *def = SSA_NAME_DEF_STMT (p);
+      if (!def || SSA_NAME_IN_FREE_LIST (p))
+	return true;
+      if (gphi *phi = dyn_cast <gphi *> (def))
+	{
+	  for (unsigned i = 0; i < gimple_phi_num_args (phi); i++)
+	    worklist.safe_push (std::make_pair (gimple_phi_arg_def (phi, i),
+						off));
+	  continue;
+	}
+      if (!is_gimple_assign (def))
+	continue;
+
+      tree rhs1 = gimple_assign_rhs1 (def);
+      enum tree_code code = gimple_assign_rhs_code (def);
+      if (code == POINTER_PLUS_EXPR)
+	{
+	  tree rhs2 = gimple_assign_rhs2 (def);
+	  if (TREE_CODE (rhs2) == INTEGER_CST)
+	    worklist.safe_push
+	      (std::make_pair (rhs1,
+			       off + offset_int::from (wi::to_wide (rhs2),
+						       SIGNED)));
+	}
+      else if ((code == SSA_NAME
+		|| code == ADDR_EXPR
+		|| CONVERT_EXPR_CODE_P (code))
+	       && POINTER_TYPE_P (TREE_TYPE (rhs1)))
+	worklist.safe_push (std::make_pair (rhs1, off));
+    }
+
+  return false;
+}
+
 /* Return true if an indirect reference based on *PTR1 constrained
    to [OFFSET1, OFFSET1 + MAX_SIZE1) may alias a variable based on BASE2
    constrained to [OFFSET2, OFFSET2 + MAX_SIZE2).  *PTR1 and BASE2 have
@@ -2147,18 +2261,27 @@ indirect_ref_may_alias_decl_p (tree ref1 ATTRIBUTE_UNUSED, tree base1,
      of the variable).
      ???  IVOPTs creates bases that do not honor this restriction,
      so do not apply this optimization for TARGET_MEM_REFs.  */
-  if (TREE_CODE (base1) != TARGET_MEM_REF
-      && !ranges_maybe_overlap_p (offset1 + moff, -1, offset2, max_size2))
-    return false;
+  bool beyond_decl_p
+    = (TREE_CODE (base1) != TARGET_MEM_REF
+       && !ranges_maybe_overlap_p (offset1 + moff, -1, offset2, max_size2));
 
   /* If the pointer based access is bigger than the variable they cannot
      alias.  This is similar to the check below where we use TBAA to
      increase the size of the pointer based access based on the dynamic
      type of a containing object we can infer from it.  */
   poly_int64 dsize2;
-  if (known_size_p (size1)
-      && poly_int_tree_p (DECL_SIZE (base2), &dsize2)
-      && known_lt (dsize2, size1))
+  bool bigger_than_decl_p
+    = (known_size_p (size1)
+       && poly_int_tree_p (DECL_SIZE (base2), &dsize2)
+       && known_lt (dsize2, size1));
+
+  /* Both of the above assume the pointer can't point below the start of
+     the variable.  A container_of () pointer built from the variable's
+     address does point below it, and code built with
+     -fno-strict-aliasing still relies on such accesses reaching the
+     variable, so skip both tests for it.  */
+  if ((beyond_decl_p || bigger_than_decl_p)
+      && !ptr_may_point_below_decl_p (ptr1, base2))
     return false;
 
   /* They also cannot alias if the pointer may not point to the decl.  */
