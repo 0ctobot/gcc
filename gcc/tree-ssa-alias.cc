@@ -1610,13 +1610,19 @@ nonoverlapping_array_refs_p (tree ref1, tree ref2)
 
 /* Return true if the access path of REF, up to but not including STOP,
    indexes an array that has no upper bound or at most one element with a
-   non-constant index.  Such an array is often a header's variable-length
-   tail, or a zero-length marker, that isn't the last member: a header
-   embedded ahead of the storage for its elements, or a [0] marker followed
-   by more members.  Indexing it reaches past its declared end into the
-   members that follow, so the access can overlap a sibling member of any
-   structure that contains the array, and different FIELD_DECLs on the two
-   paths prove nothing.  */
+   non-constant index, or indexes any array with a constant index that is
+   outside of its bounds or not known to be inside of them.  Such an array is
+   often a header's variable-length tail, or a zero-length marker, that isn't
+   the last member: a header embedded ahead of the storage for its elements,
+   or a [0] marker followed by more members.  Indexing it reaches past its
+   declared end into the members that follow, so the access can overlap a
+   sibling member of any structure that contains the array, and different
+   FIELD_DECLs on the two paths prove nothing.  A constant index past the end
+   is as common as a variable one, as with hdr->data[1] for the second
+   element of a [1] array.  A constant index outside the bounds of an array
+   of any size reaches the memory around it just the same, such as t->b[-1]
+   for the last element of the member before b, or m[0][4] for the first
+   element of row 1 of an int m[2][4].  */
 
 bool
 ref_indexes_short_array_p (tree ref, tree stop)
@@ -1624,12 +1630,23 @@ ref_indexes_short_array_p (tree ref, tree stop)
   for (; handled_component_p (ref) && ref != stop;
        ref = TREE_OPERAND (ref, 0))
     {
-      if ((TREE_CODE (ref) != ARRAY_REF
-	   && TREE_CODE (ref) != ARRAY_RANGE_REF)
-	  || TREE_CODE (TREE_OPERAND (ref, 1)) == INTEGER_CST)
+      if (TREE_CODE (ref) != ARRAY_REF
+	  && TREE_CODE (ref) != ARRAY_RANGE_REF)
 	continue;
+      tree index = TREE_OPERAND (ref, 1);
       tree low = array_ref_low_bound (ref);
       tree high = array_ref_up_bound (ref);
+      if (TREE_CODE (index) == INTEGER_CST)
+	{
+	  /* An access that stays inside the array can't reach a sibling.  */
+	  if (high
+	      && TREE_CODE (low) == INTEGER_CST
+	      && TREE_CODE (high) == INTEGER_CST
+	      && !tree_int_cst_lt (index, low)
+	      && !tree_int_cst_lt (high, index))
+	    continue;
+	  return true;
+	}
       if (!high
 	  || TREE_CODE (low) != INTEGER_CST
 	  || TREE_CODE (high) != INTEGER_CST
@@ -1681,10 +1698,10 @@ nonoverlapping_refs_since_match_p (tree match1, tree ref1,
 
   /* The walk below concludes "no overlap" from two different FIELD_DECLs
      of one RECORD_TYPE, or from different constant indices of one array,
-     which assumes that every variable index stays inside its array.  Don't
-     assume that for an array whose declared size can't hold the index;
-     callers have already compared the offsets and max sizes, which stay
-     right for members ahead of such an array.  */
+     which assumes that every index stays inside its array.  Don't assume
+     that for an array whose declared size can't hold the index; callers
+     have already compared the offsets and max sizes, which stay right for
+     members ahead of such an array.  */
   if (ref_indexes_short_array_p (ref1, match1)
       || ref_indexes_short_array_p (ref2, match2))
     {
