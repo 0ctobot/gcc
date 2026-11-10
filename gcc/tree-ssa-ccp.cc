@@ -1105,7 +1105,7 @@ ccp_lattice_meet (ccp_prop_value_t *val1, ccp_prop_value_t *val2)
     }
   else if (val1->lattice_val == CONSTANT
 	   && val2->lattice_val == CONSTANT
-	   && operand_equal_p (val1->value, val2->value, 0))
+	   && operand_equal_for_phi_arg_p (val1->value, val2->value))
     {
       /* Ci M Cj = Ci		if (i == j)
 	 Ci M Cj = VARYING	if (i != j)

@@ -11884,9 +11884,9 @@ lower_bound_in_type (tree outer, tree inner)
 
 /* Return true if two operands that are suitable for PHI nodes are
    necessarily equal.  Specifically, both ARG0 and ARG1 must be either
-   SSA_NAME or invariant.  Note that this is strictly an optimization.
-   That is, callers of this function can directly call operand_equal_p
-   and get the same result, only slower.  */
+   SSA_NAME or invariant.  Unlike operand_equal_p, this treats the addresses
+   of different members at the same offset as unequal until the object sizes
+   have been computed.  */
 
 bool
 operand_equal_for_phi_arg_p (const_tree arg0, const_tree arg1)
@@ -11895,7 +11895,15 @@ operand_equal_for_phi_arg_p (const_tree arg0, const_tree arg1)
     return true;
   if (TREE_CODE (arg0) == SSA_NAME || TREE_CODE (arg1) == SSA_NAME)
     return false;
-  return operand_equal_p (arg0, arg1, 0);
+
+  /* The addresses of two members at the same offset in one object are
+     equal, but the members' object sizes differ.  Until the object sizes
+     have been computed, keep such addresses apart so that a PHI of them
+     isn't replaced by one of its arguments.  */
+  unsigned int flags = 0;
+  if (cfun && !(cfun->curr_properties & PROP_objsz))
+    flags = OEP_ADDRESS_OF_SAME_FIELD;
+  return operand_equal_p (arg0, arg1, flags);
 }
 
 /* Returns number of zeros at the end of binary representation of X.  */

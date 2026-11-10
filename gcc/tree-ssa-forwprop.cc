@@ -6811,7 +6811,7 @@ pass_forwprop::execute (function *fun)
 		;
 	      else if (! first)
 		first = use;
-	      else if (! operand_equal_p (first, use, 0))
+	      else if (! operand_equal_for_phi_arg_p (first, use))
 		{
 		  all_same = false;
 		  break;
