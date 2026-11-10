@@ -124,10 +124,17 @@ gen_log2 (tree op, location_t loc, tree *result, tree type)
     tmp1 = gimple_convert (&stmts, loc, type, op);
   else
     tmp1 = op;
-  /* Build FFS (op) - 1.  */
-  tree tmp2 = gimple_build (&stmts, loc, IFN_FFS, orig_type, tmp1);
+  /* Build FFS (op) - 1 in TYPE and convert the result back to the index
+     type afterwards.  TYPE can be wider than the index type (e.g., int for
+     a narrow bit-field), and FFS of a TYPE operand can be as large as the
+     precision of TYPE, which may not fit the index type.  The logarithm of
+     a power of two in the index type always fits, so the final conversion
+     is exact.  */
+  tree tmp2 = gimple_build (&stmts, loc, IFN_FFS, type, tmp1);
   tree tmp3 = gimple_build (&stmts, loc, MINUS_EXPR,
-			    orig_type, tmp2, build_one_cst (orig_type));
+			    type, tmp2, build_one_cst (type));
+  if (type != orig_type)
+    tmp3 = gimple_convert (&stmts, loc, orig_type, tmp3);
   *result = tmp3;
   return stmts;
 }
