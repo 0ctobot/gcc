@@ -133,6 +133,8 @@ static struct datadep_stats
 static bool subscript_dependence_tester_1 (struct data_dependence_relation *,
 					   unsigned int, unsigned int,
 					   class loop *);
+static bool object_address_invariant_in_loop_p (const class loop *,
+						const_tree);
 /* Returns true iff A divides B.  */
 
 static inline bool
@@ -1386,6 +1388,22 @@ dr_analyze_indices (struct indices *dri, tree ref, edge nest, loop_p loop,
 	  tree access_fn = analyze_scalar_evolution (loop, op, nowrap_bound);
 	  access_fn = instantiate_scev (nest, loop, access_fn);
 	  access_fns.safe_push (access_fn);
+
+	  /* A variable index into an array that has no upper bound or at
+	     most one element, such as a [1] or [0] member that isn't the
+	     last one, can reach the members that follow the array.  The
+	     offsets of the enclosing components then don't separate this
+	     access from one to a later member, so make the array itself
+	     the base object.  References into two different arrays then
+	     have different bases and get compared by their addresses, and
+	     dr_may_alias_p compares the objects that enclose the arrays.  */
+	  if (handled_component_p (TREE_OPERAND (ref, 0))
+	      && ref_indexes_short_array_p (ref, TREE_OPERAND (ref, 0)))
+	    {
+	      dri->base_object = TREE_OPERAND (ref, 0);
+	      dri->access_fns = access_fns;
+	      return;
+	    }
 	}
       else if (TREE_CODE (ref) == COMPONENT_REF
 	       && (TREE_CODE (TREE_TYPE (TREE_OPERAND (ref, 0))) == RECORD_TYPE
@@ -2186,6 +2204,14 @@ create_intersect_range_checks_index (class loop *loop, tree *cond_expr,
     return false;
 
   if (!operand_equal_p (DR_BASE_OBJECT (dr_a.dr), DR_BASE_OBJECT (dr_b.dr), 0))
+    return false;
+
+  /* The index ranges only tell the accesses apart if the base object stays at
+     one address for the whole loop.  dr_analyze_indices can leave an index that
+     LOOP varies inside the base object, as it does for an array that encloses a
+     [0] or [1] member array, and then the same index reaches a different
+     address in each iteration.  */
+  if (!object_address_invariant_in_loop_p (loop, DR_BASE_OBJECT (dr_a.dr)))
     return false;
 
   if (!operand_equal_p (DR_STEP (dr_a.dr), DR_STEP (dr_b.dr), 0))
@@ -3057,6 +3083,27 @@ contains_ssa_ref_p (tree ref)
   return res;
 }
 
+/* Return what the access functions of DR are applied to for the purpose of
+   alias analysis.  That's DR_BASE_OBJECT unless it's an array within an
+   enclosing object, which is where dr_analyze_indices stops for an array
+   whose elements can extend past its declared end, or for an array member
+   of a union.  Indexing such an array can reach whatever follows it, so
+   only the enclosing object covers everything that DR can access.  */
+
+static tree
+dr_alias_base_object (const struct data_reference *dr)
+{
+  tree base = DR_BASE_OBJECT (dr);
+  if (DR_NUM_DIMENSIONS (dr) == 0
+      || !handled_component_p (base)
+      || TREE_CODE (TREE_TYPE (base)) != ARRAY_TYPE)
+    return base;
+
+  while (handled_component_p (base))
+    base = TREE_OPERAND (base, 0);
+  return base;
+}
+
 /* Returns false if we can prove that data references A and B do not alias,
    true otherwise.  If LOOP_NEST is false no cross-iteration aliases are
    considered.  */
@@ -3065,8 +3112,8 @@ bool
 dr_may_alias_p (const struct data_reference *a, const struct data_reference *b,
 		class loop *loop_nest)
 {
-  tree addr_a = DR_BASE_OBJECT (a);
-  tree addr_b = DR_BASE_OBJECT (b);
+  tree addr_a = dr_alias_base_object (a);
+  tree addr_b = dr_alias_base_object (b);
 
   /* If we are not processing a loop nest but scalar code we
      do not need to care about possible cross-iteration dependences
