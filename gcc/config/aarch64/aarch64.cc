@@ -29941,6 +29941,13 @@ aarch64_expand_cpymem (rtx *operands, bool is_memmove)
      whether that would improve performance.  */
   bool use_qregs = size > 24 && TARGET_SIMD;
 
+  /* An overlapping tail accesses some bytes twice, which is wrong for
+     volatile memory: a device register or a buffer shared with another
+     agent sees each repeated access.  Copy the tail in non-overlapping
+     pieces when either side is volatile.  */
+  bool overlap_tail = (!STRICT_ALIGNMENT
+		       && !MEM_VOLATILE_P (dst) && !MEM_VOLATILE_P (src));
+
   base = copy_to_mode_reg (Pmode, XEXP (dst, 0));
   dst = adjust_automodify_address (dst, VOIDmode, base, 0);
 
@@ -29976,7 +29983,7 @@ aarch64_expand_cpymem (rtx *operands, bool is_memmove)
 
       /* Emit trailing copies using overlapping unaligned accesses
 	 (when !STRICT_ALIGNMENT) - this is smaller and faster.  */
-      if (size > 0 && size < 16 && !STRICT_ALIGNMENT)
+      if (size > 0 && size < 16 && overlap_tail)
 	{
 	  next_mode = smallest_mode_for_size
 	    (size * BITS_PER_UNIT, MODE_INT).require ();
@@ -30053,6 +30060,10 @@ aarch64_expand_setmem (rtx *operands)
   if (len > max_set_size || (TARGET_MOPS && len > mops_threshold))
     return aarch64_expand_setmem_mops (operands);
 
+  /* As in aarch64_expand_cpymem, don't write any byte of a volatile
+     destination twice.  */
+  bool overlap_tail = !STRICT_ALIGNMENT && !MEM_VOLATILE_P (dst);
+
   base = copy_to_mode_reg (Pmode, XEXP (dst, 0));
   dst = adjust_automodify_address (dst, VOIDmode, base, 0);
 
@@ -30088,7 +30099,7 @@ aarch64_expand_setmem (rtx *operands)
 
       /* Emit trailing writes using overlapping unaligned accesses
 	 (when !STRICT_ALIGNMENT) - this is smaller and faster.  */
-      if (len > 0 && len < 16 && !STRICT_ALIGNMENT)
+      if (len > 0 && len < 16 && overlap_tail)
 	{
 	  next_mode = smallest_mode_for_size
 	    (len * BITS_PER_UNIT, MODE_INT).require ();

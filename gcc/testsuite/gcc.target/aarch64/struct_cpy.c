@@ -63,7 +63,10 @@ FUN(14)
 FUN(15)
 FUN(16)
 
-/* { dg-final { scan-assembler-times {ldr\s} 18 } } */
-/* { dg-final { scan-assembler-times {ldrb} 4 } } */
-/* { dg-final { scan-assembler-times {ldrh} 4 } } */
+/* Each var##x is volatile, so its copy is made of non-overlapping accesses
+   (4, 2 and 1 bytes for struct7) rather than ending with an access that
+   overlaps bytes already copied.  */
+/* { dg-final { scan-assembler-times {ldr\s} 16 } } */
+/* { dg-final { scan-assembler-times {ldrb} 8 } } */
+/* { dg-final { scan-assembler-times {ldrh} 8 } } */
 /* { dg-final { scan-assembler-times {ldp} 1 } } */
