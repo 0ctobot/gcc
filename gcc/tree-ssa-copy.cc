@@ -403,7 +403,7 @@ copy_prop::visit_phi (gphi *phi)
       /* If PHI_VAL and ARG don't have a common copy-of chain, then
 	 this PHI node cannot be a copy operation.  */
       if (phi_val.value != arg_value
-	  && !operand_equal_p (phi_val.value, arg_value, 0))
+	  && !operand_equal_for_phi_arg_p (phi_val.value, arg_value))
 	{
 	  phi_val.value = lhs;
 	  break;

@@ -501,7 +501,7 @@ degenerate_phi_result (gphi *phi)
 	 a released SSA name.  */
       else if (TREE_CODE (val) != TREE_CODE (arg)
 	       || TREE_CODE (val) == SSA_NAME
-	       || !operand_equal_p (arg, val, 0))
+	       || !operand_equal_for_phi_arg_p (arg, val))
 	break;
     }
   return (i == gimple_phi_num_args (phi) ? val : NULL);

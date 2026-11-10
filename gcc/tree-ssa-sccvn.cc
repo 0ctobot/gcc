@@ -5200,6 +5200,30 @@ cond_stmts_equal_p (gcond *cond1, tree lhs1, tree rhs1,
 	      && expressions_equal_p (rhs1, lhs2)));
 }
 
+/* Return true if the values VAL1 and VAL2, which compare equal, can replace
+   each other.  The addresses of two members at the same offset compare equal,
+   but the members' object sizes differ, so keep them apart until the object
+   sizes have been computed.  */
+
+static bool
+vn_values_interchangeable_p (tree val1, tree val2)
+{
+  return (TREE_CODE (val1) != ADDR_EXPR
+	  || (cfun->curr_properties & PROP_objsz)
+	  || operand_equal_p (val1, val2,
+			      OEP_PURE_SAME | OEP_ADDRESS_OF_SAME_FIELD));
+}
+
+/* Return true if the arguments ARG1 and ARG2 of two PHIs being compared are
+   equal.  */
+
+static bool
+vn_phi_args_equal_p (tree arg1, tree arg2)
+{
+  return (expressions_equal_p (arg1, arg2, false)
+	  && vn_values_interchangeable_p (arg1, arg2));
+}
+
 /* Compare two phi entries for equality, ignoring VN_TOP arguments.  */
 
 static int
@@ -5272,10 +5296,10 @@ vn_phi_eq (const_vn_phi_t const vp1, const_vn_phi_t const vp2)
 	       only match VN_TOP == VN_TOP for now, we could allow
 	       VN_TOP on the not prevailing PHI though.  See for example
 	       PR102920.  */
-	    if (! expressions_equal_p (vp1->phiargs[te1->dest_idx],
-				       vp2->phiargs[te2->dest_idx], false)
-		|| ! expressions_equal_p (vp1->phiargs[fe1->dest_idx],
-					  vp2->phiargs[fe2->dest_idx], false))
+	    if (! vn_phi_args_equal_p (vp1->phiargs[te1->dest_idx],
+				       vp2->phiargs[te2->dest_idx])
+		|| ! vn_phi_args_equal_p (vp1->phiargs[fe1->dest_idx],
+					  vp2->phiargs[fe2->dest_idx]))
 	      return false;
 
 	    return true;
@@ -5300,7 +5324,7 @@ vn_phi_eq (const_vn_phi_t const vp1, const_vn_phi_t const vp2)
       tree phi2op = vp2->phiargs[i];
       if (phi1op == phi2op)
 	continue;
-      if (!expressions_equal_p (phi1op, phi2op, false))
+      if (!vn_phi_args_equal_p (phi1op, phi2op))
 	return false;
     }
 
@@ -6464,7 +6488,8 @@ visit_reference_op_store (tree lhs, tree op, gimple *stmt)
       tree result = vnresult->result;
       gcc_checking_assert (TREE_CODE (result) != SSA_NAME
 			   || result == SSA_VAL (result));
-      resultsame = expressions_equal_p (result, op);
+      resultsame = (expressions_equal_p (result, op)
+		    && vn_values_interchangeable_p (result, op));
       if (resultsame)
 	{
 	  /* If the TBAA state isn't compatible for downstream reads
@@ -6623,7 +6648,8 @@ visit_phi (gimple *phi, bool *inserted, bool backedges_varying_p)
 	    sameval = def;
 	    sameval_e = e;
 	  }
-	else if (expressions_equal_p (def, sameval))
+	else if (expressions_equal_p (def, sameval)
+		 && vn_values_interchangeable_p (def, sameval))
 	  sameval_e = NULL;
 	else if (virtual_operand_p (def))
 	  {
@@ -6637,6 +6663,7 @@ visit_phi (gimple *phi, bool *inserted, bool backedges_varying_p)
 	       which we cannot do in expressions_equal_p.  */
 	    if (TREE_CODE (def) == ADDR_EXPR
 		&& TREE_CODE (sameval) == ADDR_EXPR
+		&& (cfun->curr_properties & PROP_objsz)
 		&& sameval_base != (void *)-1)
 	      {
 		if (!sameval_base)
@@ -7684,7 +7711,8 @@ eliminate_dom_walker::eliminate_stmt (basic_block b, gimple_stmt_iterator *gsi)
 	rhs = VN_INFO (rhs)->valnum;
       gassign *ass;
       if (val
-	  && (operand_equal_p (val, rhs, 0)
+	  && ((operand_equal_p (val, rhs, 0)
+	       && vn_values_interchangeable_p (val, rhs))
 	      /* Due to the bitfield lookups above we can get bit
 		 interpretations of the same RHS as values here.  Those
 		 are redundant as well.  */
