@@ -1024,6 +1024,14 @@ crc_optimization::loop_calculates_crc (gphi *output_crc,
      to keep states, for further comparison.  */
   bool is_crc = true;
   crc_symbolic_execution loop_executor (m_crc_loop, output_crc);
+
+  /* The data's bits are symbolic during the execution unless its initial
+     value is a constant, in which case its bits are tracked as known
+     values.  Only symbolic data can appear in the CRC's condition.  */
+  tree data_origin = NULL_TREE;
+  if (m_phi_for_data && TREE_CODE (m_data_arg) != INTEGER_CST)
+    data_origin = gimple_phi_result (m_phi_for_data);
+
   while (!loop_executor.is_last_iteration ())
     {
       if (!loop_executor.symb_execute_crc_loop ())
@@ -1039,6 +1047,7 @@ crc_optimization::loop_calculates_crc (gphi *output_crc,
       tree calculated_crc = PHI_ARG_DEF_FROM_EDGE (output_crc,
 						   single_exit (m_crc_loop));
       if (!all_states_match_lfsr (lfsr, m_is_bit_forward, calculated_crc,
+				 data_origin,
 				 loop_executor.get_final_states ()))
 	{
 	  if (dump_file && (dump_flags & TDF_DETAILS))
