@@ -1,5 +1,5 @@
 /* { dg-do compile } */
-/* { dg-options "-O -fdump-tree-fre1" } */
+/* { dg-options "-O -fdump-tree-fre1 -fdump-tree-fre3" } */
 
 struct S { char a[3]; char b[5]; } s = { "abc", "defg" };
 
@@ -25,4 +25,7 @@ bar (int a, int b)
   return __builtin_strlen (p);
 }
 
-/* { dg-final { scan-tree-dump-times "strlen \\\(&s" 2 "fre1" } } */
+/* &s.a and &s are at the same offset but have different subobject sizes, so
+   FRE only merges the PHIs of them once the object sizes are known.  */
+/* { dg-final { scan-tree-dump-not "strlen \\\(&s" "fre1" } } */
+/* { dg-final { scan-tree-dump-times "strlen \\\(&s" 2 "fre3" } } */
