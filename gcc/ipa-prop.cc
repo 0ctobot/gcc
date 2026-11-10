@@ -3320,6 +3320,10 @@ ipa_analyze_call_uses (struct ipa_func_body_info *fbi, gcall *call)
 static void
 note_fnptr_in_record (tree rec_type, unsigned fld_offset, tree fn)
 {
+  /* A store through a pointer to a non-const record and a call through a
+     pointer to a const one use the same field, so key on the main
+     variant.  */
+  rec_type = TYPE_MAIN_VARIANT (rec_type);
   gcc_assert (!fn || TREE_CODE (fn) == FUNCTION_DECL);
   gcc_assert (TREE_CODE (rec_type) == RECORD_TYPE);
   /* Storing a function with a different signature through a cast leaves the
@@ -3399,7 +3403,7 @@ ipa_single_noted_fnptr_in_record (tree rec_type, unsigned fld_offset)
     return NULL_TREE;
 
   noted_fnptr_store repr;
-  repr.rec_type = rec_type;
+  repr.rec_type = TYPE_MAIN_VARIANT (rec_type);
   repr.fld_offset = fld_offset;
 
   noted_fnptr_store **slot = noted_fnptrs_in_records->find_slot (&repr,
@@ -3407,6 +3411,36 @@ ipa_single_noted_fnptr_in_record (tree rec_type, unsigned fld_offset)
   if (!slot)
     return NULL_TREE;
   return (*slot)->fn;
+}
+
+/* Note a store of VAL to the function pointer FLD_OFFSET bytes into a record
+   of type REC_TYPE.  VAL is NULL_TREE when the stored value isn't available,
+   such as for the result of a call.
+
+   Anything other than the address of a function, such as a parameter, a
+   pointer loaded from another structure or the result of a conditional, can
+   be any function, so it leaves the field without a single known target.  A
+   null pointer adds no call target: a call through it is either guarded by a
+   check for null or faults, and the speculative call's fallback handles a
+   null field exactly as the indirect call does.  */
+
+static void
+note_fnptr_value_in_record (tree rec_type, unsigned fld_offset, tree val)
+{
+  if (val)
+    {
+      STRIP_NOPS (val);
+      if (integer_zerop (val)
+	  || (TREE_CODE (val) == CONSTRUCTOR && CONSTRUCTOR_NELTS (val) == 0))
+	return;
+      if (TREE_CODE (val) == ADDR_EXPR
+	  && TREE_CODE (TREE_OPERAND (val, 0)) == FUNCTION_DECL)
+	{
+	  note_fnptr_in_record (rec_type, fld_offset, TREE_OPERAND (val, 0));
+	  return;
+	}
+    }
+  note_fnptr_in_record (rec_type, fld_offset, NULL_TREE);
 }
 
 /* Free the hash table storing the information about function pointers stored
@@ -3429,20 +3463,25 @@ ipa_free_noted_fnptr_calls ()
 static void
 ipa_analyze_stmt_uses (struct ipa_func_body_info *fbi, gimple *stmt)
 {
+  tree lhs, val;
   if (is_gimple_call (stmt))
-    ipa_analyze_call_uses (fbi, as_a <gcall *> (stmt));
-  else if (gimple_assign_single_p (stmt)
-	   && TREE_CODE (gimple_assign_rhs1 (stmt)) == ADDR_EXPR
-	   && (TREE_CODE (TREE_OPERAND (gimple_assign_rhs1 (stmt), 0))
-	       == FUNCTION_DECL))
     {
-      tree rec_type;
-      unsigned fld_offset;
-      if (is_func_ptr_from_record (gimple_assign_lhs (stmt), &rec_type,
-				   &fld_offset))
-	note_fnptr_in_record (rec_type, fld_offset,
-			      TREE_OPERAND (gimple_assign_rhs1 (stmt), 0));
+      ipa_analyze_call_uses (fbi, as_a <gcall *> (stmt));
+      lhs = gimple_call_lhs (stmt);
+      val = NULL_TREE;
     }
+  else if (gimple_assign_single_p (stmt) && !gimple_clobber_p (stmt))
+    {
+      lhs = gimple_assign_lhs (stmt);
+      val = gimple_assign_rhs1 (stmt);
+    }
+  else
+    return;
+
+  tree rec_type;
+  unsigned fld_offset;
+  if (lhs && is_func_ptr_from_record (lhs, &rec_type, &fld_offset))
+    note_fnptr_value_in_record (rec_type, fld_offset, val);
 }
 
 /* Callback of walk_stmt_load_store_addr_ops for the visit_load.
@@ -3706,32 +3745,47 @@ ipa_analyze_node (struct cgraph_node *node)
   pop_cfun ();
 }
 
-/* Analyze NODE and note any function pointers in record-typed static
-   initializers.
+/* Note the function pointers that CTOR, an initializer of an object of type
+   TYPE, stores to records, including records in arrays and nested in other
+   records or unions.  */
 
-   TODO: The current implementation does not traverse the initializers to scan
-   records nested inside other types.  It should catch the most basic way of
-   writing "virtual functions" in C but can be extended, of course.
-*/
-
-void
-ipa_analyze_var_static_initializer (varpool_node *node)
+static void
+note_fnptrs_in_ctor (tree type, tree ctor)
 {
-  tree decl = node->decl;
-  tree rec_type = TREE_TYPE (decl);
-  if (TREE_CODE (rec_type) != RECORD_TYPE
-      || TREE_CODE (DECL_INITIAL (decl)) != CONSTRUCTOR)
+  if (TREE_CODE (ctor) != CONSTRUCTOR)
     return;
 
   unsigned ix;
   tree index, val;
-  FOR_EACH_CONSTRUCTOR_ELT (CONSTRUCTOR_ELTS (DECL_INITIAL (decl)), ix, index,
-			    val)
+  if (TREE_CODE (type) == ARRAY_TYPE)
     {
-      if (TREE_CODE (val) != ADDR_EXPR
-	  || TREE_CODE (TREE_OPERAND (val, 0)) != FUNCTION_DECL
-	  /* ObjC can produce constructor elements with NULL indices.  */
-	  || !index)
+      tree elt_type = TREE_TYPE (type);
+      if (!RECORD_OR_UNION_TYPE_P (elt_type)
+	  && TREE_CODE (elt_type) != ARRAY_TYPE)
+	return;
+      FOR_EACH_CONSTRUCTOR_VALUE (CONSTRUCTOR_ELTS (ctor), ix, val)
+	note_fnptrs_in_ctor (elt_type, val);
+      return;
+    }
+
+  if (!RECORD_OR_UNION_TYPE_P (type))
+    return;
+
+  FOR_EACH_CONSTRUCTOR_ELT (CONSTRUCTOR_ELTS (ctor), ix, index, val)
+    {
+      /* ObjC can produce constructor elements with NULL indices.  */
+      if (!index || TREE_CODE (index) != FIELD_DECL)
+	continue;
+      tree fld_type = TREE_TYPE (index);
+      if (TREE_CODE (val) == CONSTRUCTOR)
+	{
+	  note_fnptrs_in_ctor (fld_type, val);
+	  continue;
+	}
+      if (TREE_CODE (type) != RECORD_TYPE
+	  || !POINTER_TYPE_P (fld_type)
+	  || TREE_CODE (TREE_TYPE (fld_type)) != FUNCTION_TYPE
+	  || !tree_fits_shwi_p (bit_position (index)))
 	continue;
       HOST_WIDE_INT elt_offset = int_bit_position (index);
       if ((elt_offset % BITS_PER_UNIT) != 0)
@@ -3739,8 +3793,20 @@ ipa_analyze_var_static_initializer (varpool_node *node)
       elt_offset = elt_offset / BITS_PER_UNIT;
       if (elt_offset > UINT_MAX)
 	continue;
-      note_fnptr_in_record (rec_type, elt_offset, TREE_OPERAND (val, 0));
+      note_fnptr_value_in_record (type, elt_offset, val);
     }
+}
+
+/* Analyze NODE and note any function pointers in record-typed static
+   initializers, including those of arrays of records and of records nested
+   in other aggregates.  */
+
+void
+ipa_analyze_var_static_initializer (varpool_node *node)
+{
+  tree decl = node->decl;
+  if (DECL_INITIAL (decl))
+    note_fnptrs_in_ctor (TREE_TYPE (decl), DECL_INITIAL (decl));
 }
 
 /* Update the jump functions associated with call graph edge E when the call
