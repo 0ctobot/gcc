@@ -1832,6 +1832,99 @@ struct pt_solution ipa_escaped_pt
       false, false, false, false, false, false, NULL };
 
 
+/* State of a walk over the objects reachable from a set of points-to
+   solutions, looking for automatic variables that need a shadow UID.  */
+
+struct shadow_walk
+{
+  /* The function whose automatic variables get shadowed, or NULL_TREE to
+     shadow every automatic variable that is reached.  */
+  tree fndecl;
+  /* First fields of the objects reached so far.  */
+  bitmap visited;
+  /* First fields of objects whose contents were already walked by an
+     earlier walk with a NULL_TREE FNDECL, or NULL.  */
+  bitmap done;
+  /* Objects whose contents still need to be walked.  */
+  auto_vec<unsigned> worklist;
+  /* Number of shadow UIDs allocated.  */
+  unsigned count;
+};
+
+/* Return the first field of the object VI is part of.  The fields of a
+   function info are its parameters and other per-function variables, so
+   stop at the first field with VI's decl.  */
+
+static varinfo_t
+shadow_walk_first_field (varinfo_t vi)
+{
+  varinfo_t v = get_varinfo (vi->head);
+  while (v->decl != vi->decl)
+    v = vi_next (v);
+  return v;
+}
+
+/* Give every field of the object VI is part of a shadow UID.  A pointer
+   into an older activation's object can point at any of its fields after
+   pointer arithmetic, not just the one the walk reached.  */
+
+static void
+shadow_walk_shadow (shadow_walk &w, varinfo_t vi)
+{
+  varinfo_t first = shadow_walk_first_field (vi);
+  for (varinfo_t v = first; v && v->decl == first->decl; v = vi_next (v))
+    if (v->shadow_var_uid == 0)
+      {
+	v->shadow_var_uid = allocate_decl_uid ();
+	w.count++;
+      }
+}
+
+/* Visit the variables in the points-to solution SOL: shadow the automatic
+   variables W is looking for, and queue every newly reached object so the
+   pointers stored in it are followed as well.  */
+
+static void
+shadow_walk_solution (shadow_walk &w, bitmap sol)
+{
+  bitmap_iterator bi;
+  unsigned j;
+
+  EXECUTE_IF_SET_IN_BITMAP (sol, 0, j, bi)
+    {
+      varinfo_t pt = get_varinfo (j);
+      /* Special variables and anything else without a decl are global and
+	 thus roots of the NULL_TREE walk.  Function infos are code.  */
+      if (pt->is_special_var || pt->is_fn_info || !pt->decl)
+	continue;
+
+      if (w.fndecl
+	  ? auto_var_in_fn_p (pt->decl, w.fndecl)
+	  : auto_var_p (pt->decl))
+	shadow_walk_shadow (w, pt);
+
+      unsigned first = shadow_walk_first_field (pt)->id;
+      if (bitmap_set_bit (w.visited, first)
+	  && (!w.done || !bitmap_bit_p (w.done, first)))
+	w.worklist.safe_push (first);
+    }
+}
+
+/* Follow the pointers stored in the objects queued in W until no new
+   objects are reached.  */
+
+static void
+shadow_walk_finish (shadow_walk &w)
+{
+  while (!w.worklist.is_empty ())
+    {
+      varinfo_t first = get_varinfo (w.worklist.pop ());
+      for (varinfo_t v = first; v && v->decl == first->decl; v = vi_next (v))
+	if (v->may_have_pointers)
+	  shadow_walk_solution (w, get_varinfo (var_rep[v->id])->solution);
+    }
+}
+
 /* Execute the driver for IPA PTA.  */
 static unsigned int
 ipa_pta_execute (void)
@@ -1867,56 +1960,59 @@ ipa_pta_execute (void)
     dump_sa_points_to_info (dump_file);
 
   /* Now post-process solutions to handle locals from different
-     runtime instantiations coming in through recursive invocations.  */
-  unsigned shadow_var_cnt = 0;
+     runtime instantiations coming in through recursive invocations.
+     An older activation's local can reach a newer activation of its
+     function through the function's parameters or through global memory,
+     either directly or through pointers stored in other objects, such as
+     another local of the older activation that holds its address.  Follow
+     the pointers stored in every object reachable from those roots, not
+     just the roots' own solutions.
+
+     Global variables are roots for every function, so walk everything
+     reachable from them once and shadow every automatic variable found
+     there.  */
+  auto_bitmap global_reach;
+  shadow_walk gw;
+  gw.fndecl = NULL_TREE;
+  gw.visited = global_reach;
+  gw.done = NULL;
+  gw.count = 0;
+  for (unsigned i = 1; i < varmap.length (); ++i)
+    {
+      varinfo_t vi = get_varinfo (i);
+      if (vi->is_global_var
+	  && !vi->is_fn_info
+	  && bitmap_set_bit (global_reach, vi->id))
+	{
+	  /* Walk the variable's own solution here since its decl may be
+	     NULL, which shadow_walk_finish doesn't handle.  */
+	  if (vi->may_have_pointers)
+	    shadow_walk_solution (gw, get_varinfo (var_rep[vi->id])->solution);
+	  shadow_walk_finish (gw);
+	}
+    }
+
+  /* Then walk from each function's parameters, shadowing only that
+     function's own locals.  Anything already reached from global memory
+     was handled above, so don't walk it again.  */
+  auto_bitmap param_reach;
+  shadow_walk fw;
+  fw.visited = param_reach;
+  fw.done = global_reach;
+  fw.count = 0;
   for (unsigned i = 1; i < varmap.length (); ++i)
     {
       varinfo_t fi = get_varinfo (i);
-      if (fi->is_fn_info
-	  && fi->decl)
-	/* Automatic variables pointed to by their containing functions
-	   parameters need this treatment.  */
-	for (varinfo_t ai = first_vi_for_offset (fi, fi_parm_base);
-	     ai; ai = vi_next (ai))
-	  {
-	    varinfo_t vi = get_varinfo (var_rep[ai->id]);
-	    bitmap_iterator bi;
-	    unsigned j;
-	    EXECUTE_IF_SET_IN_BITMAP (vi->solution, 0, j, bi)
-	      {
-		varinfo_t pt = get_varinfo (j);
-		if (pt->shadow_var_uid == 0
-		    && pt->decl
-		    && auto_var_in_fn_p (pt->decl, fi->decl))
-		  {
-		    pt->shadow_var_uid = allocate_decl_uid ();
-		    shadow_var_cnt++;
-		  }
-	      }
-	  }
-      /* As well as global variables which are another way of passing
-	 arguments to recursive invocations.  */
-      else if (fi->is_global_var)
-	{
-	  for (varinfo_t ai = fi; ai; ai = vi_next (ai))
-	    {
-	      varinfo_t vi = get_varinfo (var_rep[ai->id]);
-	      bitmap_iterator bi;
-	      unsigned j;
-	      EXECUTE_IF_SET_IN_BITMAP (vi->solution, 0, j, bi)
-		{
-		  varinfo_t pt = get_varinfo (j);
-		  if (pt->shadow_var_uid == 0
-		      && pt->decl
-		      && auto_var_p (pt->decl))
-		    {
-		      pt->shadow_var_uid = allocate_decl_uid ();
-		      shadow_var_cnt++;
-		    }
-		}
-	    }
-	}
+      if (!fi->is_fn_info || !fi->decl)
+	continue;
+      fw.fndecl = fi->decl;
+      bitmap_clear (param_reach);
+      for (varinfo_t ai = first_vi_for_offset (fi, fi_parm_base);
+	   ai; ai = vi_next (ai))
+	shadow_walk_solution (fw, get_varinfo (var_rep[ai->id])->solution);
+      shadow_walk_finish (fw);
     }
+  unsigned shadow_var_cnt = gw.count + fw.count;
   if (shadow_var_cnt && dump_file && (dump_flags & TDF_DETAILS))
     fprintf (dump_file, "Allocated %u shadow variables for locals "
 	     "maybe leaking into recursive invocations of their containing "
