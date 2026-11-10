@@ -538,6 +538,30 @@ tree_loop_unroll_and_jam (void)
       if (!datarefs.length ())
 	continue;
 
+      /* Fusing the unrolled copies of the inner loop interleaves the
+	 accesses of consecutive outer iterations.  The dependence checks
+	 below only care about the values that memory ends up with, but
+	 volatile accesses must also stay in their original order.  Calls
+	 and volatile asms already make the dependence analysis fail, and
+	 bb_prevents_fusion_p rejects volatile accesses outside the inner
+	 loop, which leaves the volatile loads and stores in the inner loop
+	 to check here.  */
+      bool has_volatile = false;
+      for (data_reference_p dr : datarefs)
+	if (gimple_has_volatile_ops (DR_STMT (dr)))
+	  {
+	    has_volatile = true;
+	    break;
+	  }
+      if (has_volatile)
+	{
+	  if (dump_file && (dump_flags & TDF_DETAILS))
+	    fprintf (dump_file, "Loop nest has volatile accesses\n");
+	  free_dependence_relations (dependences);
+	  free_data_refs (datarefs);
+	  continue;
+	}
+
       if (dump_file && (dump_flags & TDF_DETAILS))
 	dump_data_dependence_relations (dump_file, dependences);
 
