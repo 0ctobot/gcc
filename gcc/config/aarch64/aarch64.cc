@@ -33308,13 +33308,13 @@ aarch64_indirect_branch_asm (rtx addr)
 }
 
 /* Emit the assembly instruction to load the thread pointer into DEST.
-   Select between different tpidr_elN registers depending on -mtp= setting.  */
+   Select the system register named by the -mtp= setting.  */
 
 const char *
 aarch64_output_load_tp (rtx dest)
 {
   const char *tpidrs[] = {"tpidr_el0", "tpidr_el1", "tpidr_el2",
-			  "tpidr_el3", "tpidrro_el0"};
+			  "tpidr_el3", "tpidrro_el0", "sp_el0"};
   char buffer[64];
   snprintf (buffer, sizeof (buffer), "mrs\t%%0, %s",
 	    tpidrs[aarch64_tpidr_register]);

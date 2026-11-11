@@ -21548,11 +21548,25 @@ with small/tiny model object files is not supported.
 @opindex mtp
 Specify the system register to use as a thread pointer.  The valid values
 are @samp{tpidr_el0}, @samp{tpidrro_el0}, @samp{tpidr_el1}, @samp{tpidr_el2},
-@samp{tpidr_el3}.  For backwards compatibility the aliases @samp{el0},
-@samp{el1}, @samp{el2}, @samp{el3} are also accepted.
+@samp{tpidr_el3}, @samp{sp_el0}.  For backwards compatibility the aliases
+@samp{el0}, @samp{el1}, @samp{el2}, @samp{el3} are also accepted.
 The default setting is @samp{tpidr_el0}.  It is recommended to compile all
 code intended to interoperate with the same value of this option to avoid
 accessing a different thread pointer from the wrong exception level.
+
+The thread pointer is the value that @code{__builtin_thread_pointer}
+returns and the base address from which thread-local variables are
+accessed.  @samp{sp_el0} is for code that runs at EL1 or higher on the
+stack pointer of its own exception level and keeps a per-thread pointer in
+@samp{sp_el0}, as the Linux kernel does with its current task.  Such code
+can read that pointer with @code{__builtin_thread_pointer}, which the
+compiler treats as returning the same value on every call, so the compiler
+can reuse one read of the register for several uses of the pointer.  For
+the same reason, the compiler may read the register earlier than the source
+does, for example before a preceding @code{asm} statement or outside a loop
+or condition.  @samp{sp_el0} cannot be read at EL0 or while it is the
+selected stack pointer, so code compiled with @option{-mtp=sp_el0} must not
+run in either state.
 
 @opindex mstrict-align
 @opindex mno-strict-align
