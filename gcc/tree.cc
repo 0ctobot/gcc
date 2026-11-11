@@ -13937,7 +13937,16 @@ component_ref_size (tree ref, special_array_member *sam /* = NULL */)
 
   memsize = NULL_TREE;
 
-  if (typematch)
+  /* A strong definition from another translation unit can replace a weak
+     definition of BASE at link time, and it can initialize the flexible
+     array member with any number of elements.  The weak initializer then
+     says nothing about the size of the member.  This doesn't apply to a
+     COMDAT definition, since all of its copies must be the same.  */
+  bool replaceable = (VAR_P (base)
+		      && DECL_WEAK (base)
+		      && !DECL_COMDAT (base));
+
+  if (typematch && !replaceable)
     /* MEMBER is a true flexible array member.  Compute its size from
        the initializer of the BASE object if it has one.  */
     if (tree init = DECL_P (base) ? DECL_INITIAL (base) : NULL_TREE)
@@ -13966,13 +13975,14 @@ component_ref_size (tree ref, special_array_member *sam /* = NULL */)
       if (typematch)
 	{
 	  if (DECL_P (base)
-	      && DECL_EXTERNAL (base)
+	      && (DECL_EXTERNAL (base) || replaceable)
 	      && bt == basetype
 	      && *sam != special_array_member::int_0)
 	    /* The size of a flexible array member of an extern struct
 	       with no initializer cannot be determined (it's defined
 	       in another translation unit and can have an initializer
-	       with an arbitrary number of elements).  */
+	       with an arbitrary number of elements).  The same goes for
+	       a weak struct whose definition can be replaced.  */
 	    return NULL_TREE;
 
 	  /* Use the size of the base struct or, for interior zero-length
