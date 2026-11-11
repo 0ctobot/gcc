@@ -2,11 +2,12 @@
 /* { dg-options "-O2" } */
 /* { dg-require-effective-target lp64 } */
 
-/* The casesi pattern always bounds checks its SImode index.  A jump table
-   indexed by a 64-bit value needs another check in DImode only when the
-   range of the index minus the lowest case value doesn't fit in 32 bits.
-   Each function uses a different table size so the scans can tell the
-   checks apart.  */
+/* A jump table indexed by a 64-bit value needs a bounds check in DImode
+   only when the range of the index minus the lowest case value doesn't fit
+   in 32 bits, and the SImode check of the casesi pattern is enough
+   otherwise.  An index that gets past the DImode check is in the table, so
+   the SImode check isn't needed after it.  Each function uses a different
+   table size so the scans can tell the checks apart.  */
 
 void h0 (void), h1 (void), h2 (void), h3 (void), h4 (void), h5 (void);
 void h6 (void), h7 (void), h8 (void), h9 (void), h10 (void), h11 (void);
@@ -33,7 +34,7 @@ void h17 (void), h18 (void), h19 (void), rare (void);
   case 14: h14 (); break;			\
   case 15: h15 (); break;
 
-/* The index is at most 63: one check.  */
+/* The index is at most 63: the SImode check.  */
 void
 masked (unsigned long esr)
 {
@@ -44,7 +45,7 @@ masked (unsigned long esr)
     }
 }
 
-/* The index has no known range: both checks.  */
+/* The index has no known range: the DImode check.  */
 void
 full (unsigned long x)
 {
@@ -56,7 +57,8 @@ full (unsigned long x)
     }
 }
 
-/* The index minus the lowest case value is in [-2, 61]: one check.  */
+/* The index minus the lowest case value is in [-2, 61]: the SImode
+   check.  */
 void
 rebased (unsigned long x)
 {
@@ -80,8 +82,8 @@ rebased (unsigned long x)
     }
 }
 
-/* The index can exceed 32 bits even though its range is known: both
-   checks.  */
+/* The index can exceed 32 bits even though its range is known: the DImode
+   check.  */
 void
 partial (unsigned long x)
 {
@@ -95,7 +97,7 @@ partial (unsigned long x)
     }
 }
 
-/* The index is at most 2^32 - 1: one check.  */
+/* The index is at most 2^32 - 1: the SImode check.  */
 void
 hi_fits (unsigned long x)
 {
@@ -109,7 +111,7 @@ hi_fits (unsigned long x)
     }
 }
 
-/* The index can be 2^32, which truncates to 0: both checks.  */
+/* The index can be 2^32, which truncates to 0: the DImode check.  */
 void
 hi_past (unsigned long x)
 {
@@ -125,7 +127,7 @@ hi_past (unsigned long x)
 }
 
 /* The index can be 18 - 2^32, which truncates to 18, one past the
-   highest case value: one check.  */
+   highest case value: the SImode check.  */
 void
 lo_fits (long v)
 {
@@ -142,7 +144,7 @@ lo_fits (long v)
 }
 
 /* The index can be 18 - 2^32, which truncates to the highest case value:
-   both checks.  */
+   the DImode check.  */
 void
 lo_past (long v)
 {
@@ -159,7 +161,8 @@ lo_past (long v)
     }
 }
 
-/* A sign-extended int with a negative lowest case value: one check.  */
+/* A sign-extended int with a negative lowest case value: the SImode
+   check.  */
 void
 sext (int i)
 {
@@ -193,19 +196,19 @@ sext (int i)
 
 /* { dg-final { scan-assembler-times {\tcmp\tw[0-9]+, 11\n} 1 } } */
 /* { dg-final { scan-assembler-not {\tcmp\tx[0-9]+, 11\n} } } */
-/* { dg-final { scan-assembler-times {\tcmp\tw[0-9]+, 12\n} 1 } } */
+/* { dg-final { scan-assembler-not {\tcmp\tw[0-9]+, 12\n} } } */
 /* { dg-final { scan-assembler-times {\tcmp\tx[0-9]+, 12\n} 1 } } */
 /* { dg-final { scan-assembler-times {\tcmp\tw[0-9]+, 13\n} 1 } } */
 /* { dg-final { scan-assembler-not {\tcmp\tx[0-9]+, 13\n} } } */
-/* { dg-final { scan-assembler-times {\tcmp\tw[0-9]+, 14\n} 1 } } */
+/* { dg-final { scan-assembler-not {\tcmp\tw[0-9]+, 14\n} } } */
 /* { dg-final { scan-assembler-times {\tcmp\tx[0-9]+, 14\n} 1 } } */
 /* { dg-final { scan-assembler-times {\tcmp\tw[0-9]+, 15\n} 1 } } */
 /* { dg-final { scan-assembler-not {\tcmp\tx[0-9]+, 15\n} } } */
-/* { dg-final { scan-assembler-times {\tcmp\tw[0-9]+, 16\n} 1 } } */
+/* { dg-final { scan-assembler-not {\tcmp\tw[0-9]+, 16\n} } } */
 /* { dg-final { scan-assembler-times {\tcmp\tx[0-9]+, 16\n} 1 } } */
 /* { dg-final { scan-assembler-times {\tcmp\tw[0-9]+, 17\n} 1 } } */
 /* { dg-final { scan-assembler-not {\tcmp\tx[0-9]+, 17\n} } } */
-/* { dg-final { scan-assembler-times {\tcmp\tw[0-9]+, 18\n} 1 } } */
+/* { dg-final { scan-assembler-not {\tcmp\tw[0-9]+, 18\n} } } */
 /* { dg-final { scan-assembler-times {\tcmp\tx[0-9]+, 18\n} 1 } } */
 /* { dg-final { scan-assembler-times {\tcmp\tw[0-9]+, 19\n} 1 } } */
 /* { dg-final { scan-assembler-not {\tcmp\tx[0-9]+, 19\n} } } */

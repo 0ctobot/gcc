@@ -47,6 +47,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "explow.h"
 #include "calls.h"
 #include "stmt.h"
+#include "cfgrtl.h"
 /* Include expr.h after insn-config.h so we get HAVE_conditional_move.  */
 #include "expr.h"
 #include "optabs-tree.h"
@@ -14316,22 +14317,76 @@ casesi_index_fits_mode_p (tree index_type, tree index_expr, tree minval,
   return rng >= 0 && rng < lim && hi < lim && lo > rng - lim;
 }
 
+/* Return true if RANGE fits in INDEX_MODE and the range of INDEX_EXPR,
+   which has type INDEX_TYPE, keeps it within [MINVAL, MINVAL + RANGE], so
+   that the bounds check of the casesi pattern can never send it to the
+   default label.
+
+   This holds for every way try_casesi converts the index to INDEX_MODE.
+   When INDEX_TYPE is wider, the difference INDEX_EXPR - MINVAL is in
+   [0, RANGE] and truncation keeps its value.  When INDEX_TYPE is narrower,
+   the index and MINVAL are both extended according to the signedness of
+   INDEX_TYPE and the pattern subtracts one from the other, which gives the
+   same difference.  */
+
+static bool
+casesi_index_in_table_p (tree index_type, tree index_expr, tree minval,
+			 tree range, scalar_int_mode index_mode)
+{
+  if (TREE_CODE (index_expr) != SSA_NAME
+      || !types_compatible_p (TREE_TYPE (index_expr), index_type)
+      || TREE_CODE (minval) != INTEGER_CST
+      || TREE_CODE (range) != INTEGER_CST)
+    return false;
+
+  int_range_max r;
+  if (!get_range_query (cfun)->range_of_expr (r, index_expr,
+					      currently_expanding_gimple_stmt)
+      || r.undefined_p ()
+      || r.varying_p ())
+    return false;
+
+  signop sgn = TYPE_SIGN (index_type);
+  widest_int lim
+    = wi::set_bit_in_zero<widest_int> (GET_MODE_PRECISION (index_mode));
+  widest_int rng = wi::to_widest (range);
+  widest_int lo = (widest_int::from (r.lower_bound (), sgn)
+		   - wi::to_widest (minval));
+  widest_int hi = (widest_int::from (r.upper_bound (), sgn)
+		   - wi::to_widest (minval));
+
+  return rng >= 0 && rng < lim && lo >= 0 && hi <= rng;
+}
+
 /* Attempt to generate a casesi instruction.  Returns true if successful,
    false otherwise (i.e. if there is no casesi instruction).
 
    DEFAULT_PROBABILITY is the probability of jumping to the default
-   label.  */
+   label.  *BOUNDS_CHECKED is set to false if the code emitted here never
+   jumps to DEFAULT_LABEL, which then can only be reached through the
+   dispatch table, and to true otherwise.  */
 bool
 try_casesi (tree index_type, tree index_expr, tree minval, tree range,
 	    rtx table_label, rtx default_label, rtx fallback_label,
-            profile_probability default_probability)
+	    profile_probability default_probability, bool *bounds_checked)
 {
   class expand_operand ops[5];
   scalar_int_mode index_mode = SImode;
   rtx op1, op2, index;
+  bool wide_check = false;
 
+  *bounds_checked = true;
   if (! targetm.have_casesi ())
     return false;
+
+  /* The casesi pattern always checks the index against the bounds of the
+     table, even when the range of the index already keeps it in bounds.
+     Find out whether that check is redundant before the index is rewritten
+     below.  */
+  bool redundant_check = (default_label
+			  && casesi_index_in_table_p (index_type, index_expr,
+						      minval, range,
+						      index_mode));
 
   /* The index must be some form of integer.  Convert it to SImode.  */
   scalar_int_mode omode = SCALAR_INT_TYPE_MODE (index_type);
@@ -14341,18 +14396,32 @@ try_casesi (tree index_type, tree index_expr, tree minval, tree range,
 
       /* We must handle the endpoints in the original mode, unless the range
 	 of the index makes the casesi pattern's own check sufficient.  */
-      bool wide_check = (default_label
-			 && !casesi_index_fits_mode_p (index_type, index_expr,
-						       minval, range,
-						       index_mode));
+      wide_check = (default_label
+		    && !casesi_index_fits_mode_p (index_type, index_expr,
+						  minval, range, index_mode));
       index_expr = build2 (MINUS_EXPR, index_type,
 			   index_expr, minval);
       minval = integer_zero_node;
       index = expand_normal (index_expr);
       if (wide_check)
-        emit_cmp_and_jump_insns (rangertx, index, LTU, NULL_RTX,
-				 omode, 1, default_label,
-                                 default_probability);
+	{
+	  emit_cmp_and_jump_insns (rangertx, index, LTU, NULL_RTX,
+				   omode, 1, default_label,
+				   default_probability);
+
+	  /* An index that gets past the check above is in [0, RANGE], so
+	     the check in the casesi pattern can't fire when RANGE fits in
+	     INDEX_MODE.  */
+	  redundant_check = false;
+	  if (TREE_CODE (range) == INTEGER_CST)
+	    {
+	      widest_int rng = wi::to_widest (range);
+	      redundant_check
+		= (rng >= 0
+		   && rng < wi::set_bit_in_zero<widest_int>
+			      (GET_MODE_PRECISION (index_mode)));
+	    }
+	}
       /* Now we can safely truncate.  */
       index = convert_to_mode (index_mode, index, 0);
     }
@@ -14381,6 +14450,49 @@ try_casesi (tree index_type, tree index_expr, tree minval, tree range,
 				  : fallback_label));
   rtx_insn *last = get_last_insn ();
   expand_jump_insn (targetm.code_for_casesi, 5, ops);
+
+  /* Delete the conditional jumps to the default label that the casesi
+     pattern emitted when its bounds check is redundant.  The pattern can't
+     tell which entries of the table lead to the default label, so a correct
+     expansion only takes such a jump for an index outside the table.  A
+     target that folds the check into the dispatch insn emits no such jump,
+     and nothing changes for it.  */
+  if (redundant_check)
+    {
+      bool deleted = false;
+      rtx_insn *next;
+      for (rtx_insn *insn = last ? NEXT_INSN (last) : get_insns (); insn;
+	   insn = next)
+	{
+	  rtx lab;
+	  next = NEXT_INSN (insn);
+	  if (JUMP_P (insn)
+	      && any_condjump_p (insn)
+	      && onlyjump_p (insn)
+	      && (lab = condjump_label (insn)) != NULL_RTX
+	      && label_ref_label (lab) == default_label)
+	    {
+	      delete_insn (insn);
+	      deleted = true;
+	    }
+	}
+
+      /* Tell the caller if the default label is no longer reachable from
+	 the code emitted here, so it can update the CFG.  */
+      if (deleted && !wide_check)
+	{
+	  *bounds_checked = false;
+	  for (rtx_insn *insn = last ? NEXT_INSN (last) : get_insns (); insn;
+	       insn = NEXT_INSN (insn))
+	    if (INSN_P (insn)
+		&& (rtx_referenced_p (default_label, PATTERN (insn))
+		    || (JUMP_P (insn) && JUMP_LABEL (insn) == default_label)))
+	      {
+		*bounds_checked = true;
+		break;
+	      }
+	}
+    }
 
   /* The casesi pattern emits its own bounds check, but it has no operand for
      the probability of the default case.  Put that probability on the
