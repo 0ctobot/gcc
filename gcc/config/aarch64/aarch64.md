@@ -3889,6 +3889,41 @@
   }
 )
 
+;; An absolute difference such as a > b ? a - b : b - a is if-converted into
+;; both subtractions followed by the compare and the csel.  The compare stays
+;; after both subtractions unless early scheduling moves it, which doesn't
+;; happen below -O3, nor with tunings that fuse CMP with CSEL, since the
+;; scheduler then keeps the compare right before the csel.  As such, the
+;; subtraction matching the compare is never next to it for the peepholes
+;; above.  Move the other subtraction first and fold the compare into the
+;; matching one.
+(define_peephole2
+  [(set (match_operand:GPI 0 "aarch64_general_reg")
+	(minus:GPI (match_operand:GPI 1 "aarch64_reg_or_zero")
+		   (match_operand:GPI 2 "aarch64_reg_or_zero")))
+   (set (match_operand:GPI 3 "aarch64_general_reg")
+	(minus:GPI (match_dup 2)
+		   (match_dup 1)))
+   (set (reg:CC CC_REGNUM)
+	(compare:CC
+	  (match_dup 1)
+	  (match_dup 2)))]
+  "!reg_overlap_mentioned_p (operands[0], operands[1])
+   && !reg_overlap_mentioned_p (operands[0], operands[2])
+   && !reg_overlap_mentioned_p (operands[0], operands[3])
+   && !reg_overlap_mentioned_p (operands[3], operands[1])
+   && !reg_overlap_mentioned_p (operands[3], operands[2])"
+  [(const_int 0)]
+  {
+    emit_insn (gen_rtx_SET (operands[3],
+			    gen_rtx_MINUS (<MODE>mode, operands[2],
+					   operands[1])));
+    emit_insn (gen_sub<mode>3_compare1 (operands[0], operands[1],
+					 operands[2]));
+    DONE;
+  }
+)
+
 (define_peephole2
   [(set (match_operand:GPI 0 "aarch64_general_reg")
 	(plus:GPI (match_operand:GPI 1 "register_operand")
