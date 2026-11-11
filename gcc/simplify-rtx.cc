@@ -3886,6 +3886,9 @@ simplify_context::simplify_binary_operation_1 (rtx_code code,
 	 Bitfields are represented as an AND based extraction */
       if (GET_CODE (op0) == AND
 	  && GET_CODE (op1) == AND
+	  /* The NE built below is STORE_FLAG_VALUE when true, while the IOR
+	     of two single bit fields is 1 when either bit is set.  */
+	  && STORE_FLAG_VALUE == 1
 	  /* The combined mask is built in a HOST_WIDE_INT.  */
 	  && is_a <scalar_int_mode> (mode, &int_mode)
 	  && HWI_COMPUTABLE_MODE_P (int_mode)
@@ -3923,6 +3926,9 @@ simplify_context::simplify_binary_operation_1 (rtx_code code,
 		output above. */
       if (GET_CODE (op0) == AND
 	  && GET_CODE (op1) == NE
+	  /* As above, the NE built below is STORE_FLAG_VALUE when true, while
+	     the IOR is 1 when only the bit that OP0 extracts is set.  */
+	  && STORE_FLAG_VALUE == 1
 	  /* The combined mask is built in a HOST_WIDE_INT.  */
 	  && is_a <scalar_int_mode> (mode, &int_mode)
 	  && HWI_COMPUTABLE_MODE_P (int_mode)
