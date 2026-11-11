@@ -320,6 +320,29 @@ vi_offset_extent (varinfo_t vi)
   return end - vi->offset + 1;
 }
 
+/* Return the alignment in bits that the start of the variable containing
+   the field VI is known to have, which the field offsets are relative to.
+   The fake declarations that stand for memory that isn't a declaration,
+   such as heap memory, don't say where that memory starts, so nothing is
+   known about those.  The exception is what a restrict pointer parameter
+   points to: its fake declaration has the pointed-to type, and the pointer
+   has to be aligned for that type.  */
+
+unsigned int
+vi_start_align (varinfo_t vi)
+{
+  varinfo_t head = get_varinfo (vi->head);
+  tree decl = head->decl;
+
+  if (!decl
+      || (!VAR_P (decl) && TREE_CODE (decl) != PARM_DECL)
+      || head->is_artificial_var
+      || head->is_heap_var
+      || head->is_fn_info)
+    return BITS_PER_UNIT;
+  return MAX (DECL_ALIGN (decl), BITS_PER_UNIT);
+}
+
 /* Determine global memory access of call STMT and update
    WRITES_GLOBAL_MEMORY, READS_GLOBAL_MEMORY and USES_GLOBAL_MEMORY.  */
 
