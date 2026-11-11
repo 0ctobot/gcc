@@ -9019,10 +9019,14 @@ get_callee_fndecl (const_tree call)
 
   STRIP_NOPS (addr);
 
-  /* If this is a readonly function pointer, extract its initial value.  */
+  /* If this is a readonly function pointer, extract its initial value.
+     A weak definition's initializer isn't necessarily its value, since a
+     strong definition from another translation unit can replace it at link
+     time.  */
   if (DECL_P (addr) && TREE_CODE (addr) != FUNCTION_DECL
       && TREE_READONLY (addr) && ! TREE_THIS_VOLATILE (addr)
-      && DECL_INITIAL (addr))
+      && DECL_INITIAL (addr)
+      && !(VAR_P (addr) && DECL_WEAK (addr) && !DECL_COMDAT (addr)))
     addr = DECL_INITIAL (addr);
 
   /* If the address is just `&f' for some function `f', then we know
