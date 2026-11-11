@@ -345,6 +345,12 @@ struct insn_info_type
      volatile.  */
   bool cannot_delete;
 
+  /* Set true if a later store in the block stores the same constant
+     into bytes that this insn also stores.  The later store is deleted
+     as redundant as long as this insn survives, so this insn must keep
+     storing every one of its bytes.  */
+  bool covers_redundant_store;
+
   /* This field is only used by the global algorithm.  It is set true
      if the insn contains any read of mem except for a (1).  This is
      also set if the insn is a call or has a clobber mem.  If the insn
@@ -595,7 +601,8 @@ static bool stores_off_frame_dead_at_return;
 static int globally_deleted;
 static int locally_deleted;
 
-/* The MEMs written by the stores that we deleted, for
+/* The MEMs written by the stores that we deleted, and the words that
+   narrow_partially_dead_store stopped storing, for
    remove_mem_equal_notes.  */
 static vec<rtx> deleted_store_mems;
 
@@ -1364,6 +1371,123 @@ all_positions_needed_p (store_info *s_info, poly_int64 start,
     }
 }
 
+/* S_INFO describes the store in INSN_INFO, and later stores in the block
+   have overwritten some of its bytes before anything read them.  If the
+   insn stores a two-word constant and no byte of one of the two words is
+   needed anymore, rewrite the insn to store only the other word.
+
+   This happens when a structure is cleared and some of its members are
+   then set, and a member store overwrites one half of a two-word chunk
+   of the clear.  The two-word store isn't dead, so we can't delete it,
+   but its dead half stops it from pairing up with the member store on
+   targets with store-pair instructions.  Storing just the word that's
+   still needed lets the two pair up instead.  */
+
+static void
+narrow_partially_dead_store (insn_info_t insn_info, store_info *s_info)
+{
+  rtx_insn *insn = insn_info->insn;
+  HOST_WIDE_INT width;
+
+  /* Leave the insn alone if it isn't a plain SET of one MEM, and keep
+     volatile and frame-related stores intact like the deletion code
+     does.  */
+  if (insn_info->cannot_delete
+      || insn_info->covers_redundant_store
+      || insn_info->store_rec != s_info
+      || s_info->next
+      || s_info->is_large
+      || !s_info->width.is_constant (&width)
+      || width != 2 * UNITS_PER_WORD)
+    return;
+
+  rtx pat = PATTERN (insn);
+  if (GET_CODE (pat) != SET
+      || !MEM_P (SET_DEST (pat))
+      || side_effects_p (pat)
+      || find_reg_equal_equiv_note (insn))
+    return;
+
+  rtx dest = SET_DEST (pat);
+  rtx src = SET_SRC (pat);
+  scalar_int_mode mode;
+  if (!is_a <scalar_int_mode> (GET_MODE (dest), &mode)
+      || GET_MODE_SIZE (mode) != width
+      || !CONST_SCALAR_INT_P (src))
+    return;
+
+  /* Bit I of the mask is for the byte at address offset I from the start
+     of the store, so the word at byte 0 is the one at the lower address
+     on both big-endian and little-endian targets.  */
+  unsigned HOST_WIDE_INT needed = s_info->positions_needed.small_bitmask;
+  unsigned HOST_WIDE_INT word_mask = lowpart_bitmask (UNITS_PER_WORD);
+  HOST_WIDE_INT live_byte;
+  if (needed == 0)
+    return;
+  else if ((needed & ~word_mask) == 0)
+    live_byte = 0;
+  else if ((needed & word_mask) == 0)
+    live_byte = UNITS_PER_WORD;
+  else
+    return;
+
+  /* simplify_subreg takes the byte offset in memory order, so it picks
+     the right word of the constant for either endianness.  */
+  rtx new_src = simplify_subreg (word_mode, src, mode, live_byte);
+  if (!new_src)
+    return;
+
+  rtx new_dest = adjust_address_nv (dest, word_mode, live_byte);
+  unsigned int align = MEM_ALIGN (new_dest);
+  if (align < GET_MODE_ALIGNMENT (word_mode)
+      && targetm.slow_unaligned_access (word_mode, align))
+    return;
+
+  if (!dbg_cnt (dse))
+    return;
+
+  /* The narrower store must be a valid insn that costs no more than the
+     original.  */
+  bool speed = optimize_bb_for_speed_p (BLOCK_FOR_INSN (insn));
+  int old_cost = insn_cost (insn, speed);
+  validate_change (insn, &SET_DEST (pat), new_dest, 1);
+  validate_change (insn, &SET_SRC (pat), new_src, 1);
+  if (!verify_changes (0) || insn_cost (insn, speed) > old_cost)
+    {
+      cancel_changes (0);
+      return;
+    }
+  confirm_change_group ();
+
+  /* REG_EQUAL notes that read the word we no longer store go stale just
+     like the ones that read a deleted store.  */
+  deleted_store_mems.safe_push (adjust_address_nv (s_info->mem, word_mode,
+						   UNITS_PER_WORD
+						   - live_byte));
+
+  /* Describe only the word that the insn stores now, so that later reads
+     and stores in the block, and the global algorithm, see the store as
+     it is.  */
+  s_info->mem = canon_rtx (new_dest);
+  s_info->mem_addr = plus_constant (get_address_mode (s_info->mem),
+				    s_info->mem_addr, live_byte);
+  s_info->offset += live_byte;
+  s_info->width = UNITS_PER_WORD;
+  s_info->positions_needed.small_bitmask = needed >> live_byte;
+  if (s_info->rhs)
+    s_info->rhs = new_src;
+  if (s_info->const_rhs)
+    s_info->const_rhs = new_src;
+
+  if (dump_file && (dump_flags & TDF_DETAILS))
+    {
+      fprintf (dump_file, "Narrowing insn %d to the needed word gid=%d",
+	       INSN_UID (insn), s_info->group_id);
+      print_range (dump_file, s_info->offset, s_info->width);
+      fprintf (dump_file, "\n");
+    }
+}
+
 
 static rtx get_stored_val (store_info *, machine_mode, poly_int64,
 			   poly_int64, basic_block, bool);
@@ -1563,6 +1687,7 @@ record_store (rtx body, bb_info_t bb_info)
       insn_info_t next = ptr->next_local_store;
       class store_info *s_info = ptr->store_rec;
       bool del = true;
+      bool same_base = false;
 
       /* Skip the clobbers. We delete the active insn if this insn
 	 shadows the set.  To have been put on the active list, it
@@ -1575,6 +1700,7 @@ record_store (rtx body, bb_info_t bb_info)
 	  && s_info->addrspace == addrspace)
 	{
 	  HOST_WIDE_INT i;
+	  same_base = true;
 	  if (dump_file && (dump_flags & TDF_DETAILS))
 	    {
 	      fprintf (dump_file, "    trying store in insn=%d gid=%d",
@@ -1675,7 +1801,14 @@ record_store (rtx body, bb_info_t bb_info)
 	    delete_dead_store_insn (insn_to_delete);
 	}
       else
-	last = ptr;
+	{
+	  /* This store may have just overwritten half of PTR's store.
+	     If this store is redundant because of PTR, PTR must keep
+	     storing the bytes that this store would have stored.  */
+	  if (same_base && redundant_reason != ptr)
+	    narrow_partially_dead_store (ptr, s_info);
+	  last = ptr;
+	}
 
       ptr = next;
     }
@@ -1712,6 +1845,8 @@ record_store (rtx body, bb_info_t bb_info)
   store_info->rhs = rhs;
   store_info->const_rhs = const_rhs;
   store_info->redundant_reason = redundant_reason;
+  if (redundant_reason)
+    redundant_reason->covers_redundant_store = true;
   store_info->addrspace = addrspace;
 
   /* If this is a clobber, we return 0.  We will only be able to
@@ -3814,7 +3949,7 @@ rest_of_handle_dse (void)
 
   /* This has to come before dse_step7 since may_alias_p uses the base values
      that end_alias_analysis frees.  */
-  if (locally_deleted || globally_deleted)
+  if (!deleted_store_mems.is_empty ())
     remove_mem_equal_notes ();
   dse_step7 ();
 
