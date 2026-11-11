@@ -469,7 +469,7 @@ set_union_with_increment (bitmap to, bitmap delta, HOST_WIDE_INT inc,
       else
 	{
 	  HOST_WIDE_INT fieldoffset = vi->offset + inc;
-	  unsigned HOST_WIDE_INT size = vi->size;
+	  unsigned HOST_WIDE_INT extent = vi_offset_extent (vi);
 
 	  /* If the offset makes the pointer point to before the variable, then
 	     no field can represent it.  Using the first field instead would
@@ -494,11 +494,11 @@ set_union_with_increment (bitmap to, bitmap delta, HOST_WIDE_INT inc,
 		  || vi->next == 0)
 		break;
 
-	      /* We have to include all fields that overlap the current field
-		 shifted by inc.  */
+	      /* We have to include all fields that overlap the offsets that
+		 the current field can stand for shifted by inc.  */
 	      vi = vi_next (vi);
 	    }
-	  while (vi->offset < fieldoffset + size);
+	  while (vi->offset < fieldoffset + extent);
 	}
     }
 
@@ -1122,6 +1122,10 @@ do_sd_constraint (constraint_graph_t graph, constraint_t c,
 	;
       else if (roffset != 0)
 	{
+	  /* The pointer can point anywhere in the offsets that V stands
+	     for, so the access can start anywhere in them shifted by
+	     roffset.  */
+	  size = vi_offset_extent (v);
 	  if (fieldoffset < 0)
 	    v = get_varinfo (v->head);
 	  else
@@ -1205,6 +1209,10 @@ do_ds_constraint (constraint_t c, bitmap delta, bitmap *expanded_delta)
 	;
       else if (loff != 0)
 	{
+	  /* The pointer can point anywhere in the offsets that V stands
+	     for, so the access can start anywhere in them shifted by
+	     loff.  */
+	  size = vi_offset_extent (v);
 	  if (fieldoffset < 0)
 	    v = get_varinfo (v->head);
 	  else

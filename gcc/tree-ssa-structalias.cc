@@ -273,9 +273,13 @@ first_vi_for_offset (varinfo_t start, unsigned HOST_WIDE_INT offset)
   return NULL;
 }
 
-/* Find the first varinfo in the same variable as START that overlaps with
-   OFFSET.  If there is no such varinfo the varinfo directly preceding
-   OFFSET is returned.  */
+/* Find the varinfo in the same variable as START that represents a pointer
+   to OFFSET: the last field that starts at or before OFFSET.  That's the
+   field containing OFFSET, or the field directly preceding OFFSET when
+   OFFSET is in padding.  An OFFSET at or beyond the end of the variable
+   yields the last field, which also represents a pointer one past the end
+   of the variable.  See vi_offset_extent for the offsets that a pointer to
+   the returned field can therefore stand for.  */
 
 varinfo_t
 first_or_preceding_vi_for_offset (varinfo_t start,
@@ -286,18 +290,34 @@ first_or_preceding_vi_for_offset (varinfo_t start,
   if (start->offset > offset)
     start = get_varinfo (start->head);
 
-  /* We may not find a variable in the field list with the actual
-     offset when we have glommed a structure to a variable.
-     In that case, however, offset should still be within the size
-     of the variable.
-     If we got beyond the offset we look for return the field
-     directly preceding offset which may be the last field.  */
   while (start->next
-	 && offset >= start->offset
-	 && !((offset - start->offset) < start->size))
+	 && vi_next (start)->offset <= offset)
     start = vi_next (start);
 
   return start;
+}
+
+/* Return the number of bits starting at VI's offset that a pointer to the
+   field VI can point into.  Since first_or_preceding_vi_for_offset maps a
+   pointer into padding to the field before it, that's everything up to the
+   next field.  For the last field, it's everything up to the end of the
+   variable plus one bit, since the last field also represents a pointer one
+   past the end of the variable.  A constant offset added to such a pointer
+   moves this whole range, so all fields that the moved range overlaps have
+   to be included in the result.  */
+
+unsigned HOST_WIDE_INT
+vi_offset_extent (varinfo_t vi)
+{
+  if (vi->next)
+    return vi_next (vi)->offset - vi->offset;
+
+  unsigned HOST_WIDE_INT end = MAX (vi->fullsize, vi->offset + vi->size);
+  /* Saturate the result for a variable of unknown size, so that adding it
+     to an offset can't wrap around.  */
+  if (end - vi->offset >= (unsigned HOST_WIDE_INT) HOST_WIDE_INT_MAX)
+    return HOST_WIDE_INT_MAX;
+  return end - vi->offset + 1;
 }
 
 /* Determine global memory access of call STMT and update

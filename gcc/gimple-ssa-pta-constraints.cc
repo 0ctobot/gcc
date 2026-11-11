@@ -515,18 +515,19 @@ get_constraint_for_ptr_offset (tree ptr, tree offset,
 	{
 	  varinfo_t temp;
 	  unsigned HOST_WIDE_INT offset = curr->offset + rhsoffset;
+	  unsigned HOST_WIDE_INT extent = vi_offset_extent (curr);
 
-	  /* We have to include all fields that overlap the current
-	     field shifted by rhsoffset.  And we include at least
-	     the last field of the variable to represent reachability
-	     of off-bound addresses, in particular &object + 1,
+	  /* We have to include all fields that overlap the offsets that
+	     the current field can stand for shifted by rhsoffset.  And we
+	     include at least the last field of the variable to represent
+	     reachability of off-bound addresses, in particular &object + 1,
 	     conservatively correct.  */
 	  temp = first_or_preceding_vi_for_offset (curr, offset);
 	  c.var = temp->id;
 	  c.offset = 0;
 	  temp = vi_next (temp);
 	  while (temp
-		 && temp->offset < offset + curr->size)
+		 && temp->offset < offset + extent)
 	    {
 	      struct constraint_expr c2;
 	      c2.var = temp->id;
@@ -633,6 +634,7 @@ get_constraint_for_component_ref (tree t, vec<ce_s> *results,
   gcc_assert (results->length () == 1);
   struct constraint_expr &result = results->last ();
 
+  HOST_WIDE_INT addr_bitpos;
   if (result.type == SCALAR
       && get_varinfo (result.var)->is_full_var)
     /* For single-field vars do not bother about the offset.  */
@@ -648,6 +650,39 @@ get_constraint_for_component_ref (tree t, vec<ce_s> *results,
 	 the address point to anything.  */
       result.var = anything_id;
       result.offset = 0;
+    }
+  else if (result.type == SCALAR
+	   && address_p
+	   && bitpos.is_constant (&addr_bitpos)
+	   && addr_bitpos >= 0)
+    {
+      /* An address has to be represented by the same field that
+	 get_constraint_for_ptr_offset would use for it, since a constant
+	 offset added to the address later is applied to the offsets that
+	 field stands for.  That's the field containing the address, the
+	 field before it when the address is in padding, or the last field
+	 when the address is at or past the end of the variable, e.g., the
+	 end of an array member.  */
+      struct constraint_expr cexpr = result;
+      varinfo_t curr = first_or_preceding_vi_for_offset
+			 (get_varinfo (result.var), addr_bitpos);
+      results->pop ();
+      cexpr.offset = 0;
+      cexpr.var = curr->id;
+      results->safe_push (cexpr);
+      /* A variable index into an array that has no upper bound or at
+	 most one element, such as a [1] member that isn't the last one,
+	 can reach the fields that follow the array.  An address formed
+	 that way can then be used to access any of them, so it has to
+	 point to all of them rather than only to the first.  */
+      if (ref_indexes_short_array_p (orig_t, NULL_TREE))
+	for (curr = vi_next (curr); curr; curr = vi_next (curr))
+	  if (ranges_maybe_overlap_p (poly_int64 (curr->offset),
+				      curr->size, bitpos, bitmaxsize))
+	    {
+	      cexpr.var = curr->id;
+	      results->safe_push (cexpr);
+	    }
     }
   else if (result.type == SCALAR)
     {
@@ -930,12 +965,15 @@ get_constraint_for_1 (tree t, vec<ce_s> *results, bool address_p,
 		    size = tree_to_uhwi (TYPE_SIZE (TREE_TYPE (t)));
 		  else
 		    size = -1;
+		  unsigned HOST_WIDE_INT last_start
+		    = vi->offset + vi_offset_extent (vi) - 1;
 		  for (; curr; curr = vi_next (curr))
 		    {
 		      /* The start of the access might happen anywhere
-			 within vi, so conservatively assume it was
-			 at its end.  */
-		      if (curr->offset - (vi->offset + vi->size - 1) < size)
+			 within the offsets that vi stands for, including
+			 its trailing padding, so conservatively assume it
+			 was at their end.  */
+		      if (curr->offset - last_start < size)
 			{
 			  cs.var = curr->id;
 			  results->safe_push (cs);
