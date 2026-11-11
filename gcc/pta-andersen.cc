@@ -471,12 +471,21 @@ set_union_with_increment (bitmap to, bitmap delta, HOST_WIDE_INT inc,
 	  HOST_WIDE_INT fieldoffset = vi->offset + inc;
 	  unsigned HOST_WIDE_INT size = vi->size;
 
-	  /* If the offset makes the pointer point to before the
-	     variable use offset zero for the field lookup.  */
+	  /* If the offset makes the pointer point to before the variable, then
+	     no field can represent it.  Using the first field instead would
+	     put the pointer too far into the variable, and adding a positive
+	     offset to it later would then select the wrong field.  This
+	     happens with container_of () applied to a list head that isn't
+	     embedded in an entry, when the head is accessed through the list
+	     member of the result.  As such, make the pointer point to
+	     anything.  */
 	  if (fieldoffset < 0)
-	    vi = get_varinfo (vi->head);
-	  else
-	    vi = first_or_preceding_vi_for_offset (vi, fieldoffset);
+	    {
+	      changed |= bitmap_set_bit (to, anything_id);
+	      return changed;
+	    }
+
+	  vi = first_or_preceding_vi_for_offset (vi, fieldoffset);
 
 	  do
 	    {

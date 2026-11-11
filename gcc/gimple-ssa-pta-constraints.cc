@@ -497,20 +497,29 @@ get_constraint_for_ptr_offset (tree ptr, tree offset,
 	    }
 	  while (temp);
 	}
+      else if (c.type == ADDRESSOF
+	       && rhsoffset < 0
+	       && (unsigned HOST_WIDE_INT) -rhsoffset > curr->offset)
+	{
+	  /* No field can represent a pointer to before the start of the
+	     variable.  Using the first field instead would put the pointer too
+	     far into the variable, and adding a positive offset to it later
+	     would then select the wrong field.  This happens with
+	     container_of () applied to a list head that isn't embedded in an
+	     entry, when the head is accessed through the list member of the
+	     result.  As such, make the pointer point to anything.  */
+	  c.var = anything_id;
+	  c.offset = 0;
+	}
       else if (c.type == ADDRESSOF)
 	{
 	  varinfo_t temp;
 	  unsigned HOST_WIDE_INT offset = curr->offset + rhsoffset;
 
-	  /* If curr->offset + rhsoffset is less than zero adjust it.  */
-	  if (rhsoffset < 0
-	      && curr->offset < offset)
-	    offset = 0;
-
 	  /* We have to include all fields that overlap the current
 	     field shifted by rhsoffset.  And we include at least
-	     the last or the first field of the variable to represent
-	     reachability of off-bound addresses, in particular &object + 1,
+	     the last field of the variable to represent reachability
+	     of off-bound addresses, in particular &object + 1,
 	     conservatively correct.  */
 	  temp = first_or_preceding_vi_for_offset (curr, offset);
 	  c.var = temp->id;
@@ -628,6 +637,18 @@ get_constraint_for_component_ref (tree t, vec<ce_s> *results,
       && get_varinfo (result.var)->is_full_var)
     /* For single-field vars do not bother about the offset.  */
     result.offset = 0;
+  else if (result.type == SCALAR
+	   && address_p
+	   && maybe_lt (bitpos, 0))
+    {
+      /* No field can represent an address before the start of the
+	 variable, e.g., the address of a member that precedes the list
+	 member in container_of () applied to a list head that isn't
+	 embedded in an entry.  As in get_constraint_for_ptr_offset, make
+	 the address point to anything.  */
+      result.var = anything_id;
+      result.offset = 0;
+    }
   else if (result.type == SCALAR)
     {
       /* In languages like C, you can access one past the end of an
