@@ -290,7 +290,8 @@ debug_constraint_graph (void)
 static bool
 constraint_expr_equal (struct constraint_expr a, struct constraint_expr b)
 {
-  return a.type == b.type && a.var == b.var && a.offset == b.offset;
+  return (a.type == b.type && a.var == b.var && a.offset == b.offset
+	  && a.size == b.size && a.align_log2 == b.align_log2);
 }
 
 /* Return true if constraint expression A is less than constraint expression
@@ -303,7 +304,16 @@ constraint_expr_less (struct constraint_expr a, struct constraint_expr b)
   if (a.type == b.type)
     {
       if (a.var == b.var)
-	return a.offset < b.offset;
+	{
+	  if (a.offset == b.offset)
+	    {
+	      if (a.size == b.size)
+		return a.align_log2 < b.align_log2;
+	      return a.size < b.size;
+	    }
+	  else
+	    return a.offset < b.offset;
+	}
       else
 	return a.var < b.var;
     }
@@ -1074,6 +1084,37 @@ solve_add_graph_edge (constraint_graph_t graph, unsigned int to,
   return false;
 }
 
+/* Return how many bits from FIELDOFFSET the memory access of the
+   dereference C can reach when it starts less than EXTENT bits after
+   FIELDOFFSET in the variable containing V.  A pointer into the middle of
+   a field is represented by the field itself, so the access can start as
+   late as the last bit of EXTENT.  Since the address of the access is a
+   multiple of its alignment, the latest start that's actually possible is
+   the last bit of EXTENT rounded down to that alignment, as long as the
+   variable's start is aligned at least as much.  An access that starts at
+   FIELDOFFSET itself is always included, even if it isn't aligned.  */
+
+static unsigned HOST_WIDE_INT
+deref_access_reach (varinfo_t v, HOST_WIDE_INT fieldoffset,
+		    unsigned HOST_WIDE_INT extent, const constraint_expr &c)
+{
+  if (c.size == 0 || extent == 0)
+    return c.size;
+
+  unsigned HOST_WIDE_INT align = MIN (HOST_WIDE_INT_1U << c.align_log2,
+				      vi_start_align (v));
+  unsigned HOST_WIDE_INT last = extent - 1;
+  /* FIELDOFFSET is negative for an offset that moves the pointer back past
+     the start of the variable, which the unsigned arithmetic handles.  */
+  unsigned HOST_WIDE_INT misalign
+    = ((unsigned HOST_WIDE_INT) fieldoffset + last) & (align - 1);
+  if (misalign > last)
+    return c.size;
+
+  unsigned HOST_WIDE_INT reach = last - misalign + c.size;
+  return MIN (reach, (unsigned HOST_WIDE_INT) HOST_WIDE_INT_MAX);
+}
+
 /* Process a constraint C that represents x = *(y + off), using DELTA as the
    starting solution for y.  */
 
@@ -1087,6 +1128,7 @@ do_sd_constraint (constraint_graph_t graph, constraint_t c,
   unsigned int j;
   bitmap_iterator bi;
   HOST_WIDE_INT roffset = c->rhs.offset;
+  unsigned HOST_WIDE_INT rsize = c->rhs.size;
 
   /* Our IL does not allow this.  */
   gcc_checking_assert (c->lhs.offset == 0);
@@ -1116,24 +1158,30 @@ do_sd_constraint (constraint_graph_t graph, constraint_t c,
       varinfo_t v = get_varinfo (j);
       HOST_WIDE_INT fieldoffset = v->offset + roffset;
       unsigned HOST_WIDE_INT size = v->size;
+      unsigned HOST_WIDE_INT reach = rsize;
       unsigned int t;
 
-      if (v->is_full_var)
-	;
-      else if (roffset != 0)
+      if (!v->is_full_var)
 	{
 	  /* The pointer can point anywhere in the offsets that V stands
 	     for, so the access can start anywhere in them shifted by
-	     roffset.  */
-	  size = vi_offset_extent (v);
-	  if (fieldoffset < 0)
-	    v = get_varinfo (v->head);
-	  else
-	    v = first_or_preceding_vi_for_offset (v, fieldoffset);
+	     roffset.  A load that is wider than the rest of the field it
+	     starts in also reads the fields after it.  */
+	  unsigned HOST_WIDE_INT extent = vi_offset_extent (v);
+	  reach = deref_access_reach (v, fieldoffset, extent, c->rhs);
+	  if (roffset != 0)
+	    {
+	      size = extent;
+	      if (fieldoffset < 0)
+		v = get_varinfo (v->head);
+	      else
+		v = first_or_preceding_vi_for_offset (v, fieldoffset);
+	    }
 	}
 
       /* We have to include all fields that overlap the current field
-	 shifted by roffset.  */
+	 shifted by roffset, along with the ones that the load reaches.  */
+      size = MAX (size, reach);
       do
 	{
 	  t = find (v->id);
@@ -1166,6 +1214,7 @@ do_ds_constraint (constraint_t c, bitmap delta, bitmap *expanded_delta)
   unsigned int j;
   bitmap_iterator bi;
   HOST_WIDE_INT loff = c->lhs.offset;
+  unsigned HOST_WIDE_INT lsize = c->lhs.size;
   bool escaped_p = false;
 
   /* Our IL does not allow this.  */
@@ -1204,23 +1253,29 @@ do_ds_constraint (constraint_t c, bitmap delta, bitmap *expanded_delta)
       unsigned int t;
       HOST_WIDE_INT fieldoffset = v->offset + loff;
       unsigned HOST_WIDE_INT size = v->size;
+      unsigned HOST_WIDE_INT reach = lsize;
 
-      if (v->is_full_var)
-	;
-      else if (loff != 0)
+      if (!v->is_full_var)
 	{
 	  /* The pointer can point anywhere in the offsets that V stands
 	     for, so the access can start anywhere in them shifted by
-	     loff.  */
-	  size = vi_offset_extent (v);
-	  if (fieldoffset < 0)
-	    v = get_varinfo (v->head);
-	  else
-	    v = first_or_preceding_vi_for_offset (v, fieldoffset);
+	     loff.  A store that is wider than the rest of the field it
+	     starts in also writes the fields after it.  */
+	  unsigned HOST_WIDE_INT extent = vi_offset_extent (v);
+	  reach = deref_access_reach (v, fieldoffset, extent, c->lhs);
+	  if (loff != 0)
+	    {
+	      size = extent;
+	      if (fieldoffset < 0)
+		v = get_varinfo (v->head);
+	      else
+		v = first_or_preceding_vi_for_offset (v, fieldoffset);
+	    }
 	}
 
       /* We have to include all fields that overlap the current field
-	 shifted by loff.  */
+	 shifted by loff, along with the ones that the store reaches.  */
+      size = MAX (size, reach);
       do
 	{
 	  if (v->may_have_pointers)

@@ -26,7 +26,7 @@
 
 namespace pointer_analysis {
 
-enum constraint_expr_type {SCALAR, DEREF, ADDRESSOF};
+enum constraint_expr_type : unsigned char {SCALAR, DEREF, ADDRESSOF};
 
 /* Static IDs for the special variables.  Variable ID zero is unused
    and used as terminator for the sub-variable chain.  */
@@ -52,6 +52,19 @@ struct constraint_expr
 {
   /* Constraint type.  */
   constraint_expr_type type;
+
+  /* For a DEREF with a nonzero SIZE, the base-2 logarithm of the alignment
+     in bits that the address of the access has.  A pointer into the middle
+     of a field is represented by the field itself, so this bounds where in
+     the field the access can start, and thus how far past the field it can
+     reach.  */
+  unsigned char align_log2 = 0;
+
+  /* For a DEREF, the number of bits that the memory access covers from
+     where it starts, so that all the fields it overlaps are included even
+     when it's wider than the field it starts in.  Zero means the access
+     doesn't reach past that field.  */
+  unsigned short size = 0;
 
   /* Variable we are referring to in the constraint.  */
   unsigned int var;
@@ -211,6 +224,7 @@ varinfo_t first_vi_for_offset (varinfo_t start,
 varinfo_t first_or_preceding_vi_for_offset (varinfo_t start,
 					    unsigned HOST_WIDE_INT offset);
 unsigned HOST_WIDE_INT vi_offset_extent (varinfo_t vi);
+unsigned int vi_start_align (varinfo_t vi);
 void determine_global_memory_access (gcall *, bool *, bool *, bool *);
 bool fndecl_maybe_in_other_partition (tree);
 varinfo_t new_var_info (tree t, const char *name, bool add_id);

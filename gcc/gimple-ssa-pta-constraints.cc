@@ -47,6 +47,7 @@
 #include "ipa-modref-tree.h"
 #include "ipa-modref.h"
 #include "attr-fnspec.h"
+#include "builtins.h"
 
 #include "tree-ssa-structalias.h"
 #include "gimple-ssa-pta-constraints.h"
@@ -551,6 +552,35 @@ get_constraint_for_ptr_offset (tree ptr, tree offset,
 }
 
 
+/* Record that the memory access REF through the dereference C covers SIZE
+   bits from where it starts, along with the alignment of its address.  This
+   lets the solver include all the fields that the access overlaps, rather
+   than only the field it starts in, when the access is wider than that
+   field, e.g., an __int128 or vector access to a structure of two pointers.
+   An access whose size isn't a constant that fits is treated as one at an
+   unknown offset instead, which includes all the fields.  */
+
+static void
+set_deref_access_size (struct constraint_expr *c, tree ref, poly_int64 size)
+{
+  HOST_WIDE_INT const_size;
+
+  if (c->type != DEREF || c->offset == UNKNOWN_OFFSET)
+    return;
+
+  if (size.is_constant (&const_size) && IN_RANGE (const_size, 0, USHRT_MAX))
+    {
+      c->size = const_size;
+      /* Unless more is known about the pointer, this is the alignment that
+	 the type of the access requires, which RTL expansion assumes for
+	 the access too.  */
+      if (const_size != 0)
+	c->align_log2 = floor_log2 (get_object_alignment (ref));
+    }
+  else
+    c->offset = UNKNOWN_OFFSET;
+}
+
 /* Given a COMPONENT_REF T, return the constraint_expr vector for it.
    If address_p is true the result will be taken its address of.
    If lhs_p is true then the constraint expression is assumed to be used
@@ -771,6 +801,8 @@ get_constraint_for_component_ref (tree t, vec<ce_s> *results,
 	result.offset = UNKNOWN_OFFSET;
       else
 	result.offset += const_bitpos;
+      if (!address_p)
+	set_deref_access_size (&result, orig_t, bitsize);
     }
   else if (result.type == ADDRESSOF)
     {
@@ -953,7 +985,14 @@ get_constraint_for_1 (tree t, vec<ce_s> *results, bool address_p,
 		  return;
 		}
 	      if (cs.type != SCALAR)
-		return;
+		{
+		  tree type_size = TYPE_SIZE (TREE_TYPE (t));
+		  poly_int64 size;
+		  if (!type_size || !poly_int_tree_p (type_size, &size))
+		    size = -1;
+		  set_deref_access_size (&results->last (), t, size);
+		  return;
+		}
 
 	      vi = get_varinfo (cs.var);
 	      curr = vi_next (vi);
