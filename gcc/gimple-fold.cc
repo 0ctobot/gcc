@@ -4731,6 +4731,13 @@ clear_padding_bit_field_bits (clear_padding_struct *buf, HOST_WIDE_INT pos,
 			      HOST_WIDE_INT bpos, HOST_WIDE_INT fldsz,
 			      HOST_WIDE_INT *cur_pos)
 {
+  /* Append the padding before the bits on its own, since appending more
+     than BUF holds keeps only the last few bytes in BUF.  */
+  if (pos > *cur_pos)
+    {
+      clear_padding_add_padding (buf, pos - *cur_pos);
+      *cur_pos = pos;
+    }
   HOST_WIDE_INT end = ROUND_UP (bpos + fldsz, BITS_PER_UNIT) / BITS_PER_UNIT;
   if (pos + end > *cur_pos)
     {
