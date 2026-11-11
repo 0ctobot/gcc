@@ -7669,10 +7669,14 @@ gimplify_modify_expr_rhs (tree *expr_p, tree *from_p, tree *to_p,
 	     and it will return GS_OK only in this case.  The data of a
 	     flexible array member makes a variable bigger than its type, and
 	     the assignment must not store that data since it copies the size
-	     of the type alone.  */
+	     of the type alone.  A weak definition's initializer isn't
+	     necessarily the variable's value, since a strong definition from
+	     another translation unit can replace it at link time, so a weak
+	     variable must be copied from memory.  */
 	  if (TREE_READONLY (*from_p)
 	      && DECL_INITIAL (*from_p)
 	      && TREE_CODE (DECL_INITIAL (*from_p)) == CONSTRUCTOR
+	      && !(DECL_WEAK (*from_p) && !DECL_COMDAT (*from_p))
 	      && !TREE_THIS_VOLATILE (*from_p)
 	      && (!TREE_THIS_VOLATILE (*to_p)
 		  || (AGGREGATE_TYPE_P (TREE_TYPE (*to_p))
