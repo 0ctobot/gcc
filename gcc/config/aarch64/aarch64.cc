@@ -63,6 +63,7 @@
 #include "dwarf2out.h"
 #include "gimple-iterator.h"
 #include "gimple-fold.h"
+#include "gimple-walk.h"
 #include "tree-vectorizer.h"
 #include "tree-vector-builder.h"
 #include "aarch64-cost-tables.h"
@@ -22733,6 +22734,11 @@ constexpr auto AARCH64_IPA_SM_FIXED = 1U << 0;
 constexpr auto AARCH64_IPA_CLOBBERS_ZA = 1U << 1;
 constexpr auto AARCH64_IPA_CLOBBERS_ZT0 = 1U << 2;
 
+/* Set if the function reads the thread pointer register that -mtp= selects,
+   either through __builtin_thread_pointer or by accessing a thread-local
+   variable.  */
+constexpr auto AARCH64_IPA_READS_TP = 1U << 3;
+
 /* Implement TARGET_NEED_IPA_FN_TARGET_INFO.  */
 
 static bool
@@ -22743,11 +22749,30 @@ aarch64_need_ipa_fn_target_info (const_tree, unsigned int &)
   return true;
 }
 
+/* Callback for walk_stmt_load_store_addr_ops.  Return true if OP refers to
+   a thread-local variable, since computing its address reads the thread
+   pointer.  */
+
+static bool
+aarch64_tls_ref_p (gimple *, tree op, tree, void *)
+{
+  op = get_base_address (op);
+  return op && VAR_P (op) && DECL_THREAD_LOCAL_P (op);
+}
+
 /* Implement TARGET_UPDATE_IPA_FN_TARGET_INFO.  */
 
 static bool
 aarch64_update_ipa_fn_target_info (unsigned int &info, const gimple *stmt)
 {
+  if (!(info & AARCH64_IPA_READS_TP)
+      && (gimple_call_builtin_p (stmt, BUILT_IN_THREAD_POINTER)
+	  || walk_stmt_load_store_addr_ops (const_cast<gimple *> (stmt),
+					    nullptr, aarch64_tls_ref_p,
+					    aarch64_tls_ref_p,
+					    aarch64_tls_ref_p)))
+    info |= AARCH64_IPA_READS_TP;
+
   if (auto *ga = dyn_cast<const gasm *> (stmt))
     {
       /* We don't know what the asm does, so conservatively assume that
@@ -22854,6 +22879,17 @@ aarch64_can_inline_p (tree caller, tree callee)
   if (!callee_za
       && aarch64_fndecl_has_state (caller, "zt0")
       && callee_has_property (AARCH64_IPA_CLOBBERS_ZT0))
+    return false;
+
+  /* An inlined copy of the callee reads the thread pointer register that
+     the caller's -mtp= selects, so a callee compiled with a different
+     -mtp= would get the wrong thread pointer and the wrong TLS addresses.
+     No attribute or pragma sets -mtp=, which means that only LTO can bring
+     such a caller and callee together.  Do this before the always_inline
+     check below, since inlining here would produce wrong code rather than
+     merely different code.  */
+  if (caller_opts->x_aarch64_tpidr_reg != callee_opts->x_aarch64_tpidr_reg
+      && callee_has_property (AARCH64_IPA_READS_TP))
     return false;
 
   /* Allow non-strict aligned functions inlining into strict

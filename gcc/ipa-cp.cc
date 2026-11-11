@@ -2159,6 +2159,37 @@ values_equal_for_ipcp_p (ipa_polymorphic_call_context x,
   return x.equal_to (y);
 }
 
+/* Return true if VAL is the address of a thread-local variable and CS calls a
+   function built with different target options than its caller.  The code
+   that computes such an address can depend on target options (on aarch64,
+   -mtp= selects the register that holds the thread pointer), so a callee
+   specialized for VAL could compute a different address than the one its
+   caller passes.  */
+
+static bool
+ipcp_tls_address_across_targets_p (tree val, cgraph_edge *cs)
+{
+  if (TREE_CODE (val) != ADDR_EXPR)
+    return false;
+  tree base = get_base_address (TREE_OPERAND (val, 0));
+  if (!base || !VAR_P (base) || !DECL_THREAD_LOCAL_P (base))
+    return false;
+
+  cl_target_option *caller_opts = target_opts_for_fn (cs->caller->decl);
+  cl_target_option *callee_opts
+    = target_opts_for_fn (cs->callee->function_symbol ()->decl);
+  return (caller_opts != callee_opts
+	  && !cl_target_option_eq (caller_opts, callee_opts));
+}
+
+/* Polymorphic contexts never hold the address of a variable.  */
+
+static bool
+ipcp_tls_address_across_targets_p (ipa_polymorphic_call_context,
+				   cgraph_edge *)
+{
+  return false;
+}
 
 /* Add a new value source to the value represented by THIS, marking that a
    value comes from edge CS and (if the underlying jump function is a
@@ -2239,6 +2270,9 @@ ipcp_lattice<valtype>::add_value (valtype newval, cgraph_edge *cs,
 
   if (bottom)
     return false;
+
+  if (ipcp_tls_address_across_targets_p (newval, cs))
+    return set_contains_variable ();
 
   for (val = values; val; last_val = val, val = val->next)
     if (values_equal_for_ipcp_p (val->value, newval))
@@ -5533,7 +5567,8 @@ find_scalar_values_for_callers_subset (vec<tree> &known_csts,
 	  if (!t
 	      || (newval
 		  && !values_equal_for_ipcp_p (t, newval))
-	      || (!first && !newval))
+	      || (!first && !newval)
+	      || ipcp_tls_address_across_targets_p (t, cs))
 	    {
 	      newval = NULL_TREE;
 	      break;
@@ -5790,9 +5825,15 @@ push_agg_values_from_edge (struct cgraph_edge *cs,
       if (!ipa_is_param_used (dest_info, index)
 	  || plats->aggs_bottom)
 	continue;
+      unsigned first_new = res->length ();
       push_agg_values_for_index_from_edge (cs, index, res,
 					   optimize_self_recursion ? interim
 					   : NULL);
+      for (unsigned i = first_new; i < res->length ();)
+	if (ipcp_tls_address_across_targets_p ((*res)[i].value, cs))
+	  res->ordered_remove (i);
+	else
+	  i++;
     }
 }
 
@@ -5905,7 +5946,9 @@ cgraph_edge_brings_all_scalars_for_node (struct cgraph_edge *cs,
       jump_func = ipa_get_ith_jump_func (args, i);
       t = ipa_value_from_jfunc (caller_info, jump_func,
 				ipa_get_type (dest_info, i));
-      if (!t || !values_equal_for_ipcp_p (val, t))
+      if (!t
+	  || !values_equal_for_ipcp_p (val, t)
+	  || ipcp_tls_address_across_targets_p (val, cs))
 	return false;
     }
   return true;

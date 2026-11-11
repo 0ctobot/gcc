@@ -3018,12 +3018,33 @@ analyze_function_body (struct cgraph_node *node, bool early)
 	    }
 	}
 
+      /* PHI arguments can expand to code of their own, such as computing
+	 the address of a thread-local variable, so pass the PHIs to the
+	 target too.  */
+      for (gphi_iterator bsi = gsi_start_phis (bb);
+	   scan_for_target_info && !gsi_end_p (bsi); gsi_next (&bsi))
+	scan_for_target_info
+	  = targetm.target_option.update_ipa_fn_target_info
+	      (info->target_info, bsi.phi ());
+
       fix_builtin_expect_stmt = find_foldable_builtin_expect (bb);
 
       for (gimple_stmt_iterator bsi = gsi_start_nondebug_bb (bb);
 	   !gsi_end_p (bsi); gsi_next_nondebug (&bsi))
 	{
 	  gimple *stmt = gsi_stmt (bsi);
+
+	  /* For target specific information, we want to scan all statements
+	     rather than those statements with non-zero weights, to avoid
+	     missing to scan something interesting for target information,
+	     such as: internal function calls.  This includes the statements
+	     that only feed __builtin_unreachable guards, which are skipped
+	     below.  */
+	  if (scan_for_target_info)
+	    scan_for_target_info
+	      = targetm.target_option.update_ipa_fn_target_info
+		  (info->target_info, stmt);
+
 	  if (!gimple_plf (stmt, STMT_NECESSARY))
 	    {
 	      if (dump_file && (dump_flags & TDF_DETAILS))
@@ -3228,15 +3249,6 @@ analyze_function_body (struct cgraph_node *node, bool early)
 		    fprintf (dump_file, "   fp_expression set\n");
 		}
 	    }
-
-	  /* For target specific information, we want to scan all statements
-	     rather than those statements with non-zero weights, to avoid
-	     missing to scan something interesting for target information,
-	     such as: internal function calls.  */
-	  if (scan_for_target_info)
-	    scan_for_target_info =
-	      targetm.target_option.update_ipa_fn_target_info
-	      (info->target_info, stmt);
 
 	  /* Account cost of address calculations in the statements.  */
 	  for (unsigned int i = 0; i < gimple_num_ops (stmt); i++)
