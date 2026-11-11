@@ -147,6 +147,9 @@ Enum(tp_reg) String(tpidr_el3) Value(AARCH64_TPIDR_EL3)
 EnumValue
 Enum(tp_reg) String(tpidrro_el0) Value(AARCH64_TPIDRRO_EL0)
 
+EnumValue
+Enum(tp_reg) String(sp_el0) Value(AARCH64_SP_EL0)
+
 mtp=
 Target RejectNegative Joined Enum(tp_reg) Var(aarch64_tpidr_reg) Init(AARCH64_TPIDR_EL0) Save
 Specify the thread pointer register.
