@@ -12772,6 +12772,24 @@ expand_expr_real_1 (tree exp, rtx target, machine_mode tmode,
 		&& GET_MODE_CLASS (ext_mode) == MODE_INT)
 	      reversep = TYPE_REVERSE_STORAGE_ORDER (type);
 
+	    /* A member that isn't a bit-field is read here too when it isn't
+	       aligned enough to load directly, such as a member of a packed
+	       record on a strict-alignment target, and the read can then
+	       cover a volatile neighbor just like a bit-field read.  Limit it
+	       to the member's own bytes, which is the region that a store to
+	       it gets in expand_assignment.  */
+	    if (MEM_P (op0)
+		&& !(TREE_CODE (exp) == COMPONENT_REF
+		     && DECL_BIT_FIELD_TYPE (TREE_OPERAND (exp, 1)))
+		&& maybe_gt (bitsize, 0)
+		&& multiple_p (bitsize, BITS_PER_UNIT)
+		&& multiple_p (bitpos, BITS_PER_UNIT)
+		&& ref_has_volatile_member_p (exp))
+	      {
+		bitregion_start = bitpos;
+		bitregion_end = bitpos + bitsize - 1;
+	      }
+
 	    gcc_checking_assert (known_ge (bitpos, 0));
 	    op0 = extract_bit_field (op0, bitsize, bitpos, unsignedp,
 				     (modifier == EXPAND_STACK_PARM
