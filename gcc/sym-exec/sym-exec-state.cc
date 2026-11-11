@@ -2412,6 +2412,22 @@ state::complement_state_with_origin (tree origin)
 bool
 state::do_operation (tree_code op_code, tree arg1, tree arg2, tree dest)
 {
+  /* A variable gets as many bits as the size of its type, so a value of an
+     integral type with a smaller precision, such as a bit-field's type, a
+     small _BitInt or bool, would keep the bits above the precision that the
+     real value loses.  Refuse to execute anything on such a value.  */
+  for (tree t : { dest, arg1, arg2 })
+    if (t
+	&& INTEGRAL_TYPE_P (TREE_TYPE (t))
+	&& compare_tree_int (TYPE_SIZE (TREE_TYPE (t)),
+			     TYPE_PRECISION (TREE_TYPE (t))) != 0)
+      {
+	if (dump_file)
+	  fprintf (dump_file, "Warning, encountered a value whose precision "
+			      "is smaller than its size!\n");
+	return false;
+      }
+
   switch (op_code)
     {
       case BIT_NOT_EXPR:
