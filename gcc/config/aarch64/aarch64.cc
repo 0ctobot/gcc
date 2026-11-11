@@ -18183,6 +18183,29 @@ aarch64_builtin_vectorization_cost (enum vect_cost_for_stmt type_of_cost,
 
   const simd_vec_cost *simd_costs = aarch64_simd_vec_costs (vectype);
 
+  /* A vector emulated in general registers (e.g., V2HI in a W register, or
+     with -mgeneral-regs-only, V4HI in an X register and V4SI in a pair of
+     X registers) is built by zeroing each register it occupies and then
+     inserting each element with its own BFI, and a splat is expanded the
+     same way.  Charge a scalar integer statement for each of those moves
+     and for each BFI.  An element that fills a whole register is moved
+     into it instead, with no BFI and no zeroing, so charge one statement
+     per register in that case.  This keeps BB SLP from replacing a group
+     of narrow scalar stores with a BFI chain and a single wider store,
+     which takes more instructions than the stores it replaces.  */
+  if (vectype
+      && VECTOR_TYPE_P (vectype)
+      && !VECTOR_MODE_P (TYPE_MODE (vectype))
+      && (type_of_cost == vec_construct || type_of_cost == scalar_to_vec))
+    {
+      unsigned HOST_WIDE_INT nunits
+	= estimated_poly_value (TYPE_VECTOR_SUBPARTS (vectype));
+      unsigned HOST_WIDE_INT elt_bits = vector_element_bits (vectype);
+      unsigned HOST_WIDE_INT nregs = CEIL (nunits * elt_bits, BITS_PER_WORD);
+      return (nregs + (elt_bits < BITS_PER_WORD ? nunits : 0))
+	     * costs->scalar_int_stmt_cost;
+    }
+
   switch (type_of_cost)
     {
       case scalar_stmt:
