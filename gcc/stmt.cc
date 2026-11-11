@@ -1209,13 +1209,14 @@ emit_case_dispatch_table (tree index_expr, tree index_type,
 						  : profile_probability::never ();
   profile_probability base = get_outgoing_edge_probs (stmt_bb);
   bool try_with_tablejump = false;
+  bool bounds_checked;
 
   profile_probability new_default_prob = conditional_probability (default_prob,
 								  base);
 
   if (! try_casesi (index_type, index_expr, minval, range,
 		    table_label, default_label, fallback_label,
-                    new_default_prob))
+		    new_default_prob, &bounds_checked))
     {
       /* Index jumptables from zero for suitable values of minval to avoid
 	 a subtraction.  For the rationale see:
@@ -1275,10 +1276,17 @@ emit_case_dispatch_table (tree index_expr, tree index_type,
          to default label. The default label can either be reached
          through the indirect jump or the direct conditional jump
          before that. Split the probability of reaching the
-         default label among these two jumps.  */
-      new_default_prob = conditional_probability (default_prob / 2, base);
-      default_prob /= 2;
-      base -= default_prob;
+	 default label among these two jumps.  When the range of the
+	 index made try_casesi drop the conditional jump, the table is
+	 the only way to the default label and its edge keeps all of
+	 its probability.  */
+      if (bounds_checked)
+	{
+	  new_default_prob = conditional_probability (default_prob / 2,
+						      base);
+	  default_prob /= 2;
+	  base -= default_prob;
+	}
     }
   else
     {
@@ -1288,6 +1296,25 @@ emit_case_dispatch_table (tree index_expr, tree index_type,
 
   if (default_edge)
     default_edge->probability = default_prob;
+
+  /* Without a bounds check and without gaps in the table, nothing jumps to
+     the default label anymore.  Remove the edge to it unless a case label
+     shares its destination.  The edge would survive otherwise, because the
+     RTL CFG fixup only purges dead edges of a tablejump when it splits the
+     block, and there's no conditional jump left to split it at.  */
+  if (!bounds_checked && !has_gaps && default_edge)
+    {
+      bool shared = false;
+      for (unsigned j = 0; j < case_list.length (); j++)
+	if (label_to_block (cfun, case_list[j].m_code_label)
+	    == default_edge->dest)
+	  {
+	    shared = true;
+	    break;
+	  }
+      if (!shared)
+	expand_remove_edge (default_edge);
+    }
 
   /* We have altered the probability of the default edge. So the probabilities
      of all other edges need to be adjusted so that it sums up to
