@@ -210,6 +210,7 @@ varinfo_t first_vi_for_offset (varinfo_t start,
 			       unsigned HOST_WIDE_INT offset);
 varinfo_t first_or_preceding_vi_for_offset (varinfo_t start,
 					    unsigned HOST_WIDE_INT offset);
+unsigned HOST_WIDE_INT vi_offset_extent (varinfo_t vi);
 void determine_global_memory_access (gcall *, bool *, bool *, bool *);
 bool fndecl_maybe_in_other_partition (tree);
 varinfo_t new_var_info (tree t, const char *name, bool add_id);
