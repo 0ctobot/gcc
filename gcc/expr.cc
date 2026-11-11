@@ -12740,6 +12740,16 @@ expand_expr_real_1 (tree exp, rtx target, machine_mode tmode,
 				      ? NULL_RTX : target),
 				     ext_mode, ext_mode, reversep, alt_rtl);
 
+	    /* The extraction extends the value from BITSIZE bits, which for a
+	       _BitInt that isn't a bit-field covers all of its storage,
+	       including the padding bits above its precision.  Unless the
+	       target keeps _BitInt values extended, those bits can hold
+	       anything, so extend the value from its precision as the direct
+	       load below does.  */
+	    if (TREE_CODE (type) == BITINT_TYPE
+		&& maybe_gt (bitsize, TYPE_PRECISION (type)))
+	      op0 = EXTEND_BITINT (op0);
+
 	    /* If the result has aggregate type and the mode of OP0 is an
 	       integral mode then, if BITSIZE is narrower than this mode
 	       and this is for big-endian data, we must put the field
