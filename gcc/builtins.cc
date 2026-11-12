@@ -7320,8 +7320,14 @@ fold_builtin_atomic_always_lock_free (tree arg0, tree arg1)
   if (!tree_fits_shwi_p (arg0))
     return NULL_TREE;
 
-  /* We need a corresponding integer mode for the access to be lock-free.  */
-  size = tree_to_shwi (arg0) * BITS_PER_UNIT;
+  /* We need a corresponding integer mode for the access to be lock-free.
+     No integer mode comes close to HOST_WIDE_INT_MAX bits, so answer no
+     for sizes whose bit count would overflow, rather than letting the
+     product wrap around to the size of a lock-free mode.  */
+  size = tree_to_shwi (arg0);
+  if (!IN_RANGE (size, 0, HOST_WIDE_INT_MAX / BITS_PER_UNIT))
+    return boolean_false_node;
+  size *= BITS_PER_UNIT;
   if (!int_mode_for_size (size, 0).exists (&mode))
     return boolean_false_node;
 
