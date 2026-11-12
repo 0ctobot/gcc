@@ -4190,6 +4190,8 @@ installdirs:
 	$(mkinstalldirs) $(DESTDIR)$(man7dir)
 
 PLUGIN_HEADERS = $(TREE_H) $(CONFIG_H) $(SYSTEM_H) coretypes.h $(TM_H) \
+  $(patsubst $(srcdir)/%,%,$(wildcard $(srcdir)/stdbackport/* \
+				       $(srcdir)/stdbackport/gbits/*)) \
   toplev.h $(DIAGNOSTIC_CORE_H) $(BASIC_BLOCK_H) $(HASH_TABLE_H) \
   tree-ssa-alias.h $(INTERNAL_FN_H) gimple-fold.h tree-eh.h gimple-expr.h \
   gimple.h is-a.h memmodel.h $(TREE_PASS_H) $(GCC_PLUGIN_H) \
@@ -4244,8 +4246,8 @@ install-gengtype: installdirs gengtype$(exeext) gtype.state
 
 # Install the headers needed to build a plugin.
 install-plugin: installdirs lang.install-plugin s-header-vars install-gengtype
-# We keep the directory structure for files in analyzer, config, common/config
-# or c-family and .def files.
+# We keep the directory structure for files in analyzer, config, common/config,
+# c-family or stdbackport and .def files.
 # All other files are flattened to a single directory.
 	$(mkinstalldirs) $(DESTDIR)$(plugin_includedir)
 	headers=`echo $(sort $(PLUGIN_HEADERS)) $$(cd $(srcdir); echo *.h *.def) | tr ' ' '\012' | sort -u`; \
