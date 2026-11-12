@@ -1082,28 +1082,38 @@ store_integral_bit_field (rtx op0, opt_scalar_int_mode op0_mode,
 	  || !HARD_REGISTER_P (op0)
 	  || hard_regno_nregs (REGNO (op0), op0_mode.require ()) != 1))
     {
-      if (bitnum % BITS_PER_WORD + bitsize > BITS_PER_WORD)
-	{
-	  if (!fallback_p)
-	    return false;
-
-	  store_split_bit_field (op0, op0_mode, bitsize, bitnum,
-				 bitregion_start, bitregion_end,
-				 value, value_mode, reverse);
-	  return true;
-	}
-      rtx new_op0
-	= simplify_gen_subreg (word_mode, op0, op0_mode.require (),
-			       bitnum / BITS_PER_WORD * UNITS_PER_WORD);
+      rtx new_op0 = NULL_RTX;
+      if (bitnum % BITS_PER_WORD + bitsize <= BITS_PER_WORD)
+	new_op0 = simplify_gen_subreg (word_mode, op0, op0_mode.require (),
+				       (bitnum / BITS_PER_WORD
+					* UNITS_PER_WORD));
       if (!new_op0)
 	{
-	  /* No valid word-mode SUBREG of op0 at this offset.  Defer to
-	     store_split_bit_field, which addresses op0 a word at a time.  */
+	  /* The field spans two words, or there's no valid word-mode
+	     SUBREG of op0 at this offset.  Defer to store_split_bit_field,
+	     which addresses its destination a word at a time.  It gets
+	     each word from operand_subword_force, which quietly works on
+	     a copy of a register that has no subreg for that word, and
+	     the store would then never reach op0.  If either word that
+	     the field touches is like that, do the store on a pseudo of
+	     op0's integer mode, which always has word subregs, and copy
+	     the result back.  */
 	  if (!fallback_p)
 	    return false;
-	  store_split_bit_field (op0, op0_mode, bitsize, bitnum,
+	  rtx dest = op0;
+	  if (!operand_subword (op0, bitnum / BITS_PER_WORD, 1,
+				GET_MODE (op0))
+	      || !operand_subword (op0, (bitnum + bitsize - 1) / BITS_PER_WORD,
+				   1, GET_MODE (op0)))
+	    {
+	      dest = gen_reg_rtx (op0_mode.require ());
+	      emit_move_insn (dest, op0);
+	    }
+	  store_split_bit_field (dest, op0_mode, bitsize, bitnum,
 				 bitregion_start, bitregion_end,
 				 value, value_mode, reverse);
+	  if (dest != op0)
+	    emit_move_insn (op0, dest);
 	  return true;
 	}
       op0 = new_op0;
