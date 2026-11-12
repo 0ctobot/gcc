@@ -7377,13 +7377,17 @@ gimplify_modify_expr_rhs (tree *expr_p, tree *from_p, tree *to_p,
 		use_target = true;
 	      else if (TREE_CODE (*to_p) != SSA_NAME
 		      && (!is_gimple_variable (*to_p)
-			  || needs_to_live_in_memory (*to_p)))
+			  || needs_to_live_in_memory (*to_p)
+			  || DECL_NONLOCAL (*to_p)))
 		/* Don't use the original target if it's already addressable;
 		   if its address escapes, and the called function uses the
 		   NRV optimization, a conforming program could see *to_p
 		   change before the called function returns; see c++/19317.
-		   When optimizing, the return_slot pass marks more functions
-		   as safe after we have escape info.  */
+		   A variable that a nested function refers to counts as
+		   addressable, since the nested function reads it through its
+		   static chain, and tree-nested.cc only makes it a field of the
+		   frame later on.  When optimizing, the return_slot pass marks
+		   more functions as safe after we have escape info.  */
 		use_target = false;
 	      else
 		use_target = true;
