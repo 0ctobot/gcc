@@ -6049,7 +6049,31 @@ visit_nary_op (tree lhs, gassign *stmt)
 	      tree ops[2];
 	      gimple_match_op match_op (gimple_match_cond::UNCOND,
 					NEGATE_EXPR, type, rhs[i]);
-	      ops[i] = vn_nary_build_or_lookup_1 (&match_op, false, true);
+	      /* Integer division only commutes with negating an operand that
+		 isn't the minimum value of its type, since negating the
+		 minimum wraps back to itself: for A == INT_MIN, A / 2 is
+		 INT_MIN / 2 but -(-A / 2) is -(INT_MIN / 2).  The negation
+		 looked up here isn't evaluated by the program, so undefined
+		 overflow doesn't rule that out, and simplifying it as if it
+		 were evaluated can find the quotient of a different value,
+		 e.g., -(int) -X folds to (int) X for an unsigned X.  As such,
+		 only proceed when the operand is a constant other than the
+		 minimum, or when overflow is undefined and the program itself
+		 either negates the operand or computes it with a negation.  */
+	      bool simplify = true;
+	      if (code == TRUNC_DIV_EXPR
+		  && !(TREE_CODE (rhs[i]) == INTEGER_CST
+		       && may_negate_without_overflow_p (rhs[i])))
+		{
+		  if (!TYPE_OVERFLOW_UNDEFINED (type))
+		    continue;
+		  gimple *def = (TREE_CODE (rhs[i]) == SSA_NAME
+				 ? SSA_NAME_DEF_STMT (rhs[i]) : NULL);
+		  simplify = (def
+			      && is_gimple_assign (def)
+			      && gimple_assign_rhs_code (def) == NEGATE_EXPR);
+		}
+	      ops[i] = vn_nary_build_or_lookup_1 (&match_op, false, simplify);
 	      ops[j] = rhs[j];
 	      if (ops[i]
 		  && (ops[0] = vn_nary_op_lookup_pieces (2, code,
