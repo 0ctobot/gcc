@@ -5447,7 +5447,19 @@ analyze_miv_subscript (tree chrec_a,
   chrec_b = chrec_convert (type, chrec_b, NULL);
   difference = chrec_fold_minus (type, chrec_a, chrec_b);
 
-  if (eq_evolutions_p (chrec_a, chrec_b))
+  /* The same access function evolving in more than one loop of the nest
+     doesn't give a distance in any one loop, as described in
+     analyze_overlapping_iterations.  */
+  if (eq_evolutions_p (chrec_a, chrec_b)
+      && !evolution_function_is_univariate_p (chrec_a, loop_nest->num))
+    {
+      *overlaps_a = conflict_fn_not_known ();
+      *overlaps_b = conflict_fn_not_known ();
+      *last_conflicts = chrec_dont_know;
+      dependence_stats.num_miv_unimplemented++;
+    }
+
+  else if (eq_evolutions_p (chrec_a, chrec_b))
     {
       /* Access functions are the same: all the elements are accessed
 	 in the same order.  */
@@ -5620,6 +5632,22 @@ analyze_overlapping_iterations (tree chrec_a,
   else if (!all_same_p
 	   && eq_evolutions_p (chrec_a, chrec_b)
 	   && dr_same_dim_step_may_be_zero_p (chrec_a))
+    {
+      dependence_stats.num_subscript_undetermined++;
+      *overlap_iterations_a = conflict_fn_not_known ();
+      *overlap_iterations_b = conflict_fn_not_known ();
+    }
+
+  /* The zero distance below is a distance in the loop of the chrec alone,
+     which is only right when the chrec evolves in a single loop of the nest.
+     A chrec like {{0, +, 1}_1, +, 1}_2 (i + j) has the same value in
+     iterations that differ in both loops, like (i + 1) + (j - 1), so the
+     subscript doesn't tie the distance in any one loop down.  When every
+     subscript is the same, the distance vectors come from the access
+     functions themselves, which handles this.  */
+  else if (!all_same_p
+	   && eq_evolutions_p (chrec_a, chrec_b)
+	   && !evolution_function_is_univariate_p (chrec_a, lnn))
     {
       dependence_stats.num_subscript_undetermined++;
       *overlap_iterations_a = conflict_fn_not_known ();
