@@ -200,6 +200,30 @@ chrec_fold_multiply_poly_poly (tree type,
       || !evolution_function_is_invariant_p (CHREC_RIGHT (poly1), var))
     return chrec_dont_know;
 
+  /* The step a*d + b*c + b*d is the difference between the first two values of
+     the product, and 2*b*d is the difference between consecutive steps.
+     Either can overflow TYPE even when no value of the product does.  With
+     undefined overflow, users such as niter's bound inference take the folded
+     coefficients as exact, which bounds the loop wrongly once one of them has
+     wrapped.  Check constant coefficients in widest_int and give up if one
+     doesn't fit TYPE.  */
+  if (INTEGRAL_TYPE_P (type)
+      && TYPE_OVERFLOW_UNDEFINED (type)
+      && TREE_CODE (CHREC_LEFT (poly0)) == INTEGER_CST
+      && TREE_CODE (CHREC_RIGHT (poly0)) == INTEGER_CST
+      && TREE_CODE (CHREC_LEFT (poly1)) == INTEGER_CST
+      && TREE_CODE (CHREC_RIGHT (poly1)) == INTEGER_CST)
+    {
+      widest_int a = wi::to_widest (CHREC_LEFT (poly0));
+      widest_int b = wi::to_widest (CHREC_RIGHT (poly0));
+      widest_int c = wi::to_widest (CHREC_LEFT (poly1));
+      widest_int d = wi::to_widest (CHREC_RIGHT (poly1));
+      if (!wi::fits_to_tree_p (a * c, type)
+	  || !wi::fits_to_tree_p (a * d + b * c + b * d, type)
+	  || !wi::fits_to_tree_p (b * d * 2, type))
+	return chrec_dont_know;
+    }
+
   /* "a*c".  */
   t0 = chrec_fold_multiply (type, CHREC_LEFT (poly0), CHREC_LEFT (poly1));
 
