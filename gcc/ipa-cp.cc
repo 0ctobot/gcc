@@ -1498,6 +1498,57 @@ set_single_call_flag (cgraph_node *node, void *)
   return false;
 }
 
+/* Worker of call_for_symbol_thunks_and_aliases.  DATA points to the
+   ipa_node_params of the function represented by NODE, either directly or
+   through a thunk or alias.  Mark the parameters of that function that receive
+   a volatile aggregate read from some caller of NODE.  */
+
+static bool
+note_volatile_read_args (cgraph_node *node, void *data)
+{
+  ipa_node_params *info = (ipa_node_params *) data;
+  int param_count = ipa_get_param_count (info);
+
+  for (cgraph_edge *cs = node->callers; cs; cs = cs->next_caller)
+    {
+      /* Thunks are visited too, and the arguments their callers pass line
+	 up with the parameters of the function.  */
+      if (cs->caller->thunk)
+	continue;
+
+      ipa_edge_args *args = ipa_edge_args_sum->get (cs);
+      int arg_count = args ? ipa_get_cs_argument_count (args) : 0;
+      if (!arg_count)
+	{
+	  /* There are no jump functions when the caller wasn't analyzed, so
+	     assume that every aggregate it passes by value is a volatile
+	     read.  */
+	  for (int i = 0; i < param_count; i++)
+	    {
+	      tree type = ipa_get_type (info, i);
+	      if (!type || !is_gimple_reg_type (type))
+		ipa_get_parm_lattices (info, i)->volatile_read_arg = true;
+	    }
+	  continue;
+	}
+
+      for (int i = 0; i < MIN (arg_count, param_count); i++)
+	if (ipa_get_ith_jump_func (args, i)->volatile_read)
+	  ipa_get_parm_lattices (info, i)->volatile_read_arg = true;
+    }
+  return false;
+}
+
+/* Return true if a clone of the function described by INFO has to keep its
+   Ith parameter when it doesn't know the parameter's value.  */
+
+static bool
+ipcp_param_needed_p (ipa_node_params *info, int i)
+{
+  return (ipa_is_param_used (info, i)
+	  || ipa_get_parm_lattices (info, i)->volatile_read_arg);
+}
+
 /* Initialize ipcp_lattices.  */
 
 static void
@@ -1611,6 +1662,15 @@ initialize_node_lattices (struct cgraph_node *node)
 	    set_all_contains_variable (plats, true);
 	}
     }
+
+  /* Clones drop the parameters that the body doesn't use and whose value
+     they don't know.  When a caller computes the argument with a volatile
+     read, dropping the parameter would also drop the read from the
+     redirected call, so remember which parameters receive such
+     arguments.  */
+  if (ipa_get_param_count (info))
+    node->call_for_symbol_thunks_and_aliases (note_volatile_read_args, info,
+					      true);
 
   for (ie = node->indirect_calls; ie; ie = ie->next_callee)
     if (ie->indirect_info->param_index >= 0
@@ -3667,7 +3727,7 @@ gather_context_independent_values (class ipa_node_params *info,
 	  ret = true;
 	}
       else if (removable_params_cost
-	       && !ipa_is_param_used (info, i))
+	       && !ipcp_param_needed_p (info, i))
 	*removable_params_cost
 	  += ipa_get_param_move_cost (info, i);
 
@@ -5202,7 +5262,7 @@ want_remove_some_param_p (cgraph_node *node, vec<tree> known_csts)
 
   for (i = 0; i < count; i++)
     {
-      if (!known_csts[i] && ipa_is_param_used (info, i))
+      if (!known_csts[i] && ipcp_param_needed_p (info, i))
        continue;
 
       if (!filled_vec)
@@ -5258,7 +5318,7 @@ create_specialized_node (struct cgraph_node *node,
 	  if (!node->can_change_signature
 	      || old_adj->op != IPA_PARAM_OP_COPY
 	      || (!known_csts[old_adj->base_index]
-		  && ipa_is_param_used (info, old_adj->base_index)))
+		  && ipcp_param_needed_p (info, old_adj->base_index)))
 	    {
 	      ipa_adjusted_param new_adj = *old_adj;
 
@@ -5279,7 +5339,7 @@ create_specialized_node (struct cgraph_node *node,
       memset (&adj, 0, sizeof (adj));
       adj.op = IPA_PARAM_OP_COPY;
       for (i = 0; i < count; i++)
-	if (!known_csts[i] && ipa_is_param_used (info, i))
+	if (!known_csts[i] && ipcp_param_needed_p (info, i))
 	  {
 	    adj.base_index = i;
 	    adj.prev_clone_index = i;

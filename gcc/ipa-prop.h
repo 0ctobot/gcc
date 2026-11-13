@@ -352,6 +352,12 @@ struct GTY (()) ipa_jump_func
   ipa_vr *m_vr;
 
   enum jump_func_type type;
+  /* Set when the argument is an aggregate passed by value whose evaluation
+     reads volatile memory.  The read happens in the caller even when the
+     callee never uses the parameter, so removing the parameter and thus the
+     argument would lose it.  Only ever set in IPA_JF_UNKNOWN jump
+     functions.  */
+  unsigned volatile_read : 1;
   /* Represents a value of a jump function.  pass_through is used only in jump
      function context.  constant represents the actual constant in constant jump
      functions and member_cst holds constant c++ member functions.  */
@@ -1215,6 +1221,7 @@ tree ipa_impossible_devirt_target (struct cgraph_edge *, tree);
 /* Functions related to both.  */
 void ipa_analyze_node (struct cgraph_node *);
 void ipa_analyze_var_static_initializer (varpool_node *node);
+bool ipa_volatile_aggregate_arg_p (tree arg);
 
 /* Aggregate jump function related functions.  */
 tree ipa_find_agg_cst_from_init (tree scalar, HOST_WIDE_INT offset,

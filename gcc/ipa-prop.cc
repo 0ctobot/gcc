@@ -490,7 +490,8 @@ ipa_dump_jump_function (FILE *f, ipa_jump_func *jump_func,
   enum jump_func_type type = jump_func->type;
 
   if (type == IPA_JF_UNKNOWN)
-    fprintf (f, "UNKNOWN\n");
+    fprintf (f, "UNKNOWN%s\n",
+	     jump_func->volatile_read ? ", volatile read" : "");
   else if (type == IPA_JF_CONST)
     {
       fprintf (f, "CONST: ");
@@ -2694,6 +2695,26 @@ skip_a_safe_conversion_op (tree t)
   return t;
 }
 
+/* Return true if evaluating the aggregate call argument ARG reads volatile
+   memory.  */
+
+bool
+ipa_volatile_aggregate_arg_p (tree arg)
+{
+  if (TREE_CODE (arg) == WITH_SIZE_EXPR)
+    arg = TREE_OPERAND (arg, 0);
+  while (handled_component_p (arg))
+    {
+      if (TREE_THIS_VOLATILE (arg))
+	return true;
+      arg = TREE_OPERAND (arg, 0);
+    }
+  return ((DECL_P (arg)
+	   || TREE_CODE (arg) == MEM_REF
+	   || TREE_CODE (arg) == TARGET_MEM_REF)
+	  && TREE_THIS_VOLATILE (arg));
+}
+
 /* Compute jump function for all arguments of callsite CS and insert the
    information in the jump_functions array in the ipa_edge_args corresponding
    to this callsite.  */
@@ -2805,6 +2826,19 @@ ipa_compute_jump_functions_for_edge (struct ipa_func_body_info *fbi,
 	}
 
       arg = skip_a_safe_conversion_op (arg);
+
+      /* An aggregate argument is loaded by the call statement itself, so
+	 when that load is volatile, the read has to stay in the caller even
+	 if the callee never uses the parameter.  Mark the jump function to
+	 keep IPA-CP from removing the parameter, and don't describe the value
+	 any further since a volatile read doesn't produce a known constant,
+	 not even from a read-only variable.  */
+      if (!is_gimple_reg (arg) && ipa_volatile_aggregate_arg_p (arg))
+	{
+	  jfunc->volatile_read = true;
+	  continue;
+	}
+
       if (is_gimple_ip_invariant (arg)
 	  || (VAR_P (arg) && is_global_var (arg) && TREE_READONLY (arg)))
 	{
@@ -5376,6 +5410,7 @@ ipa_duplicate_jump_function (cgraph_edge *src, cgraph_edge *dst,
   /* We can avoid calling ipa_set_jfunc_vr since it would only look up the
      place in the hash_table where the source m_vr resides.  */
   dst_jf->m_vr = src_jf->m_vr;
+  dst_jf->volatile_read = src_jf->volatile_read;
 
   if (src_jf->type == IPA_JF_CONST)
     {
@@ -5690,6 +5725,13 @@ ipa_write_jump_function (struct output_block *ob,
   if (jump_func->type == IPA_JF_CONST
       && TREE_CODE (jump_func->value.constant.value) == ADDR_EXPR)
     flag = 1;
+  /* The flag is otherwise unused for unknown jump functions, so it carries
+     the volatile read bit there.  Readers that don't know about the bit
+     ignore it, which keeps the format compatible in both directions.  */
+  else if (jump_func->type == IPA_JF_UNKNOWN)
+    flag = jump_func->volatile_read;
+  else
+    gcc_checking_assert (!jump_func->volatile_read);
 
   streamer_write_uhwi (ob, jump_func->type * 2 + flag);
   switch (jump_func->type)
@@ -5814,6 +5856,7 @@ ipa_read_jump_function (class lto_input_block *ib,
     {
     case IPA_JF_UNKNOWN:
       ipa_set_jf_unknown (jump_func);
+      jump_func->volatile_read = flag;
       break;
     case IPA_JF_CONST:
       {
@@ -7190,7 +7233,8 @@ ipa_agg_jump_functions_equivalent_p (ipa_agg_jf_item *ajf1,
 bool
 ipa_jump_functions_equivalent_p (ipa_jump_func *jf1, ipa_jump_func *jf2)
 {
-  if (jf1->type != jf2->type)
+  if (jf1->type != jf2->type
+      || jf1->volatile_read != jf2->volatile_read)
     return false;
 
   switch (jf1->type)
