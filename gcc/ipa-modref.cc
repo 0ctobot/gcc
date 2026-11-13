@@ -1821,6 +1821,25 @@ modref_access_analysis::analyze_stmt (gimple *stmt, bool always_executed)
      record_unknown_store ();
      return;
    case GIMPLE_CALL:
+     /* Summaries leave out stores done before a noreturn call, since control
+	isn't expected to come back.  When the callee can reach a nonlocal
+	label or a setjmp receiver in this function, control does come back and
+	this function then returns normally, so neither the callee's summary
+	nor its ECF flags describe what it may clobber.  Treat the call as
+	unknown.  This is done during IPA analysis as well, since propagation
+	would otherwise merge the same incomplete summaries later.  */
+     if (stmt_can_make_abnormal_goto (stmt))
+       {
+	 if (dump_file)
+	   fprintf (dump_file, " - Call can return abnormally into this "
+		    "function; recording unknown loads and stores.\n");
+	 set_side_effects ();
+	 if (!ignore_nondeterminism_p (current_function_decl, 0, NULL))
+	   set_nondeterministic ();
+	 record_unknown_load ();
+	 record_unknown_store ();
+	 return;
+       }
      if (!m_ipa || gimple_call_internal_p (stmt))
        analyze_call (as_a <gcall *> (stmt));
      else
@@ -2478,6 +2497,13 @@ modref_eaf_analysis::analyze_ssa_name (tree name, bool deferred)
 	  /* Recursion would require bit of propagation; give up for now.  */
 	  if (callee && !m_ipa && recursive_call_p (current_function_decl,
 						  callee))
+	    m_lattice[index].merge (0);
+	  /* The callee's flags for NAME may omit stores done before a noreturn
+	     call, which become visible here when the callee transfers control
+	     abnormally back into this function.  Give up on NAME rather than
+	     recording an escape point, so IPA propagation cannot improve the
+	     flags afterwards.  */
+	  else if (stmt_can_make_abnormal_goto (call))
 	    m_lattice[index].merge (0);
 	  else
 	    {
