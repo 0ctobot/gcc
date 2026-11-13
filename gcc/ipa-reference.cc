@@ -661,8 +661,15 @@ read_write_all_from_decl (struct cgraph_node *node,
 {
   tree decl = node->decl;
   int flags = flags_from_decl_or_type (decl);
+  /* A leaf function cannot touch a module static, since it never calls back
+     into this unit.  Threading barriers are leaf too, but other threads'
+     stores to the statics become visible at a barrier, and our own stores
+     must not move across it.  As such, the alias oracle treats a call to one
+     as reading and writing all of them, and a function that calls one has to
+     count as doing the same.  */
   if ((flags & ECF_LEAF)
-      && node->get_availability () < AVAIL_INTERPOSABLE)
+      && node->get_availability () < AVAIL_INTERPOSABLE
+      && !threading_barrier_builtin_p (decl))
     ;
   else if (flags & ECF_CONST)
     ;
