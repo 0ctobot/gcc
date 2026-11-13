@@ -2943,7 +2943,11 @@ spaceship_replacement (basic_block cond_bb, basic_block middle_bb,
 
    Similarly for __builtin_clz or __builtin_ctz if
    C?Z_DEFINED_VALUE_AT_ZERO is 2, optab is present and
-   instead of 0 above it uses the value from that macro.  */
+   instead of 0 above it uses the value from that macro.
+
+   The builtin's result may also feed up to two conversions or arithmetic
+   operations with a constant operand, e.g., x ? 32 - __builtin_clz (x) : 0,
+   in which case C is the result of those statements for __builtin_fun (0).  */
 
 static bool
 cond_removal_in_builtin_zero_pattern (basic_block cond_bb,
@@ -2954,6 +2958,8 @@ cond_removal_in_builtin_zero_pattern (basic_block cond_bb,
   gimple_stmt_iterator gsi, gsi_from;
   gimple *call;
   gimple *cast = NULL;
+  gimple *uses[2];
+  unsigned num_uses = 0;
   tree lhs, arg;
 
   /* Check that
@@ -2961,24 +2967,26 @@ cond_removal_in_builtin_zero_pattern (basic_block cond_bb,
    _9 = __builtin_popcountl (_2);
    OR
    _9 = __builtin_popcountl (b_4(D));
+   followed by at most two statements computing the PHI argument from _9
    are the only stmts in the middle_bb.  */
 
   gsi = gsi_start_nondebug_after_labels_bb (middle_bb);
   if (gsi_end_p (gsi))
     return false;
-  cast = gsi_stmt (gsi);
-  gsi_next_nondebug (&gsi);
-  if (!gsi_end_p (gsi))
+  call = gsi_stmt (gsi);
+  if (!is_gimple_call (call))
     {
-      call = gsi_stmt (gsi);
+      cast = call;
       gsi_next_nondebug (&gsi);
-      if (!gsi_end_p (gsi))
+      if (gsi_end_p (gsi))
 	return false;
+      call = gsi_stmt (gsi);
     }
-  else
+  for (gsi_next_nondebug (&gsi); !gsi_end_p (gsi); gsi_next_nondebug (&gsi))
     {
-      call = cast;
-      cast = NULL;
+      if (num_uses == ARRAY_SIZE (uses))
+	return false;
+      uses[num_uses++] = gsi_stmt (gsi);
     }
 
   /* Check that we have a popcount/clz/ctz builtin.  */
@@ -3096,6 +3104,64 @@ cond_removal_in_builtin_zero_pattern (basic_block cond_bb,
       arg = gimple_assign_rhs1 (cast);
     }
 
+  /* The builtin's result may go through a conversion or an arithmetic
+     operation with a constant operand before reaching the PHI, as in
+     x ? 32 - __builtin_clz (x) : 0.  Evaluate those statements at the
+     builtin's value at zero, which the other PHI argument must then equal.
+     Moving the statements above the condition only gives them that one new
+     input, so they can't introduce undefined behavior or a trap as long as
+     evaluating them at it doesn't overflow a type that doesn't wrap.  A
+     builtin without a fixed value at zero is only handled on its own,
+     because its value is chosen from the other PHI argument.  */
+  tree res = lhs;
+  tree zero_val = NULL_TREE;
+  if (!any_val)
+    zero_val = build_int_cst (TREE_TYPE (lhs), val);
+  else if (num_uses)
+    return false;
+  for (unsigned i = 0; i < num_uses; i++)
+    {
+      gassign *use = dyn_cast <gassign *> (uses[i]);
+      if (!use
+	  || TREE_CODE (gimple_assign_lhs (use)) != SSA_NAME
+	  || !INTEGRAL_TYPE_P (TREE_TYPE (gimple_assign_lhs (use))))
+	return false;
+      tree type = TREE_TYPE (gimple_assign_lhs (use));
+      enum tree_code code = gimple_assign_rhs_code (use);
+      if (CONVERT_EXPR_CODE_P (code))
+	{
+	  if (gimple_assign_rhs1 (use) != res)
+	    return false;
+	  zero_val = fold_convert (type, zero_val);
+	}
+      else if (code == PLUS_EXPR
+	       || code == MINUS_EXPR
+	       || code == MULT_EXPR
+	       || code == BIT_AND_EXPR
+	       || code == BIT_IOR_EXPR
+	       || code == BIT_XOR_EXPR)
+	{
+	  tree op0 = gimple_assign_rhs1 (use);
+	  tree op1 = gimple_assign_rhs2 (use);
+	  if (op0 == res && TREE_CODE (op1) == INTEGER_CST)
+	    op0 = zero_val;
+	  else if (op1 == res && TREE_CODE (op0) == INTEGER_CST)
+	    op1 = zero_val;
+	  else
+	    return false;
+	  zero_val = const_binop (code, type, op0, op1);
+	  if (!zero_val || TREE_CODE (zero_val) != INTEGER_CST)
+	    return false;
+	  if (TREE_OVERFLOW (zero_val) && !TYPE_OVERFLOW_WRAPS (type))
+	    return false;
+	}
+      else
+	return false;
+      if (TREE_OVERFLOW (zero_val))
+	zero_val = drop_tree_overflow (zero_val);
+      res = gimple_assign_lhs (use);
+    }
+
   gcond *cond = dyn_cast <gcond *> (*gsi_last_bb (cond_bb));
 
   /* Cond_bb has a check for b_4 [!=|==] 0 before calling the popcount/clz/ctz
@@ -3138,7 +3204,7 @@ cond_removal_in_builtin_zero_pattern (basic_block cond_bb,
     std::swap (arg0, arg1);
 
   /* Check PHI arguments.  */
-  if (lhs != arg0
+  if (res != arg0
       || TREE_CODE (arg1) != INTEGER_CST)
     return false;
   if (any_val)
@@ -3150,11 +3216,11 @@ cond_removal_in_builtin_zero_pattern (basic_block cond_bb,
 	return false;
       val = at_zero;
     }
-  else if (wi::to_wide (arg1) != val)
+  else if (wi::to_wide (arg1) != wi::to_wide (zero_val))
     return false;
 
-  /* And insert the popcount/clz/ctz builtin and cast stmt before the
-     cond_bb.  */
+  /* And insert the popcount/clz/ctz builtin, the cast stmt and the
+     statements using the builtin's result before the cond_bb.  */
   gsi = gsi_last_bb (cond_bb);
   if (cast)
     {
@@ -3177,9 +3243,15 @@ cond_removal_in_builtin_zero_pattern (basic_block cond_bb,
       gsi_remove (&gsi_from, true);
     }
   reset_flow_sensitive_info (lhs);
+  for (unsigned i = 0; i < num_uses; i++)
+    {
+      gsi_from = gsi_for_stmt (uses[i]);
+      gsi_move_before (&gsi_from, &gsi);
+      reset_flow_sensitive_info (gimple_assign_lhs (uses[i]));
+    }
 
   /* Now update the PHI and remove unneeded bbs.  */
-  replace_phi_edge_with_variable (cond_bb, e2, phi, lhs);
+  replace_phi_edge_with_variable (cond_bb, e2, phi, res);
   return true;
 }
 

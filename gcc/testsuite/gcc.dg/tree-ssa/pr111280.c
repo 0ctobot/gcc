@@ -3,7 +3,7 @@
 /* { dg-require-effective-target int32 } */
 /* { dg-require-effective-target clzsi } */
 /* { dg-require-effective-target ctzsi } */
-/* { dg-options "-O2 -fdump-tree-optimized" } */
+/* { dg-options "-O2 -fdump-tree-sccp -fdump-tree-optimized" } */
 
 /* The first value that the loops test is T shifted by one.  It can be
    zero, so its count needs a value at zero.  */
@@ -29,7 +29,8 @@ ctz_loop (unsigned int t)
 }
 
 /* The loop is entered only with a nonzero T, so the count needs no value
-   at zero.  */
+   at zero.  Check that in the sccp dump, since phiopt can later remove the
+   guard by giving .CLZ a value at zero.  */
 
 __attribute__((noipa)) int
 clz_guarded (unsigned int t)
@@ -60,4 +61,4 @@ main ()
 
 /* { dg-final { scan-tree-dump-times {\.CLZ \(_\d+, 32\)} 1 "optimized" } } */
 /* { dg-final { scan-tree-dump-times {\.CTZ \(_\d+, 32\)} 1 "optimized" } } */
-/* { dg-final { scan-tree-dump-times {\.CLZ \(t_\d+\(D\)\)} 1 "optimized" } } */
+/* { dg-final { scan-tree-dump-times {_\d+ = \.CLZ \(t_\d+\(D\)\);} 1 "sccp" } } */
