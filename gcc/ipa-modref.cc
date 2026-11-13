@@ -2910,15 +2910,19 @@ modref_eaf_analysis::record_escape_points (tree name, int parm_index, int flags)
 /* Determine EAF flags for function parameters
    and fill in SUMMARY/SUMMARY_LTO.  If IPA is true work in IPA mode
    where we also collect escape points.
-   PAST_FLAGS, PAST_RETSLOT_FLAGS, PAST_STATIC_CHAIN_FLAGS can be
-   used to preserve flags from previous (IPA) run for cases where
-   late optimizations changed code in a way we can no longer analyze
-   it easily.  */
+
+   The flags describe the current body only.  Don't merge in the flags
+   from the IPA summary: late optimizations may replace a parameter with
+   another value known to be equal to it, such as when final value
+   replacement turns "return f" after a "f != l" loop into "return l".
+   A use of the pointer (returning it, letting it escape or accessing
+   memory through it) then moves from one parameter to the other, and
+   combining the old flags of one with the new flags of the other would
+   claim that neither parameter is used that way.  */
 
 static void
 analyze_parms (modref_summary *summary, modref_summary_lto *summary_lto,
-	       bool ipa, vec<eaf_flags_t> &past_flags,
-	       int past_retslot_flags, int past_static_chain_flags)
+	       bool ipa)
 {
   unsigned int parm_index = 0;
   unsigned int count = 0;
@@ -3011,28 +3015,6 @@ analyze_parms (modref_summary *summary, modref_summary_lto *summary_lto,
       flags = remove_useless_eaf_flags
 		 (flags, ecf_flags,
 		  VOID_TYPE_P (TREE_TYPE (TREE_TYPE (current_function_decl))));
-      if (past_flags.length () > parm_index)
-	{
-	  int past = past_flags[parm_index];
-	  past = remove_useless_eaf_flags
-		     (past, ecf_flags,
-		      VOID_TYPE_P (TREE_TYPE
-			  (TREE_TYPE (current_function_decl))));
-	  /* Store merging can produce reads when combining together multiple
-	     bitfields.  See PR111613.  */
-	  past &= ~(EAF_NO_DIRECT_READ | EAF_NO_INDIRECT_READ);
-	  if (dump_file && (flags | past) != flags && !(flags & EAF_UNUSED))
-	    {
-	      fprintf (dump_file,
-		       "  Flags for param %i combined with IPA pass:",
-		       (int)parm_index);
-	      dump_eaf_flags (dump_file, past, false);
-	      fprintf (dump_file, " determined: ");
-	      dump_eaf_flags (dump_file, flags, true);
-	    }
-	  if (!(flags & EAF_UNUSED))
-	    flags |= past;
-	}
 
       if (flags)
 	{
@@ -3054,23 +3036,8 @@ analyze_parms (modref_summary *summary, modref_summary_lto *summary_lto,
   if (retslot)
     {
       int flags = eaf_analysis.get_ssa_name_flags (retslot);
-      int past = past_retslot_flags;
 
       flags = remove_useless_eaf_flags (flags, ecf_flags, false);
-      past = remove_useless_eaf_flags
-		 (past, ecf_flags,
-		  VOID_TYPE_P (TREE_TYPE
-		      (TREE_TYPE (current_function_decl))));
-      if (dump_file && (flags | past) != flags && !(flags & EAF_UNUSED))
-	{
-	  fprintf (dump_file,
-		   "  Retslot flags combined with IPA pass:");
-	  dump_eaf_flags (dump_file, past, false);
-	  fprintf (dump_file, " determined: ");
-	  dump_eaf_flags (dump_file, flags, true);
-	}
-      if (!(flags & EAF_UNUSED))
-	flags |= past;
       if (flags)
 	{
 	  if (summary)
@@ -3084,23 +3051,8 @@ analyze_parms (modref_summary *summary, modref_summary_lto *summary_lto,
   if (static_chain)
     {
       int flags = eaf_analysis.get_ssa_name_flags (static_chain);
-      int past = past_static_chain_flags;
 
       flags = remove_useless_eaf_flags (flags, ecf_flags, false);
-      past = remove_useless_eaf_flags
-		 (past, ecf_flags,
-		  VOID_TYPE_P (TREE_TYPE
-		      (TREE_TYPE (current_function_decl))));
-      if (dump_file && (flags | past) != flags && !(flags & EAF_UNUSED))
-	{
-	  fprintf (dump_file,
-		   "  Static chain flags combined with IPA pass:");
-	  dump_eaf_flags (dump_file, past, false);
-	  fprintf (dump_file, " determined: ");
-	  dump_eaf_flags (dump_file, flags, true);
-	}
-      if (!(flags & EAF_UNUSED))
-	flags |= past;
       if (flags)
 	{
 	  if (summary)
@@ -3234,8 +3186,7 @@ analyze_function (bool ipa)
       summary_lto->calls_interposable = false;
     }
 
-  analyze_parms (summary, summary_lto, ipa,
-		 past_flags, past_retslot_flags, past_static_chain_flags);
+  analyze_parms (summary, summary_lto, ipa);
 
   {
     modref_access_analysis analyzer (ipa, summary, summary_lto);
