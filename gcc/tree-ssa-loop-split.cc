@@ -458,6 +458,22 @@ compute_new_first_bound (gimple_seq *stmts, class tree_niter_desc *niter,
   tree end = force_gimple_operand (niter->bound, &stmts2,
 					true, NULL_TREE);
   gimple_seq_add_seq_without_update (stmts, stmts2);
+
+  /* The bound in NITER only holds when MAY_BE_ZERO is false.  Otherwise the
+     body runs once and the first exit test fails, but END can lie before
+     the first tested value of the control IV, making end-beg and the bound
+     adjustment below wrap around so the first loop runs past the original
+     exit.  Use that first tested value as the end instead, which makes the
+     first loop exit after its single iteration.  */
+  if (!integer_zerop (niter->may_be_zero))
+    {
+      tree may_be_zero = force_gimple_operand (niter->may_be_zero, &stmts2,
+					       true, NULL_TREE);
+      gimple_seq_add_seq_without_update (stmts, stmts2);
+      end = gimple_build (stmts, COND_EXPR, TREE_TYPE (end), may_be_zero,
+			  controlbase, end);
+    }
+
   if (POINTER_TYPE_P (TREE_TYPE (controlbase)))
     enddiff = gimple_build (stmts, POINTER_DIFF_EXPR,
 			    ssizetype, end, enddiff);
