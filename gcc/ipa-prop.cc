@@ -2172,6 +2172,13 @@ analyze_agg_content_value (struct ipa_func_body_info *fbi,
       || contains_bitfld_component_ref_p (lhs))
     return;
 
+  /* A store with reverse scalar storage order writes the bytes of the value
+     in the opposite order, while every user of the recorded value takes it
+     to be in native order.  A load of the same bytes in another type, such
+     as a byte copy, would then see them swapped, so don't record the value.  */
+  if (reverse_storage_order_for_component_p (lhs))
+    return;
+
   /* Skip SSA copies.  */
   while (gimple_assign_rhs_class (stmt) == GIMPLE_SINGLE_RHS)
     {
