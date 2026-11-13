@@ -1625,6 +1625,19 @@ addr_object_size (struct object_size_info *osi, const_tree ptr,
     }
   else if (!pt_var_size)
     return false;
+  else if (TREE_CODE (pt_var) == MEM_REF
+	   && (object_size_type & OST_SUBOBJECT)
+	   && (object_size_type & OST_MINIMUM))
+    {
+      /* A bare MEM_REF address, as in &MEM[&obj + 6], doesn't say whether
+	 its offset came from a member's address, as in &obj.m + 2, or from
+	 arithmetic on the whole object.  Folding produces it from the former,
+	 and so does IPA-CP when it propagates &p->m for a known P.  The size
+	 computed above is what's left in the whole object, which can be more
+	 than what's left in the member, and a minimum must never be more.
+	 The minimum for the subobject therefore isn't known.  */
+      return false;
+    }
   else
     {
       bytes = pt_var_size;
