@@ -4718,7 +4718,7 @@ clear_padding_add_padding (clear_padding_struct *buf,
 }
 
 static void clear_padding_type (clear_padding_struct *, tree,
-				HOST_WIDE_INT, bool);
+				HOST_WIDE_INT, bool, bool = false);
 
 /* Mark FLDSZ bits starting at bit BPOS of byte POS of an aggregate as
    non-padding in BUF.  *CUR_POS is the byte offset in the aggregate that
@@ -4907,7 +4907,8 @@ clear_padding_union (clear_padding_struct *buf, tree type,
 	  {
 	    HOST_WIDE_INT fldsz = tree_to_shwi (DECL_SIZE_UNIT (field));
 	    clear_padding_type (union_buf, TREE_TYPE (field), fldsz,
-				for_auto_init);
+				for_auto_init,
+				TYPE_REVERSE_STORAGE_ORDER (type));
 	    clear_padding_add_padding (union_buf, sz - fldsz);
 	  }
 	clear_padding_flush (union_buf, true);
@@ -5066,11 +5067,12 @@ type_has_padding_at_level_p (tree type)
 
 /* Emit a runtime loop:
    for (; buf.base != end; buf.base += sz)
-     __builtin_clear_padding (buf.base);  */
+     __builtin_clear_padding (buf.base);
+   REVERSE is true if the elements are in reverse storage order.  */
 
 static void
 clear_padding_emit_loop (clear_padding_struct *buf, tree type,
-			 tree end, bool for_auto_init)
+			 tree end, bool for_auto_init, bool reverse)
 {
   tree l1 = create_artificial_label (buf->loc);
   tree l2 = create_artificial_label (buf->loc);
@@ -5081,7 +5083,7 @@ clear_padding_emit_loop (clear_padding_struct *buf, tree type,
   g = gimple_build_label (l1);
   gimple_set_location (g, buf->loc);
   gsi_insert_before (buf->gsi, g, GSI_SAME_STMT);
-  clear_padding_type (buf, type, buf->sz, for_auto_init);
+  clear_padding_type (buf, type, buf->sz, for_auto_init, reverse);
   clear_padding_flush (buf, true);
   g = gimple_build_assign (buf->base, POINTER_PLUS_EXPR, buf->base,
 			   size_int (buf->sz));
@@ -5104,11 +5106,12 @@ clear_padding_emit_loop (clear_padding_struct *buf, tree type,
    instead, it's inserted by the compiler to initialize the
    paddings of automatic variable.  Therefore, we should not
    emit the error messages for flexible array members to confuse
-   the end user.  */
+   the end user.  REVERSE is true if a scalar TYPE is in reverse
+   storage order.  */
 
 static void
 clear_padding_type (clear_padding_struct *buf, tree type,
-		    HOST_WIDE_INT sz, bool for_auto_init)
+		    HOST_WIDE_INT sz, bool for_auto_init, bool reverse)
 {
   switch (TREE_CODE (type))
     {
@@ -5147,7 +5150,8 @@ clear_padding_type (clear_padding_struct *buf, tree type,
 		cur_pos = pos;
 		if (tree asbase = lang_hooks.types.classtype_as_base (field))
 		  ftype = asbase;
-		clear_padding_type (buf, ftype, fldsz, for_auto_init);
+		clear_padding_type (buf, ftype, fldsz, for_auto_init,
+				    TYPE_REVERSE_STORAGE_ORDER (type));
 		cur_pos += fldsz;
 	      }
 	  }
@@ -5187,7 +5191,8 @@ clear_padding_type (clear_padding_struct *buf, tree type,
 	  buf->align = TYPE_ALIGN (elttype);
 	  buf->off = 0;
 	  buf->size = 0;
-	  clear_padding_emit_loop (buf, elttype, end, for_auto_init);
+	  clear_padding_emit_loop (buf, elttype, end, for_auto_init,
+				   TYPE_REVERSE_STORAGE_ORDER (type));
 	  off += sz;
 	  buf->base = base;
 	  buf->sz = prev_sz;
@@ -5198,7 +5203,8 @@ clear_padding_type (clear_padding_struct *buf, tree type,
 	  break;
 	}
       for (HOST_WIDE_INT i = 0; i < nelts; i++)
-	clear_padding_type (buf, TREE_TYPE (type), fldsz, for_auto_init);
+	clear_padding_type (buf, TREE_TYPE (type), fldsz, for_auto_init,
+			    TYPE_REVERSE_STORAGE_ORDER (type));
       break;
     case UNION_TYPE:
       clear_padding_union (buf, type, sz, for_auto_init);
@@ -5243,6 +5249,26 @@ clear_padding_type (clear_padding_struct *buf, tree type,
       break;
     case BITINT_TYPE:
     do_bitint:
+      if (reverse && TYPE_MODE (type) != BLKmode)
+	{
+	  /* A _BitInt with an integer mode is accessed as a single scalar,
+	     so reverse storage order swaps all of its bytes at once.  Lay
+	     out its padding in target order and then reverse those bytes
+	     the same way.  Wider _BitInts are accessed limb by limb, which
+	     ignores reverse storage order for now (PR118070), so their
+	     padding stays in target order.  */
+	  gcc_assert ((size_t) sz <= clear_padding_unit
+		      && known_eq (GET_MODE_SIZE (TYPE_MODE (type)), sz));
+	  if ((unsigned HOST_WIDE_INT) sz + buf->size
+	      > clear_padding_buf_size)
+	    clear_padding_flush (buf, false);
+	  size_t start = buf->size;
+	  clear_padding_type (buf, type, sz, for_auto_init, false);
+	  gcc_assert (buf->size == start + sz);
+	  for (HOST_WIDE_INT i = 0; i < sz / 2; i++)
+	    std::swap (buf->buf[start + i], buf->buf[start + sz - 1 - i]);
+	  break;
+	}
       {
 	struct bitint_info info;
 	bool ok = targetm.c.bitint_type_info (TYPE_PRECISION (type), &info);
@@ -5379,11 +5405,14 @@ gimple_fold_builtin_clear_padding (gimple_stmt_iterator *gsi)
   else if (TREE_CODE (type) == ARRAY_TYPE && buf.sz < 0)
     {
       tree sz = TYPE_SIZE_UNIT (type);
-      tree elttype = type;
+      tree elttype = type, arrtype = type;
       /* Only supports C/C++ VLAs and flattens all the VLA levels.  */
       while (TREE_CODE (elttype) == ARRAY_TYPE
 	     && int_size_in_bytes (elttype) < 0)
-	elttype = TREE_TYPE (elttype);
+	{
+	  arrtype = elttype;
+	  elttype = TREE_TYPE (elttype);
+	}
       HOST_WIDE_INT eltsz = int_size_in_bytes (elttype);
       gcc_assert (eltsz >= 0);
       if (eltsz)
@@ -5399,7 +5428,8 @@ gimple_fold_builtin_clear_padding (gimple_stmt_iterator *gsi)
 	  buf.sz = eltsz;
 	  buf.align = TYPE_ALIGN (elttype);
 	  buf.alias_type = build_pointer_type (elttype);
-	  clear_padding_emit_loop (&buf, elttype, end, for_auto_init);
+	  clear_padding_emit_loop (&buf, elttype, end, for_auto_init,
+				   TYPE_REVERSE_STORAGE_ORDER (arrtype));
 	}
     }
   else
