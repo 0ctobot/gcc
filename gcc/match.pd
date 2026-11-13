@@ -12521,6 +12521,45 @@ DEFINE_INT_AND_FLOAT_ROUND_FN (RINT)
   (with { tree utype = unsigned_type_for (TREE_TYPE (@0)); }
    (plus (CTZ:type (convert:utype @0)) { build_one_cst (type); }))))
 
+/* MIN (__builtin_ffs (X) - 1, C) -> MIN (.CTZ (X, V), C) when the target
+   defines .CTZ (0) as V and both sides agree for X == 0.  For a nonzero X,
+   __builtin_ffs (X) - 1 is exactly the count of trailing zeros, and the
+   conversions around the subtraction can't change it since the type of
+   the subtraction is checked to hold the precision of X.  For X == 0 the
+   subtraction yields all ones in its type instead, so the fold is only
+   done when clamping that value to C gives the same result as clamping V
+   to C.  This removes the zero check that __builtin_ffs needs on targets
+   whose ctz instruction already has a defined result for zero.  */
+(simplify
+ (min (convert1?:s (plus:s@3 (convert2?:s (FFS:s@2 @0)) integer_all_onesp))
+      INTEGER_CST@1)
+ (if (INTEGRAL_TYPE_P (TREE_TYPE (@0))
+      && TREE_CODE (TREE_TYPE (@0)) != BITINT_TYPE
+      && INTEGRAL_TYPE_P (TREE_TYPE (@3))
+      && INTEGRAL_TYPE_P (type))
+  (with { tree utype = unsigned_type_for (TREE_TYPE (@0));
+	  tree itype = TREE_TYPE (@2);
+	  tree ptype = TREE_TYPE (@3);
+	  int val = 0;
+	  bool ok = false;
+	  if (wi::fits_to_tree_p (widest_int (TYPE_PRECISION (utype)), ptype)
+	      && direct_internal_fn_supported_p (IFN_CTZ, utype,
+						 OPTIMIZE_FOR_BOTH)
+	      && CTZ_DEFINED_VALUE_AT_ZERO (SCALAR_INT_TYPE_MODE (utype),
+					    val) == 2)
+	    {
+	      tree ffs0 = fold_convert (type, build_all_ones_cst (ptype));
+	      tree ctz0 = fold_convert (type, build_int_cst (itype, val));
+	      signop sgn = TYPE_SIGN (type);
+	      ok = (wi::min (wi::to_wide (ffs0), wi::to_wide (@1), sgn)
+		    == wi::min (wi::to_wide (ctz0), wi::to_wide (@1), sgn));
+	    }
+	}
+   (if (ok)
+    (min (convert (IFN_CTZ:itype (convert:utype @0)
+				 { build_int_cst (integer_type_node, val); }))
+	 @1)))))
+
 /* To recognize the popcnt pattern for 32-bit from Hacker's Delight
    int Gia_WordCountOnes32c ( uint32_t uword)
    {
