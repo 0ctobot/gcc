@@ -387,6 +387,9 @@ struct isra_param_flow
      constructed in the caller just to be passed by reference to functions
      (i.e. is never read).  */
   unsigned constructed_for_calls : 1;
+  /* True when the actual argument is an aggregate loaded from volatile
+     memory.  */
+  unsigned volatile_read : 1;
 };
 
 /* Structure used to convey information about calls from the intra-procedural
@@ -589,6 +592,8 @@ isra_call_summary::dump (FILE *f)
       if (ipf->constructed_for_calls)
 	fprintf (f, "      Variable constructed just to be passed to "
 		 "calls.\n");
+      if (ipf->volatile_read)
+	fprintf (f, "      Loaded from volatile memory.\n");
     }
 }
 
@@ -2226,10 +2231,30 @@ ssa_name_only_returned_p (function *fun, tree name, bitmap analyzed)
   return res;
 }
 
+/* Return true if evaluating the aggregate call argument ARG reads volatile
+   memory.  */
+
+static bool
+volatile_aggregate_arg_p (tree arg)
+{
+  if (TREE_CODE (arg) == WITH_SIZE_EXPR)
+    arg = TREE_OPERAND (arg, 0);
+  while (handled_component_p (arg))
+    {
+      if (TREE_THIS_VOLATILE (arg))
+	return true;
+      arg = TREE_OPERAND (arg, 0);
+    }
+  return ((DECL_P (arg)
+	   || TREE_CODE (arg) == MEM_REF
+	   || TREE_CODE (arg) == TARGET_MEM_REF)
+	  && TREE_THIS_VOLATILE (arg));
+}
+
 /* Inspect the uses of the return value of the call associated with CS, and if
    it is not used or if it is only used to construct the return value of the
    caller, mark it as such in call or caller summary.  Also check for
-   misaligned arguments.  */
+   misaligned arguments and arguments loaded from volatile memory.  */
 
 static void
 isra_analyze_call (cgraph_edge *cs)
@@ -2276,6 +2301,18 @@ isra_analyze_call (cgraph_edge *cs)
       if (is_gimple_reg (arg))
 	continue;
 
+      /* An aggregate argument is loaded by the call statement itself rather
+	 than by a separate statement.  Removing the parameter would drop the
+	 load from the caller entirely, and splitting it would replace the load
+	 with narrower, non-volatile loads of only the used parts.  Either way
+	 a volatile read would be lost, so record it to keep the parameter
+	 intact.  */
+      if (volatile_aggregate_arg_p (arg))
+	{
+	  csum->init_inputs (count);
+	  csum->m_arg_flow[i].volatile_read = true;
+	}
+
       tree offset;
       poly_int64 bitsize, bitpos;
       machine_mode mode;
@@ -2283,10 +2320,7 @@ isra_analyze_call (cgraph_edge *cs)
       get_inner_reference (arg, &bitsize, &bitpos, &offset, &mode,
 			   &unsignedp, &reversep, &volatilep);
       if (!multiple_p (bitpos, BITS_PER_UNIT))
-	{
-	  csum->m_bit_aligned_arg = true;
-	  break;
-	}
+	csum->m_bit_aligned_arg = true;
     }
 
   tree lhs = gimple_call_lhs (call_stmt);
@@ -2872,6 +2906,7 @@ isra_write_edge_summary (output_block *ob, cgraph_edge *e)
       bp_pack_value (&bp, ipf->pointer_pass_through, 1);
       bp_pack_value (&bp, ipf->safe_to_import_accesses, 1);
       bp_pack_value (&bp, ipf->constructed_for_calls, 1);
+      bp_pack_value (&bp, ipf->volatile_read, 1);
       streamer_write_bitpack (&bp);
       streamer_write_uhwi (ob, ipf->unit_offset);
       streamer_write_uhwi (ob, ipf->unit_size);
@@ -3000,6 +3035,7 @@ isra_read_edge_summary (struct lto_input_block *ib, cgraph_edge *cs)
       ipf->pointer_pass_through = bp_unpack_value (&bp, 1);
       ipf->safe_to_import_accesses = bp_unpack_value (&bp, 1);
       ipf->constructed_for_calls = bp_unpack_value (&bp, 1);
+      ipf->volatile_read = bp_unpack_value (&bp, 1);
       ipf->unit_offset = streamer_read_uhwi (ib);
       ipf->unit_size = streamer_read_uhwi (ib);
     }
@@ -3259,6 +3295,25 @@ check_for_caller_issues (struct cgraph_node *node, void *data)
 
       if (csum->m_bit_aligned_arg)
 	issues->bit_aligned_aggregate_argument = true;
+
+      /* The caller must keep reading all of a volatile aggregate argument,
+	 so the corresponding parameter can be neither removed nor split.  */
+      isra_func_summary *ifs = func_sums->get (issues->candidate);
+      unsigned count = MIN (csum->m_arg_flow.length (),
+			    vec_safe_length (ifs->m_parameters));
+      for (unsigned i = 0; i < count; i++)
+	if (csum->m_arg_flow[i].volatile_read)
+	  {
+	    isra_param_desc *desc = &(*ifs->m_parameters)[i];
+	    if (dump_file && (dump_flags & TDF_DETAILS)
+		&& (desc->locally_unused || desc->split_candidate))
+	      fprintf (dump_file, "Argument %u of a call from %s to %s is "
+		       "loaded from volatile memory, not removing or splitting "
+		       "the parameter.\n", i, cs->caller->dump_name (),
+		       issues->candidate->dump_name ());
+	    desc->locally_unused = false;
+	    desc->split_candidate = false;
+	  }
 
       issues->there_is_one = true;
     }
