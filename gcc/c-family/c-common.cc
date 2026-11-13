@@ -8693,12 +8693,13 @@ atomic_bitint_fetch_using_cas_loop (location_t loc,
     func_call = build_function_call_vec (loc, vNULL, fndecl, params, NULL);
   if (sync_p)
     {
-      if (return_old_p)
-	retval = create_tmp_var_raw (nonatomic_lhs_type);
-      else
-	retval = old;
+      /* __sync_val_compare_and_swap returns the value the object held
+	 before the call and stores NEWVAL only if that value is OLD, so the
+	 swap succeeded if RETVAL is equal to OLD.  Otherwise, RETVAL is the
+	 object's current value and becomes OLD for the next attempt.  */
+      retval = create_tmp_var_raw (nonatomic_lhs_type);
       func_call = build2 (MODIFY_EXPR, void_type_node, retval, func_call);
-      tree cmp = build2 (EQ_EXPR, boolean_type_node, retval, newval);
+      tree cmp = build2 (EQ_EXPR, boolean_type_node, retval, old);
       func_call = build2 (COMPOUND_EXPR, boolean_type_node, func_call, cmp);
     }
 
@@ -8710,7 +8711,7 @@ atomic_bitint_fetch_using_cas_loop (location_t loc,
   SET_EXPR_LOCATION (stmt, loc);
   add_stmt (stmt);
 
-  if (sync_p && return_old_p)
+  if (sync_p)
     {
       stmt = build2_loc (loc, MODIFY_EXPR, void_type_node, old, retval);
       add_stmt (stmt);
