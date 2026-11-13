@@ -288,6 +288,33 @@ vec_perm_indices::all_in_range_p (element_type start, element_type size) const
   return true;
 }
 
+/* Return true if a stepped pattern in VECTOR_CST CST, which has NELTS
+   elements, leaves the range of the element type before its final
+   element.  */
+
+static bool
+vector_cst_series_wraps_p (tree cst, unsigned HOST_WIDE_INT nelts)
+{
+  tree elt_type = TREE_TYPE (TREE_TYPE (cst));
+  unsigned int npatterns = VECTOR_CST_NPATTERNS (cst);
+  unsigned HOST_WIDE_INT count = nelts / npatterns;
+  for (unsigned int i = 0; i < npatterns; ++i)
+    {
+      tree v1 = VECTOR_CST_ENCODED_ELT (cst, npatterns + i);
+      tree v2 = VECTOR_CST_ENCODED_ELT (cst, 2 * npatterns + i);
+      if (TREE_CODE (v1) != INTEGER_CST || TREE_CODE (v2) != INTEGER_CST)
+	continue;
+
+      /* The series is linear and V1 and V2 are in range, so it stays in
+	 range unless its final element is out of range.  */
+      widest_int step = wi::to_widest (v2) - wi::to_widest (v1);
+      widest_int last = wi::to_widest (v2) + (count - 3) * step;
+      if (!wi::fits_to_tree_p (last, elt_type))
+	return true;
+    }
+  return false;
+}
+
 /* Try to read the contents of VECTOR_CST CST as a constant permutation
    vector.  Return true and add the elements to BUILDER on success,
    otherwise return false without modifying BUILDER.  */
@@ -299,6 +326,29 @@ tree_to_vec_perm_builder (vec_perm_builder *builder, tree cst)
   for (unsigned int i = 0; i < encoded_nelts; ++i)
     if (!tree_fits_poly_int64_p (VECTOR_CST_ENCODED_ELT (cst, i)))
       return false;
+
+  /* The elements of a stepped pattern in a VECTOR_CST wrap in the precision of
+     the element type, so an 8-bit { 1, 2, 3, ... } goes from 255 back to 0.
+     The builder extrapolates the same encoding without wrapping and would see
+     256 there instead, which selects from the wrong input when there are two
+     inputs of 256 elements each.  Expand a fixed-length selector element by
+     element whenever one of its series wraps.  Variable-length selectors are
+     always read in the unwrapped form, as vec_perm_indices::new_vector
+     explains.  */
+  unsigned HOST_WIDE_INT nelts;
+  if (VECTOR_CST_STEPPED_P (cst)
+      && TYPE_VECTOR_SUBPARTS (TREE_TYPE (cst)).is_constant (&nelts)
+      && vector_cst_series_wraps_p (cst, nelts))
+    {
+      for (unsigned HOST_WIDE_INT i = 0; i < nelts; ++i)
+	if (!tree_fits_poly_int64_p (vector_cst_elt (cst, i)))
+	  return false;
+
+      builder->new_vector (nelts, nelts, 1);
+      for (unsigned HOST_WIDE_INT i = 0; i < nelts; ++i)
+	builder->quick_push (tree_to_poly_int64 (vector_cst_elt (cst, i)));
+      return true;
+    }
 
   builder->new_vector (TYPE_VECTOR_SUBPARTS (TREE_TYPE (cst)),
 		       VECTOR_CST_NPATTERNS (cst),
