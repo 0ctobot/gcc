@@ -955,7 +955,7 @@ struct GTY((tag ("SYMTAB_FUNCTION"))) cgraph_node : public symtab_node
       redefined_extern_inline (false), tm_may_enter_irr (false),
       ipcp_clone (false), gc_candidate (false),
       called_by_ifunc_resolver (false), has_omp_variant_constructs (false),
-      m_summary_id (-1)
+      has_edgeless_barrier (false), m_summary_id (-1)
   {}
 
   /* Remove the node from cgraph and all inline clones inlined into it.
@@ -1586,6 +1586,11 @@ struct GTY((tag ("SYMTAB_FUNCTION"))) cgraph_node : public symtab_node
   unsigned called_by_ifunc_resolver : 1;
   /* True if the function contains unresolved OpenMP metadirectives.  */
   unsigned has_omp_variant_constructs : 1;
+  /* True if the function contains a threading barrier that has no call
+     edge: an asm statement that clobbers memory or an atomic internal
+     function call.  This is set up when the call graph edges and references
+     are built for the body.  */
+  unsigned has_edgeless_barrier : 1;
 
 private:
 

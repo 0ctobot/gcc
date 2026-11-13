@@ -5103,6 +5103,7 @@ expand_call_inline (basic_block bb, gimple *stmt, copy_body_data *id,
   dst_cfun->calls_eh_return |= id->src_cfun->calls_eh_return;
   id->dst_node->has_omp_variant_constructs
     |= id->src_node->has_omp_variant_constructs;
+  id->dst_node->has_edgeless_barrier |= id->src_node->has_edgeless_barrier;
 
   gcc_assert (!id->src_cfun->after_inlining);
 
