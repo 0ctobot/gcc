@@ -340,6 +340,89 @@ vect_analyze_possibly_independent_ddr (data_dependence_relation *ddr,
   return true;
 }
 
+/* A subroutine of vect_analyze_data_ref_dependence.  Handle the relation
+   DDR between a store in the inner loop of an outer loop that we vectorize
+   and the store itself.
+
+   Vectorizing the outer loop runs consecutive outer iterations side by side
+   through the inner loop, so the stores of different outer iterations happen
+   in the order of their inner loop iterations instead.  In
+
+     for (j = 0; j < 3; j++)
+       for (k = 0; k < n; k++)
+	 a[j + k] = j;
+
+   iteration (0, 1) stores to a[1] before iteration (1, 0) does, but once
+   outer iterations 0 and 1 share a vector iteration, the store for k = 1
+   comes last and leaves 0 in a[1].  Stores within one outer iteration keep
+   their order, since each vector lane runs the inner loop in scalar order.
+   The same holds when the later outer iteration also stores in a later inner
+   iteration, as for a[j - k].  Limit *MAX_VF to the smallest outer loop
+   distance among the distances whose inner loop distance is zero or runs
+   backwards, so that such outer iterations never share a vector iteration, as
+   we do for relations between different references.  */
+
+static opt_result
+vect_analyze_nested_self_dependence (data_dependence_relation *ddr,
+				     loop_vec_info loop_vinfo,
+				     unsigned int *max_vf)
+{
+  class loop *loop = LOOP_VINFO_LOOP (loop_vinfo);
+  data_reference *dr = DDR_A (ddr);
+
+  if (DDR_ARE_DEPENDENT (ddr) != chrec_dont_know
+      && DDR_NUM_DIST_VECTS (ddr) != 0)
+    {
+      unsigned int loop_depth = index_in_loop_nest (loop->num,
+						    DDR_LOOP_NEST (ddr));
+      unsigned int inner_depth = index_in_loop_nest (loop->inner->num,
+						     DDR_LOOP_NEST (ddr));
+      unsigned int min_dist = *max_vf;
+      for (lambda_vector dist_v : DDR_DIST_VECTS (ddr))
+	{
+	  int outer_dist = dist_v[loop_depth];
+	  int inner_dist = dist_v[inner_depth];
+	  /* The lanes run the inner iterations in order, so an outer iteration
+	     that reaches the location in a later inner iteration still stores
+	     last.  */
+	  if (outer_dist == 0
+	      || (inner_dist != 0 && (outer_dist > 0) == (inner_dist > 0)))
+	    continue;
+	  unsigned int dist = abs (outer_dist);
+	  if (dist < min_dist)
+	    min_dist = dist;
+	}
+
+      if (min_dist >= 2)
+	{
+	  if (min_dist < *max_vf)
+	    {
+	      *max_vf = min_dist;
+	      if (dump_enabled_p ())
+		dump_printf_loc (MSG_NOTE, vect_location,
+				 "adjusting maximal vectorization factor "
+				 "to %i\n", *max_vf);
+	    }
+	  return opt_result::success ();
+	}
+    }
+
+  /* The user asserted that safelen consecutive outer iterations can run
+     concurrently, which allows their stores to happen in any order.  */
+  if (loop->safelen >= 2)
+    {
+      if ((unsigned int) loop->safelen < *max_vf)
+	*max_vf = loop->safelen;
+      LOOP_VINFO_NO_DATA_DEPENDENCIES (loop_vinfo) = false;
+      return opt_result::success ();
+    }
+
+  return opt_result::failure_at (DR_STMT (dr),
+				 "not vectorized, possible dependence of %T "
+				 "on itself between outer loop iterations\n",
+				 DR_REF (dr));
+}
+
 
 /* Function vect_analyze_data_ref_dependence.
 
@@ -404,8 +487,10 @@ vect_analyze_data_ref_dependence (struct data_dependence_relation *ddr,
   if (DDR_ARE_DEPENDENT (ddr) == chrec_known)
     return opt_result::success ();
 
-  if (dra == drb
-      || (DR_IS_READ (dra) && DR_IS_READ (drb)))
+  if (dra == drb)
+    return vect_analyze_nested_self_dependence (ddr, loop_vinfo, max_vf);
+
+  if (DR_IS_READ (dra) && DR_IS_READ (drb))
     return opt_result::success ();
 
   /* We do not have to consider dependences between accesses that belong
@@ -903,6 +988,29 @@ vect_analyze_data_ref_dependences (loop_vec_info loop_vinfo,
 					  LOOP_VINFO_LOOP_NEST (loop_vinfo),
 					  false);
       gcc_assert (res);
+
+      /* compute_all_dependences leaves out the relation of a reference
+	 with itself, which doesn't matter when vectorizing an innermost
+	 loop since a store that advances with the loop hits a different
+	 location in each iteration.  A store in the inner loop of an outer
+	 loop that we vectorize can hit the same location in several outer
+	 iterations though, so add those relations too.  */
+      class loop *loop = LOOP_VINFO_LOOP (loop_vinfo);
+      if (loop->inner)
+	{
+	  vec<loop_p> loop_nest
+	    = LOOP_VINFO_LOOP_NEST (loop_vinfo).to_vec_legacy ();
+	  data_reference *dr;
+	  FOR_EACH_VEC_ELT (LOOP_VINFO_DATAREFS (loop_vinfo), i, dr)
+	    if (DR_IS_WRITE (dr)
+		&& nested_in_vect_loop_p (loop,
+					  loop_vinfo->lookup_dr (dr)->stmt))
+	      {
+		ddr = initialize_data_dependence_relation (dr, dr, loop_nest);
+		LOOP_VINFO_DDRS (loop_vinfo).safe_push (ddr);
+		compute_affine_dependence (ddr, loop);
+	      }
+	}
     }
 
   LOOP_VINFO_NO_DATA_DEPENDENCIES (loop_vinfo) = true;
