@@ -178,7 +178,17 @@ chrec_fold_multiply_poly_poly (tree type,
     }
 
   /* poly0 and poly1 are two polynomials in the same variable,
-     {a, +, b}_x * {c, +, d}_x  ->  {a*c, +, a*d + b*c + b*d, +, 2*b*d}_x.  */
+     {a, +, b}_x * {c, +, d}_x  ->  {a*c, +, a*d + b*c + b*d, +, 2*b*d}_x.
+
+     If X and Y are the values of poly0 and poly1 in iteration i, the product
+     grows by X*d + b*Y + b*d in the next iteration.  The formula above
+     substitutes a + b*i for X and c + d*i for Y, which is only exact when the
+     steps b and d don't vary in loop x.  When either step is itself an
+     evolution in loop x, the formula is wrong, so give up.  */
+  var = CHREC_VARIABLE (poly0);
+  if (!evolution_function_is_invariant_p (CHREC_RIGHT (poly0), var)
+      || !evolution_function_is_invariant_p (CHREC_RIGHT (poly1), var))
+    return chrec_dont_know;
 
   /* "a*c".  */
   t0 = chrec_fold_multiply (type, CHREC_LEFT (poly0), CHREC_LEFT (poly1));
@@ -197,7 +207,6 @@ chrec_fold_multiply_poly_poly (tree type,
 			    ? build_real (type, dconst2)
 			    : build_int_cst (type, 2), t2);
 
-  var = CHREC_VARIABLE (poly0);
   return build_polynomial_chrec (var, t0,
 				 build_polynomial_chrec (var, t1, t2));
 }
