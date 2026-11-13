@@ -2231,26 +2231,6 @@ ssa_name_only_returned_p (function *fun, tree name, bitmap analyzed)
   return res;
 }
 
-/* Return true if evaluating the aggregate call argument ARG reads volatile
-   memory.  */
-
-static bool
-volatile_aggregate_arg_p (tree arg)
-{
-  if (TREE_CODE (arg) == WITH_SIZE_EXPR)
-    arg = TREE_OPERAND (arg, 0);
-  while (handled_component_p (arg))
-    {
-      if (TREE_THIS_VOLATILE (arg))
-	return true;
-      arg = TREE_OPERAND (arg, 0);
-    }
-  return ((DECL_P (arg)
-	   || TREE_CODE (arg) == MEM_REF
-	   || TREE_CODE (arg) == TARGET_MEM_REF)
-	  && TREE_THIS_VOLATILE (arg));
-}
-
 /* Inspect the uses of the return value of the call associated with CS, and if
    it is not used or if it is only used to construct the return value of the
    caller, mark it as such in call or caller summary.  Also check for
@@ -2307,7 +2287,7 @@ isra_analyze_call (cgraph_edge *cs)
 	 with narrower, non-volatile loads of only the used parts.  Either way
 	 a volatile read would be lost, so record it to keep the parameter
 	 intact.  */
-      if (volatile_aggregate_arg_p (arg))
+      if (ipa_volatile_aggregate_arg_p (arg))
 	{
 	  csum->init_inputs (count);
 	  csum->m_arg_flow[i].volatile_read = true;

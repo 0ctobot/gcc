@@ -301,6 +301,10 @@ public:
 
   /* There is a virtual call based on this parameter.  */
   bool virt_call = false;
+  /* Some caller passes an argument whose evaluation reads volatile memory,
+     so the parameter must survive in clones that don't know its value even
+     when the body doesn't use it.  */
+  bool volatile_read_arg = false;
 };
 
 bool values_equal_for_ipcp_p (tree x, tree y);
