@@ -32,6 +32,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "optabs-tree.h"
 #include "insn-config.h"
 #include "gimple-pretty-print.h"
+#include "alias.h"
 #include "fold-const.h"
 #include "stor-layout.h"
 #include "cfganal.h"
@@ -4864,6 +4865,19 @@ hoist_adjacent_loads (basic_block bb0, basic_block bb1,
 	 assume that the existence of one array element implies the
 	 existence of a different one.  */
       if (!operand_equal_p (TREE_OPERAND (ref1, 0), TREE_OPERAND (ref2, 0), 0))
+	continue;
+
+      /* With strict aliasing, reading one field of a record through an
+	 access with a nonzero alias set means the whole record exists, so
+	 the other field can be read too.  Without strict aliasing, or for
+	 an access with alias set zero such as one through a may_alias type,
+	 the access only says that the field it reads exists.  The other
+	 field may then lie past the end of the accessible memory.  Only
+	 hoist such loads when the whole record can be read without
+	 trapping.  */
+      tree rec = TREE_OPERAND (ref1, 0);
+      if ((!flag_strict_aliasing || get_alias_set (rec) == 0)
+	  && tree_could_trap_p (rec))
 	continue;
 
       field1 = TREE_OPERAND (ref1, 1);
