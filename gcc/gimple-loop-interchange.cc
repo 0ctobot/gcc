@@ -1868,12 +1868,17 @@ tree_loop_interchange_compute_ddrs (vec<loop_p> loop_nest,
   for (unsigned i = 0; datarefs.iterate (i, &a); ++i)
     {
       bool a_outer_p = gimple_bb (DR_STMT (a))->loop_father != innermost;
-      for (unsigned j = i + 1; datarefs.iterate (j, &b); ++j)
+      /* Start at A itself since a write can store to the same memory in
+	 different iterations of the nest, e.g., a[j + 2*k] for j = 2, k = 0
+	 and j = 0, k = 1.  Interchange must preserve the order of those
+	 stores just like the order of stores from different references.  */
+      for (unsigned j = i; datarefs.iterate (j, &b); ++j)
 	if (DR_IS_WRITE (a) || DR_IS_WRITE (b))
 	  {
 	    bool b_outer_p = gimple_bb (DR_STMT (b))->loop_father != innermost;
 	    /* Don't support multiple write references in outer loop.  */
-	    if (a_outer_p && b_outer_p && DR_IS_WRITE (a) && DR_IS_WRITE (b))
+	    if (a != b && a_outer_p && b_outer_p
+		&& DR_IS_WRITE (a) && DR_IS_WRITE (b))
 	      return false;
 
 	    ddr_p ddr = initialize_data_dependence_relation (a, b, loop_nest);
