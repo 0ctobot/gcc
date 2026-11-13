@@ -2935,6 +2935,53 @@ modref_may_conflict (const gcall *stmt,
   return false;
 }
 
+/* Return true if FNDECL is a builtin that acts as a threading barrier.  A
+   call to one orders memory accesses against those of other threads, so it
+   has to be treated as reading and writing all global memory.  That includes
+   statics whose address never escapes, since other threads can still access
+   them by running code in this unit.  */
+
+bool
+threading_barrier_builtin_p (const_tree fndecl)
+{
+  if (!fndecl_built_in_p (fndecl, BUILT_IN_NORMAL))
+    return false;
+
+  switch (DECL_FUNCTION_CODE (fndecl))
+    {
+    /* __sync_* builtins and some OpenMP builtins act as threading
+       barriers.  */
+#undef DEF_SYNC_BUILTIN
+#define DEF_SYNC_BUILTIN(ENUM, NAME, TYPE, ATTRS) case ENUM:
+#include "sync-builtins.def"
+#undef DEF_SYNC_BUILTIN
+    case BUILT_IN_GOMP_ATOMIC_START:
+    case BUILT_IN_GOMP_ATOMIC_END:
+    case BUILT_IN_GOMP_REDUCTION_START:
+    case BUILT_IN_GOMP_REDUCTION_END:
+    case BUILT_IN_GOMP_BARRIER:
+    case BUILT_IN_GOMP_BARRIER_CANCEL:
+    case BUILT_IN_GOMP_TASKWAIT:
+    case BUILT_IN_GOMP_TASKGROUP_END:
+    case BUILT_IN_GOMP_CRITICAL_START:
+    case BUILT_IN_GOMP_CRITICAL_END:
+    case BUILT_IN_GOMP_CRITICAL_NAME_START:
+    case BUILT_IN_GOMP_CRITICAL_NAME_END:
+    case BUILT_IN_GOMP_LOOP_END:
+    case BUILT_IN_GOMP_LOOP_END_CANCEL:
+    case BUILT_IN_GOMP_ORDERED_START:
+    case BUILT_IN_GOMP_ORDERED_END:
+    case BUILT_IN_GOMP_SECTIONS_END:
+    case BUILT_IN_GOMP_SECTIONS_END_CANCEL:
+    case BUILT_IN_GOMP_SINGLE_COPY_START:
+    case BUILT_IN_GOMP_SINGLE_COPY_END:
+      return true;
+
+    default:
+      return false;
+    }
+}
+
 /* Check if REF conflicts with call using "fn spec" attribute.
    If CLOBBER is true we are checking for writes, otherwise check loads.
 
@@ -3004,40 +3051,9 @@ check_fnspec (gcall *call, ao_ref *ref, bool clobber)
 
  /* FIXME: we should handle barriers more consistently, but for now leave the
     check here.  */
-  if (gimple_call_builtin_p (call, BUILT_IN_NORMAL))
-    switch (DECL_FUNCTION_CODE (gimple_call_fndecl (call)))
-      {
-      /* __sync_* builtins and some OpenMP builtins act as threading
-	 barriers.  */
-#undef DEF_SYNC_BUILTIN
-#define DEF_SYNC_BUILTIN(ENUM, NAME, TYPE, ATTRS) case ENUM:
-#include "sync-builtins.def"
-#undef DEF_SYNC_BUILTIN
-      case BUILT_IN_GOMP_ATOMIC_START:
-      case BUILT_IN_GOMP_ATOMIC_END:
-      case BUILT_IN_GOMP_REDUCTION_START:
-      case BUILT_IN_GOMP_REDUCTION_END:
-      case BUILT_IN_GOMP_BARRIER:
-      case BUILT_IN_GOMP_BARRIER_CANCEL:
-      case BUILT_IN_GOMP_TASKWAIT:
-      case BUILT_IN_GOMP_TASKGROUP_END:
-      case BUILT_IN_GOMP_CRITICAL_START:
-      case BUILT_IN_GOMP_CRITICAL_END:
-      case BUILT_IN_GOMP_CRITICAL_NAME_START:
-      case BUILT_IN_GOMP_CRITICAL_NAME_END:
-      case BUILT_IN_GOMP_LOOP_END:
-      case BUILT_IN_GOMP_LOOP_END_CANCEL:
-      case BUILT_IN_GOMP_ORDERED_START:
-      case BUILT_IN_GOMP_ORDERED_END:
-      case BUILT_IN_GOMP_SECTIONS_END:
-      case BUILT_IN_GOMP_SECTIONS_END_CANCEL:
-      case BUILT_IN_GOMP_SINGLE_COPY_START:
-      case BUILT_IN_GOMP_SINGLE_COPY_END:
-	return 1;
-
-      default:
-	return -1;
-      }
+  if (gimple_call_builtin_p (call, BUILT_IN_NORMAL)
+      && threading_barrier_builtin_p (gimple_call_fndecl (call)))
+    return 1;
   return -1;
 }
 
