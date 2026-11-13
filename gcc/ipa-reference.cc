@@ -101,8 +101,8 @@ static vec<tree> *reference_vars_to_consider;
 varpool_node_hook_list *varpool_node_hooks;
 
 /* Set of all interesting module statics.  A bit is set for every module
-   static we are considering.  This is added to the local info when asm
-   code is found that clobbers all memory.  */
+   static we are considering.  This becomes the global info of a function
+   that reads or writes all of them.  */
 static bitmap all_module_statics;
 /* Zero bitmap.  */
 static bitmap no_module_statics;
@@ -704,6 +704,18 @@ get_read_write_all_from_node (struct cgraph_node *node,
   if (node->get_availability () <= AVAIL_INTERPOSABLE
       || (node->analyzed && !opt_for_fn (node->decl, flag_ipa_reference)))
     read_write_all_from_decl (node, read_all, write_all);
+
+  /* A memory clobbering asm or an atomic internal call in the body is a
+     threading barrier just like a call to a barrier builtin, but it has no
+     call edge to look at below.  */
+  if (node->has_edgeless_barrier)
+    {
+      read_all = true;
+      write_all = true;
+      if (dump_file && (dump_flags & TDF_DETAILS))
+	fprintf (dump_file, "   barrier in body -> read all, write all\n");
+      return;
+    }
 
   for (e = node->callees;
        e && !(read_all && write_all);

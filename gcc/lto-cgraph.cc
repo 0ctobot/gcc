@@ -568,6 +568,7 @@ lto_output_node (struct lto_simple_output_block *ob, struct cgraph_node *node,
   bp_pack_value (&bp, node->thunk, 1);
   bp_pack_value (&bp, node->parallelized_function, 1);
   bp_pack_value (&bp, node->has_omp_variant_constructs, 1);
+  bp_pack_value (&bp, node->has_edgeless_barrier, 1);
 
   /* Stream thunk info always because we use it in
      ipa_polymorphic_call_context::ipa_polymorphic_call_context
@@ -1307,6 +1308,7 @@ input_overwrite_node (struct lto_file_decl_data *file_data,
   node->thunk = bp_unpack_value (bp, 1);
   node->parallelized_function = bp_unpack_value (bp, 1);
   node->has_omp_variant_constructs = bp_unpack_value (bp, 1);
+  node->has_edgeless_barrier = bp_unpack_value (bp, 1);
   *has_thunk_info = bp_unpack_value (bp, 1);
   node->resolution = bp_unpack_enum (bp, ld_plugin_symbol_resolution,
 				     LDPR_NUM_KNOWN);

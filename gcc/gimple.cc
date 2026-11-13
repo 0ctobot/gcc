@@ -3041,7 +3041,10 @@ gimple_asm_clobbers_memory_p (const gasm *stmt)
   for (i = 0; i < gimple_asm_nclobbers (stmt); i++)
     {
       tree op = gimple_asm_clobber_op (stmt, i);
-      if (strcmp (TREE_STRING_POINTER (TREE_VALUE (op)), "memory") == 0)
+      /* The clobber can be an error marker, since the call graph is still
+	 built for a function whose asm had errors.  */
+      if (TREE_CODE (TREE_VALUE (op)) == STRING_CST
+	  && strcmp (TREE_STRING_POINTER (TREE_VALUE (op)), "memory") == 0)
 	return true;
     }
 

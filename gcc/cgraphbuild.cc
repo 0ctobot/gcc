@@ -284,6 +284,39 @@ mark_store (gimple *stmt, tree t, tree, void *data)
   return false;
 }
 
+/* Return true if STMT acts as a threading barrier but doesn't get a call
+   edge.  An asm statement that clobbers memory and an atomic internal
+   function call both order memory accesses against other threads, yet
+   neither one has a callee that IPA passes could look at.  */
+
+static bool
+edgeless_barrier_p (gimple *stmt)
+{
+  if (gasm *asm_stmt = dyn_cast <gasm *> (stmt))
+    return gimple_asm_clobbers_memory_p (asm_stmt);
+
+  gcall *call = dyn_cast <gcall *> (stmt);
+  if (!call || !gimple_call_internal_p (call))
+    return false;
+
+  switch (gimple_call_internal_fn (call))
+    {
+    case IFN_ATOMIC_BIT_TEST_AND_SET:
+    case IFN_ATOMIC_BIT_TEST_AND_COMPLEMENT:
+    case IFN_ATOMIC_BIT_TEST_AND_RESET:
+    case IFN_ATOMIC_COMPARE_EXCHANGE:
+    case IFN_ATOMIC_ADD_FETCH_CMP_0:
+    case IFN_ATOMIC_SUB_FETCH_CMP_0:
+    case IFN_ATOMIC_AND_FETCH_CMP_0:
+    case IFN_ATOMIC_OR_FETCH_CMP_0:
+    case IFN_ATOMIC_XOR_FETCH_CMP_0:
+      return true;
+
+    default:
+      return false;
+    }
+}
+
 /* Record all references from cgraph_node that are taken in statement STMT.  */
 
 void
@@ -291,6 +324,8 @@ cgraph_node::record_stmt_references (gimple *stmt)
 {
   walk_stmt_load_store_addr_ops (stmt, this, mark_load, mark_store,
 				 mark_address);
+  if (edgeless_barrier_p (stmt))
+    has_edgeless_barrier = true;
 }
 
 /* Create cgraph edges for function calls.
@@ -428,6 +463,7 @@ cgraph_edge::rebuild_edges (void)
 
   node->remove_callees ();
   node->remove_all_references ();
+  node->has_edgeless_barrier = false;
 
   node->count = ENTRY_BLOCK_PTR_FOR_FN (cfun)->count;
 
@@ -479,6 +515,7 @@ cgraph_edge::rebuild_references (void)
       ref->remove_reference ();
     else
       i++;
+  node->has_edgeless_barrier = false;
 
   FOR_EACH_BB_FN (bb, cfun)
     {
@@ -569,6 +606,7 @@ pass_remove_cgraph_callee_edges::execute (function *)
   cgraph_node *node = cgraph_node::get (current_function_decl);
   node->remove_callees ();
   node->remove_all_references ();
+  node->has_edgeless_barrier = false;
   return 0;
 }
 
