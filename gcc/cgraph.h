@@ -2995,6 +2995,9 @@ void record_references_in_initializer (tree, bool);
 void cgraph_build_static_cdtor (char which, tree body, int priority);
 bool ipa_discover_variable_flags (void);
 
+/* In ipa-visibility.cc  */
+void split_weak_function_definitions (void);
+
 /* In varpool.cc  */
 tree ctor_for_folding (tree);
 

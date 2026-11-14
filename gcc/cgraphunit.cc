@@ -2287,6 +2287,10 @@ ipa_passes (void)
       /* Generate coverage variables and constructors.  */
       coverage_finish ();
 
+      /* Split weak functions that have aliases now that profiling and coverage
+	 are done with them under their own names.  */
+      split_weak_function_definitions ();
+
       /* Process new functions added.  */
       set_cfun (NULL);
       current_function_decl = NULL;

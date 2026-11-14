@@ -86,6 +86,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "ipa-utils.h"
 #include "stringpool.h"
 #include "attribs.h"
+#include "output.h"
 
 /* Return true when NODE cannot be local. Worker for cgraph_local_node_p.  */
 
@@ -925,6 +926,273 @@ function_and_variable_visibility (bool whole_program)
   return 0;
 }
 
+/* An alias defined in the same file as its target, as in
+
+     int w __attribute__ ((weak)) = 1;
+     extern int a __attribute__ ((alias ("w")));
+
+   is bound by the assembler to the location of w's definition in this object,
+   not to the symbol w.  When a strong definition elsewhere overrides w, a
+   still names the storage defined here.  The symbol table records a as an
+   alias of the symbol w though, and that's what gets streamed for LTO.  Once
+   the linker plugin reports that another definition of w prevails, a follows
+   that definition, or it ends up undefined when the overriding definition is
+   in an object that isn't LTO.
+
+   Keep the native behavior by moving the definition of such a weak symbol W
+   into a new local symbol before streaming, and by turning W into an alias of
+   the local symbol.  The aliases of W then become aliases of the local symbol
+   as well, which is what the assembler binds them to.  Variables are split at
+   the end of the early visibility pass, before points-to analysis identifies
+   their storage through their alias targets.  Functions are split after the
+   early optimizations and the profiling instrumentation, so these still see
+   each function under its own name.  */
+
+/* Return true if NODE is a symbol version or is offloadable, which are
+   relationships that splitting a weak definition doesn't preserve.  Helper for
+   call_for_symbol_and_aliases.  */
+
+static bool
+weak_split_barrier_p (symtab_node *node, void *)
+{
+  return node->symver || node->offloadable;
+}
+
+/* Return true if the alias family that NODE belongs to has a node that
+   weak_split_barrier_p rejects.  */
+
+static bool
+weak_split_family_barrier_p (symtab_node *node)
+{
+  return node->ultimate_alias_target ()->call_for_symbol_and_aliases
+    (weak_split_barrier_p, NULL, true);
+}
+
+/* Return true if NODE is a public weak definition with an alias that the
+   assembler binds to NODE's location.  */
+
+static bool
+weak_split_candidate_p (symtab_node *node)
+{
+  if (!node->definition
+      || node->alias
+      || !DECL_WEAK (node->decl)
+      || !TREE_PUBLIC (node->decl)
+      || DECL_EXTERNAL (node->decl)
+      || DECL_COMDAT (node->decl)
+      || node->get_comdat_group ())
+    return false;
+
+  ipa_ref *ref;
+  for (unsigned i = 0; node->iterate_direct_aliases (i, ref); i++)
+    if (!ref->referring->transparent_alias && !ref->referring->symver)
+      return !weak_split_family_barrier_p (node);
+  return false;
+}
+
+/* Return true if NODE is a weak alias whose own aliases point at NODE instead
+   of NODE's target.  */
+
+static bool
+weak_middle_alias_p (symtab_node *node)
+{
+  return (node->alias
+	  && node->analyzed
+	  && DECL_WEAK (node->decl)
+	  && !node->transparent_alias
+	  && !node->symver
+	  && !node->ifunc_resolver
+	  && !node->cpp_implicit_alias
+	  && !node->get_comdat_group ()
+	  && node->has_aliases_p ()
+	  && !weak_split_family_barrier_p (node));
+}
+
+/* The assembler binds an alias of a weak alias U to the location that U is
+   bound to, like for an alias of any other alias.  resolve_alias accounts for
+   this by moving the aliases that U already has onto U's target, but when U is
+   resolved before its own aliases, they're left pointing at U and would follow
+   an overriding definition of U under LTO.  Resolve each such U again to move
+   its aliases onto its target, with the same treatment of the noipa attribute
+   as resolve_alias gives them otherwise.  */
+
+static void
+flatten_weak_middle_aliases (void)
+{
+  auto_vec<symtab_node *> middles;
+  symtab_node *node;
+  FOR_EACH_SYMBOL (node)
+    if (weak_middle_alias_p (node))
+      middles.safe_push (node);
+
+  for (symtab_node *u : middles)
+    {
+      symtab_node *target = u->get_alias_target ();
+      u->analyzed = false;
+      u->remove_all_references ();
+      u->resolve_alias (target);
+    }
+}
+
+/* Clear DECL_RTL of NODE.  Helper for call_for_symbol_and_aliases.  */
+
+static bool
+clear_decl_rtl (symtab_node *node, void *)
+{
+  SET_DECL_RTL (node->decl, NULL);
+  return false;
+}
+
+/* Set the local flag of NODE to whether DATA is non-NULL.  Helper for
+   call_for_symbol_thunks_and_aliases.  */
+
+static bool
+set_local (cgraph_node *node, void *data)
+{
+  node->local = data != NULL;
+  return false;
+}
+
+/* Move the storage of the weak variable W into a new local variable and make W
+   an alias of it.  */
+
+static void
+split_weak_variable (varpool_node *w)
+{
+  tree decl = copy_node (w->decl);
+  SET_DECL_ASSEMBLER_NAME (decl,
+			   clone_function_name_numbered (w->decl, "weakdef"));
+  SET_DECL_RTL (decl, NULL);
+  TREE_PUBLIC (decl) = 0;
+  DECL_WEAK (decl) = 0;
+  DECL_VISIBILITY (decl) = VISIBILITY_DEFAULT;
+  DECL_VISIBILITY_SPECIFIED (decl) = 0;
+  /* W keeps its DIE, which gets a location of its own as an alias.  */
+  DECL_ARTIFICIAL (decl) = 1;
+  DECL_IGNORED_P (decl) = 1;
+  varpool_node::add (decl);
+
+  varpool_node *l = varpool_node::get (decl);
+  if (!l->analyzed)
+    l->analyze ();
+  /* Emit the storage where W's would have been.  */
+  std::swap (l->order, w->order);
+  l->no_reorder = w->no_reorder;
+  l->force_output = w->force_output;
+  l->must_remain_in_tu_body = w->must_remain_in_tu_body;
+  if (!w->implicit_section)
+    l->set_section (*w);
+
+  w->analyzed = false;
+  DECL_INITIAL (w->decl) = NULL;
+  w->symtab_node::call_for_symbol_and_aliases (clear_decl_rtl, NULL, true);
+  w->remove_all_references ();
+  varpool_node::create_alias (w->decl, decl);
+  w->resolve_alias (l);
+
+  if (dump_file)
+    fprintf (dump_file, "Split weak definition %s into %s\n",
+	     w->dump_name (), l->dump_name ());
+}
+
+/* Make the aliases of weak aliases point at the right targets, then split the
+   weak variables with aliases.  */
+
+static void
+split_weak_variable_definitions (void)
+{
+  if (!flag_generate_lto || in_lto_p || !TARGET_SUPPORTS_ALIASES)
+    return;
+
+  flatten_weak_middle_aliases ();
+
+  auto_vec<varpool_node *> vars;
+  varpool_node *vnode;
+  FOR_EACH_DEFINED_VARIABLE (vnode)
+    if (vnode->analyzed
+	&& !DECL_COMMON (vnode->decl)
+	&& !DECL_THREAD_LOCAL_P (vnode->decl)
+	&& !DECL_HARD_REGISTER (vnode->decl)
+	&& !DECL_HAS_VALUE_EXPR_P (vnode->decl)
+	&& weak_split_candidate_p (vnode))
+      vars.safe_push (vnode);
+
+  for (varpool_node *w : vars)
+    split_weak_variable (w);
+}
+
+/* Move the body of the weak function W into a new local function and make W an
+   alias of it.  */
+
+static void
+split_weak_function (cgraph_node *w)
+{
+  cgraph_node *l
+    = w->create_version_clone_with_body (vNULL, NULL, NULL, NULL, NULL,
+					 "weakdef");
+  /* A function that cannot be copied, such as one with the noclone attribute
+     (which noipa implies), is left as it is.  */
+  if (!l)
+    return;
+
+  std::swap (l->order, w->order);
+  l->force_output = w->force_output;
+  l->must_remain_in_tu_body = w->must_remain_in_tu_body;
+  l->profile_id = w->profile_id;
+  l->tp_first_run = w->tp_first_run;
+  l->frequency = w->frequency;
+  l->only_called_at_startup = w->only_called_at_startup;
+  l->only_called_at_exit = w->only_called_at_exit;
+  l->tm_may_enter_irr = w->tm_may_enter_irr;
+  DECL_NAME (l->decl) = DECL_NAME (w->decl);
+
+  symtab->call_cgraph_removal_hooks (w);
+  w->release_body (true);
+  w->reset ();
+  w->symtab_node::call_for_symbol_and_aliases (clear_decl_rtl, NULL, true);
+  cgraph_node::create_alias (w->decl, l->decl);
+  w->resolve_alias (l);
+  l->call_for_symbol_thunks_and_aliases
+    (set_local, (void *)(size_t) l->local_p (), true);
+
+  if (symtab->dump_file)
+    fprintf (symtab->dump_file, "Split weak definition %s into %s\n",
+	     w->dump_name (), l->dump_name ());
+}
+
+/* Split the weak functions with aliases.  This is called after the early IPA
+   passes, by which point split_weak_variable_definitions has already made the
+   aliases of weak function aliases point at the right targets.  */
+
+void
+split_weak_function_definitions (void)
+{
+  if (!flag_generate_lto || in_lto_p || !TARGET_SUPPORTS_ALIASES)
+    return;
+
+  auto_vec<cgraph_node *> fns;
+  cgraph_node *node;
+  FOR_EACH_DEFINED_FUNCTION (node)
+    if (node->has_gimple_body_p ()
+	&& !node->inlined_to
+	&& !node->clone_of
+	&& !node->tm_clone
+	&& !get_tm_clone_pair (node->decl)
+	&& !node->dispatcher_function
+	&& !node->is_target_clone
+	&& !DECL_FUNCTION_VERSIONED (node->decl)
+	/* The registration of a constructor or destructor stays with W, which
+	   would leave nothing to run L's body.  */
+	&& !DECL_STATIC_CONSTRUCTOR (node->decl)
+	&& !DECL_STATIC_DESTRUCTOR (node->decl)
+	&& !MAIN_NAME_P (DECL_NAME (node->decl))
+	&& weak_split_candidate_p (node))
+      fns.safe_push (node);
+
+  for (cgraph_node *w : fns)
+    split_weak_function (w);
+}
+
 /* Local function pass handling visibilities.  This happens before LTO streaming
    so in particular -fwhole-program should be ignored at this level.  */
 
@@ -1020,7 +1288,10 @@ public:
   /* opt_pass methods: */
   unsigned int execute (function *) final override
     {
-      return function_and_variable_visibility (flag_whole_program && !flag_lto);
+      unsigned int todo
+	= function_and_variable_visibility (flag_whole_program && !flag_lto);
+      split_weak_variable_definitions ();
+      return todo;
     }
 
 }; // class pass_ipa_function_and_variable_visibility
