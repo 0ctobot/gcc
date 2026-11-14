@@ -310,7 +310,7 @@ get_constraint_for_ssa_var (tree t, vec<ce_s> *results, bool address_p)
 		       || DECL_PT_UID (node->decl) == DECL_UID (node->decl))
 		      && (! DECL_PT_UID_SET_P (t)
 			  || DECL_PT_UID (t) == DECL_UID (node->decl)));
-	  DECL_PT_UID (t) = DECL_UID (node->decl);
+	  SET_DECL_PT_UID (t, DECL_UID (node->decl));
 	  t = node->decl;
 	}
 
