@@ -53,4 +53,6 @@ main (void)
   return 0;
 }
 
-/* { dg-final { scan-ipa-dump-not "Increasing alignment of decl" "increase_alignment" } } */
+/* With LTO, a aliases the local definition that owns w's original storage.
+   Increasing the alignment of a can then align the storage as well.  */
+/* { dg-final { scan-ipa-dump-not "Increasing alignment of decl" "increase_alignment" { target { no-opts "-flto" "-flto=*" } } } } */
