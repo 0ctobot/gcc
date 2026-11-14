@@ -2577,8 +2577,11 @@ symtab_node::can_increase_alignment_p (void)
 
   /* We cannot change alignment of symbols that may bind to symbols
      in other translation unit that may contain a definition with lower
-     alignment.  */
-  if (!decl_binds_to_current_def_p (decl))
+     alignment.  The same goes for the alias target, which owns the
+     storage: if only the alias got the new alignment, code using the
+     alias would assume an alignment the storage doesn't have.  */
+  if (!decl_binds_to_current_def_p (decl)
+      || !decl_binds_to_current_def_p (target->decl))
     return false;
 
   /* When compiling partition, be sure the symbol is not output by other
