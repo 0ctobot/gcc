@@ -3266,6 +3266,43 @@ vect_get_strided_load_store_ops (stmt_vec_info stmt_info, slp_tree node,
   *vec_offset = cse_and_gimplify_to_preheader (loop_vinfo, offset);
 }
 
+/* Return true if the transform of STMT_INFO, a gather, scatter or strided
+   access that SLP_NODE vectorizes as VMAT_GATHER_SCATTER_IFN in vector
+   type VECTYPE, needs an instruction to convert its offset vector to
+   LS.supported_offset_vectype.  The costing code runs before the offset
+   vector exists, so take its type from where the transform gets it: the
+   offset operand of a gather or scatter, or the series of steps built by
+   vect_get_strided_load_store_ops for a strided access.  */
+
+static bool
+vect_gather_scatter_offset_conversion_p (stmt_vec_info stmt_info,
+					 slp_tree slp_node, tree vectype,
+					 const vect_load_store_data &ls)
+{
+  if (!ls.supported_offset_vectype)
+    return false;
+
+  tree offset_vectype;
+  if (STMT_VINFO_GATHER_SCATTER_P (stmt_info))
+    offset_vectype = SLP_TREE_VECTYPE (SLP_TREE_CHILDREN (slp_node)[0]);
+  else
+    {
+      /* vect_get_strided_load_store_ops passes the scalar step to a
+	 strided load or store when the target has one, which leaves no
+	 offset vector to convert.  */
+      internal_fn ifn = (DR_IS_READ (STMT_VINFO_DATA_REF (stmt_info))
+			 ? IFN_MASK_LEN_STRIDED_LOAD
+			 : IFN_MASK_LEN_STRIDED_STORE);
+      if (direct_internal_fn_supported_p (ifn, vectype, OPTIMIZE_FOR_SPEED))
+	return false;
+      offset_vectype = ls.strided_offset_vectype;
+    }
+
+  /* vect_gather_scatter_fn_p can ask for an offset type that only differs
+     in sign, which doesn't need an instruction.  */
+  return !tree_nop_conversion_p (ls.supported_offset_vectype, offset_vectype);
+}
+
 /* Return the amount that should be added to a vector pointer, represented by
    DR_INFO, to increment to the next vectorized iteration.  */
 
@@ -9113,9 +9150,9 @@ vectorizable_store (vec_info *vinfo,
 	    {
 	      if (costing_p)
 		{
-		  if (ls.supported_offset_vectype
-		      && !tree_nop_conversion_p (ls.supported_offset_vectype,
-						 vec_offset))
+		  if (vect_gather_scatter_offset_conversion_p (stmt_info,
+							       slp_node,
+							       vectype, ls))
 		    inside_cost
 		      += record_stmt_cost (cost_vec, 1, vector_stmt,
 					   slp_node, 0, vect_body);
@@ -11120,9 +11157,9 @@ vectorizable_load (vec_info *vinfo,
 	    {
 	      if (costing_p)
 		{
-		  if (ls.supported_offset_vectype
-		      && !tree_nop_conversion_p (ls.supported_offset_vectype,
-						 vec_offset))
+		  if (vect_gather_scatter_offset_conversion_p (stmt_info,
+							       slp_node,
+							       vectype, ls))
 		    inside_cost
 		      += record_stmt_cost (cost_vec, 1, vector_stmt,
 					   slp_node, 0, vect_body);
