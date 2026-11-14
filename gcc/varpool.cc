@@ -583,8 +583,14 @@ varpool_node::assemble_aliases (void)
 	do_assemble_symver (alias->decl,
 			    DECL_ASSEMBLER_NAME (decl));
       else if (!alias->transparent_alias)
-	do_assemble_alias (alias->decl,
-			   DECL_ASSEMBLER_NAME (decl));
+	{
+	  do_assemble_alias (alias->decl,
+			     DECL_ASSEMBLER_NAME (decl));
+	  /* assemble_decl skips aliases, so this is the only place where an
+	     emitted alias can get the location of its own symbol.  */
+	  if (!DECL_IGNORED_P (alias->decl))
+	    debug_hooks->late_global_decl (alias->decl);
+	}
       alias->assemble_aliases ();
     }
 }
