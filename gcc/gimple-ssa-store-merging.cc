@@ -4279,9 +4279,22 @@ imm_store_chain_info::output_merged_store (merged_store_group *group)
 	  }
 	else
 	  break;
+      /* With bzero_first, split_group drops the zero bytes of every later
+	 store, since the clear already wrote them, even when the rest of the
+	 stored value isn't zero.  As with DSE removing a redundant store of
+	 zero, the clear then has to stand in for those bytes in type-based
+	 alias analysis.  Otherwise, a later load that conflicts with the store
+	 but not with the clear gets disambiguated from the clear and can read
+	 what memory held before it.  */
+      store_immediate_info *clear = bzero_first ? store : NULL;
       FOR_EACH_VEC_ELT_FROM (group->stores, i, store, i)
 	if (gimple_clobber_p (store->stmt))
 	  num_clobber_stmts++;
+	else if (clear
+		 && store->order > clear->order
+		 && !refs_same_for_tbaa_p (gimple_assign_lhs (clear->stmt),
+					   gimple_assign_lhs (store->stmt)))
+	  bzero_first = false;
       if (num_clobber_stmts == orig_num_stmts)
 	return false;
       orig_num_stmts -= num_clobber_stmts;
