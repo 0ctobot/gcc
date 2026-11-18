@@ -2539,6 +2539,10 @@ tree
 ipa_get_callee_param_type (struct cgraph_edge *e, int i)
 {
   int n;
+  /* An indirect edge has no call statement when the body of its caller isn't
+     loaded, e.g. at WPA, which leaves nothing to take the type from.  */
+  if (!e->callee && !e->call_stmt)
+    return NULL;
   tree type = (e->callee
 	       ? TREE_TYPE (e->callee->decl)
 	       : gimple_call_fntype (e->call_stmt));
