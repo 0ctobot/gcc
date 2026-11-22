@@ -3239,13 +3239,11 @@ build_counted_by_ref (tree datum, tree subdatum,
     }
   while (counted_by_field);
 
-  /* The count is read through its address in .ACCESS_WITH_SIZE and written
-     through the pointer __builtin_counted_by_ref returns, but the storage
-     order of a scalar is lost once its address is taken.  Ignore the
-     attribute for a count with reverse storage order, whose address cannot
-     be taken in the source either, rather than accessing the count with its
-     bytes swapped.  */
-  if (reverse_storage_order_for_component_p (counted_by_ref))
+  /* .ACCESS_WITH_SIZE and __builtin_counted_by_ref both need a pointer to
+     the count.  A pointer cannot describe a bit-field or carry the byte
+     order of a scalar field whose storage order is reversed.  */
+  if (DECL_C_BIT_FIELD (counted_by_subdatum)
+      || reverse_storage_order_for_component_p (counted_by_ref))
     return NULL_TREE;
 
   counted_by_ref = build_fold_addr_expr (counted_by_ref);

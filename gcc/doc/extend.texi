@@ -2678,8 +2678,8 @@ integer type.  Otherwise, the compiler reports an error and ignores
 the attribute.
 
 The compiler also ignores the attribute when the field that represents
-the number of the elements has reverse scalar storage order (see the
-@code{scalar_storage_order} attribute).
+the number of the elements is a bit-field or has reverse scalar storage
+order (see the @code{scalar_storage_order} attribute).
 
 When the field that represents the number of the elements is assigned a
 negative integer value, the compiler treats the value as zero.
