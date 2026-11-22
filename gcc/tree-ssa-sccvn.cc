@@ -2477,6 +2477,7 @@ vn_reference_lookup_2 (ao_ref *op, tree vuse, void *data_)
       tree base = ao_ref_base (op);
 
       if (base
+	  && !reverse_storage_order_for_component_p (vr->operands)
 	  && op->offset.is_constant (&op_offset)
 	  && op->size.is_constant (&op_size)
 	  && op->max_size_known_p ()

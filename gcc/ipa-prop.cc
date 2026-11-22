@@ -1489,6 +1489,8 @@ ipa_load_from_parm_agg (struct ipa_func_body_info *fbi,
     return false;
 
   tree base = get_ref_base_and_extent_hwi (op, offset_p, &size, &reverse);
+  if (reverse)
+    return false;
 
   if (base && (*offset_p / BITS_PER_UNIT) <= UINT_MAX)
     {
