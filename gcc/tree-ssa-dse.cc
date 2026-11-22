@@ -96,6 +96,23 @@ static void delete_dead_or_redundant_call (gimple_stmt_iterator *, const char *)
 static bitmap need_eh_cleanup;
 static bitmap need_ab_cleanup;
 
+/* Return true if the checked memory builtin at STMT can still reject the
+   requested length.  Changing the length or deleting the call would also
+   change that check.  */
+
+static bool
+dse_may_fail_length_check_p (gimple *stmt)
+{
+  if (gimple_call_num_args (stmt) != 4)
+    return false;
+  tree len = gimple_call_arg (stmt, 2);
+  tree limit = gimple_call_arg (stmt, 3);
+  return (!integer_zerop (len) && !integer_all_onesp (limit)
+	  && !(TREE_CODE (len) == INTEGER_CST
+	       && TREE_CODE (limit) == INTEGER_CST
+	       && tree_int_cst_le (len, limit)));
+}
+
 /* STMT is a statement that may write into memory.  Analyze it and
    initialize WRITE to describe how STMT affects memory.  When
    MAY_DEF_OK is true then the function initializes WRITE to what
@@ -494,12 +511,9 @@ compute_trims (ao_ref *ref, sbitmap live, int *trim_head, int *trim_tail,
 	 We could have a type with no TYPE_SIZE_UNIT or we could have a VLA
 	 where TYPE_SIZE_UNIT is not a constant.  A reference built from a
 	 pointer and a size has a char base with no relation to the size of
-	 the object the pointer points to, so it says nothing about bounds.
-	 Keep the old limit for checked builtins, since shortening the call
-	 would also shorten the length it checks.  */
+	 the object the pointer points to, so it says nothing about bounds.  */
       if (*trim_tail
-	  && (!ao_ref_from_ptr_p (ref)
-	      || (is_gimple_call (stmt) && gimple_call_num_args (stmt) == 4))
+	  && !ao_ref_from_ptr_p (ref)
 	  && TYPE_SIZE_UNIT (TREE_TYPE (ref->base))
 	  && TREE_CODE (TYPE_SIZE_UNIT (TREE_TYPE (ref->base))) == INTEGER_CST
 	  && compare_tree_int (TYPE_SIZE_UNIT (TREE_TYPE (ref->base)),
@@ -1039,7 +1053,8 @@ dse_optimize_redundant_stores (gimple *stmt)
 	      && (fndecl = gimple_call_fndecl (use_stmt)) != NULL
 	      && (DECL_FUNCTION_CODE (fndecl) == BUILT_IN_MEMSET
 		  || DECL_FUNCTION_CODE (fndecl) == BUILT_IN_MEMSET_CHK)
-	      && integer_zerop (gimple_call_arg (use_stmt, 1))))
+	      && integer_zerop (gimple_call_arg (use_stmt, 1))
+	      && !dse_may_fail_length_check_p (use_stmt)))
 	{
 	  ao_ref write;
 
@@ -1723,6 +1738,12 @@ dse_optimize_stmt (function *fun, gimple_stmt_iterator *gsi, sbitmap live_bytes)
 		 || DECL_FUNCTION_CODE (fndecl) == BUILT_IN_MEMSET_CHK)
 		&& integer_zerop (gimple_call_arg (stmt, 1)))
 	      dse_optimize_redundant_stores (stmt);
+
+	    /* A check that can fail must stay as it is, so don't try to delete
+	       or trim the call itself.  Later stores only run once the check
+	       has passed, so they can still be redundant with it.  */
+	    if (dse_may_fail_length_check_p (stmt))
+	      return;
 
 	    enum dse_store_status store_status;
 	    bool byte_tracking_enabled

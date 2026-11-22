@@ -13,4 +13,7 @@ main (void)
   return 0;
 }
 
-/* { dg-bogus "overflow" "" { target *-*-* } 10 } */
+/* The overflowing call is inlined into main, which isn't in a system header,
+   so the overflow is diagnosed despite -Wno-system-headers.  */
+/* { dg-warning "\\\[-Wstringop-overflow" "" { target *-*-* } 10 } */
+/* { dg-message "file included" "In file included" { target *-*-* } 0 } */
