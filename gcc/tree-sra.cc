@@ -2510,6 +2510,9 @@ sort_and_splice_var_accesses (tree var)
 	  grp_assignment_write |= ac2->grp_assignment_write;
 	  grp_partial_lhs |= ac2->grp_partial_lhs;
 	  unscalarizable_region |= ac2->grp_unscalarizable_region;
+	  /* One scalar cannot represent both byte orders of the same bytes.  */
+	  if (is_gimple_reg_type (ac2->type) && ac2->reverse != access->reverse)
+	    unscalarizable_region = true;
 	  relink_to_new_repr (access, ac2);
 
 	  /* If there are both aggregate-type and scalar-type accesses with
@@ -3213,6 +3216,16 @@ propagate_subaccesses_from_rhs (struct access *lacc, struct access *racc)
 	}
     }
 
+  /* A copy between two scalar replacements copies a value, which is only a copy
+     of the bytes when both sides give them the same storage order.  */
+  if (is_gimple_reg_type (lacc->type)
+      && is_gimple_reg_type (racc->type)
+      && lacc->reverse != racc->reverse)
+    {
+      lacc->grp_unscalarizable_region = 1;
+      racc->grp_unscalarizable_region = 1;
+    }
+
   if (is_gimple_reg_type (lacc->type)
       || lacc->grp_unscalarizable_region
       || racc->grp_unscalarizable_region)
@@ -3265,6 +3278,13 @@ propagate_subaccesses_from_rhs (struct access *lacc, struct access *racc)
 	      lacc->grp_same_access_path = false;
 	    }
 	  lacc->reverse = reverse;
+	  /* The scalar on the RHS may not have the storage order of the
+	     aggregate type, e.g., when it comes from a folded memcpy.  */
+	  if (reverse != racc->reverse)
+	    {
+	      lacc->grp_unscalarizable_region = 1;
+	      racc->grp_unscalarizable_region = 1;
+	    }
 	}
       return ret;
     }
@@ -4462,7 +4482,10 @@ load_assign_lhs_subreplacements (struct access *lacc,
 	  tree rhs;
 
 	  racc = find_access_in_subtree (sad->top_racc, offset, lacc->size);
-	  if (racc && racc->grp_to_be_replaced)
+	  /* Replacements of opposite storage orders hold different values for
+	     the same bytes, so go through the aggregate for those.  */
+	  if (racc && racc->grp_to_be_replaced
+	      && racc->reverse == lacc->reverse)
 	    {
 	      rhs = get_access_replacement (racc);
 	      bool vce = false;
@@ -4518,7 +4541,8 @@ load_assign_lhs_subreplacements (struct access *lacc,
 							    offset,
 							    lacc->size);
 
-	      if (racc && racc->grp_to_be_replaced)
+	      if (racc && racc->grp_to_be_replaced
+		  && racc->reverse == lacc->reverse)
 		{
 		  if (racc->grp_write || constant_decl_p (racc->base))
 		    drhs = get_access_replacement (racc);
