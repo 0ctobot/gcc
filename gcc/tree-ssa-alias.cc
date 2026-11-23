@@ -1638,6 +1638,11 @@ ref_indexes_short_array_p (tree ref, tree stop)
 	  && TREE_CODE (ref) != ARRAY_RANGE_REF)
 	continue;
       tree index = TREE_OPERAND (ref, 1);
+      /* The C++ front end gives a [0] array the bounds [0, SIZE_MAX] rather
+	 than leaving the upper bound open, so recognize one by its size.  */
+      tree size = TYPE_SIZE (TREE_TYPE (TREE_OPERAND (ref, 0)));
+      if (size && integer_zerop (size))
+	return true;
       tree low = array_ref_low_bound (ref);
       tree high = array_ref_up_bound (ref);
       if (TREE_CODE (index) == INTEGER_CST)
