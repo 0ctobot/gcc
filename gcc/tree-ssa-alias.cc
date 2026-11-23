@@ -4523,7 +4523,9 @@ ao_compare::compare_ao_refs (ao_ref *ref1, ao_ref *ref2,
 			     bool lto_streaming_safe,
 			     bool tbaa)
 {
-  if (TREE_THIS_VOLATILE (ref1->ref) != TREE_THIS_VOLATILE (ref2->ref))
+  if (TREE_THIS_VOLATILE (ref1->ref) != TREE_THIS_VOLATILE (ref2->ref)
+      || (reverse_storage_order_for_component_p (ref1->ref)
+	  != reverse_storage_order_for_component_p (ref2->ref)))
     return SEMANTICS;
   tree base1 = ao_ref_base (ref1);
   tree base2 = ao_ref_base (ref2);
