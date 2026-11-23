@@ -4004,9 +4004,15 @@ vn_reference_lookup_3 (ao_ref *ref, tree vuse, void *data_,
   /* 6) For memcpy copies translate the reference through them if the copy
      kills ref.  But we cannot (easily) do this translation if the memcpy is
      a storage order barrier, i.e. is equivalent to a VIEW_CONVERT_EXPR that
-     can modify the storage order of objects (see storage_order_barrier_p).  */
+     can modify the storage order of objects (see storage_order_barrier_p).
+     Nor can we translate a reverse-order load, since the translated reference
+     reads the source in native order.  The checks of the arguments below only
+     catch the address of a reverse-order aggregate, not a pointer to one held
+     in an SSA name.  */
   else if (data->vn_walk_kind == VN_WALKREWRITE
 	   && is_gimple_reg_type (vr->type)
+	   && !reverse_storage_order_for_component_p (vr->operands)
+	   && !contains_storage_order_barrier_p (vr->operands)
 	   /* ???  Handle BCOPY as well.  */
 	   && (gimple_call_builtin_p (def_stmt, BUILT_IN_MEMCPY)
 	       || gimple_call_builtin_p (def_stmt, BUILT_IN_MEMCPY_CHK)
