@@ -77,6 +77,7 @@ static bool merge_object_sizes (struct object_size_info *, tree, tree);
 static bool plus_stmt_object_size (struct object_size_info *, tree, gimple *);
 static bool object_size_variable_offset_p (tree, bool = false);
 static bool object_size_may_step_back_p (tree);
+static bool object_size_step_repeats_p (tree, tree);
 static bool object_size_step_returns_p (tree, tree, tree);
 static bool object_size_offset_steps_back_p (tree, bool);
 static bool cond_expr_object_size (struct object_size_info *, tree, gimple *);
@@ -2819,9 +2820,13 @@ plus_stmt_object_size (struct object_size_info *osi, tree var, gimple *stmt)
 	    {
 	      /* If VAR is in a dependency loop through OP0, then OP0 was
 		 already visited or walking it gets back to VAR and marks it for
-		 reexamination.  A loop entered elsewhere can get past this,
-		 which can only make the maximum larger.  */
-	      in_loop = bitmap_bit_p (osi->visited, SSA_NAME_VERSION (op0));
+		 reexamination.  OP0 was also visited already when another
+		 pointer computed from it got walked first, e.g., an earlier
+		 argument of the same PHI, so it only counts when the chain
+		 behind OP0 leads back to VAR.  A loop entered elsewhere can
+		 get past this, which can only make the maximum larger.  */
+	      in_loop = (bitmap_bit_p (osi->visited, SSA_NAME_VERSION (op0))
+			 && object_size_step_repeats_p (var, op0));
 	      collect_object_sizes_for (osi, op0);
 	      in_loop |= bitmap_bit_p (osi->reexamine, varno);
 	    }
