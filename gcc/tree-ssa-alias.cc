@@ -49,6 +49,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "builtins.h"
 #include "internal-fn.h"
 #include "ipa-utils.h"
+#include "tree-cfg.h"
 
 /* Broad overview of how alias analysis on gimple works:
 
@@ -3731,11 +3732,11 @@ stmt_kills_ref_p (gimple *stmt, ao_ref *ref)
 	 ???  We only need to care about the RHS throwing.  For aggregate
 	 assignments or similar calls and non-call exceptions the LHS
 	 might throw as well.
-	 ???  We also should care about possible longjmp, but since we
-	 do not understand that longjmp is not using global memory we will
-	 not consider a kill here since the function call will be considered
-	 as possibly using REF.	 */
+	 A call that can return abnormally into the current function, through a
+	 longjmp or a nonlocal goto, doesn't assign its result when it leaves
+	 that way either.  */
       && !stmt_can_throw_internal (cfun, stmt)
+      && !stmt_can_make_abnormal_goto (stmt)
       && (!stmt_can_throw_external (cfun, stmt)
 	  || !ref_may_alias_global_p (ref, false)))
     {
@@ -3834,6 +3835,10 @@ stmt_kills_ref_p (gimple *stmt, ao_ref *ref)
 	  && node->binds_to_current_def_p ()
 	  && (summary = get_modref_function_summary (node)) != NULL
 	  && summary->kills.length ()
+	  /* The kills only hold when the callee returns normally.  A call that
+	     can return abnormally into this function, through a longjmp or a
+	     nonlocal goto, can leave before it stores.  */
+	  && !stmt_can_make_abnormal_goto (stmt)
 	  /* Check that we can not trap while evaluating function
 	     parameters.  This check is overly conservative.  */
 	  && (!cfun->can_throw_non_call_exceptions

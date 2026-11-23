@@ -211,8 +211,13 @@ initialize_ao_ref_for_dse (gimple *stmt, ao_ref *write, bool may_def_ok = false)
     }
   if (tree lhs = gimple_get_lhs (stmt))
     {
+      /* A statement that throws doesn't store to its LHS, and neither does a
+	 call that returns abnormally into this function through a longjmp or a
+	 nonlocal goto.  */
       if (TREE_CODE (lhs) != SSA_NAME
-	  && (may_def_ok || !stmt_could_throw_p (cfun, stmt)))
+	  && (may_def_ok
+	      || (!stmt_could_throw_p (cfun, stmt)
+		  && !stmt_can_make_abnormal_goto (stmt))))
 	{
 	  ao_ref_init (write, lhs);
 	  return true;
@@ -387,7 +392,8 @@ clear_bytes_written_by (sbitmap live_bytes, gimple *stmt, ao_ref *ref)
       bool interposed;
       modref_summary *summary = get_modref_function_summary (call, &interposed);
 
-      if (summary && !interposed)
+      /* The kills only hold when the callee returns normally.  */
+      if (summary && !interposed && !stmt_can_make_abnormal_goto (call))
 	for (auto kill : summary->kills)
 	  if (kill.get_ao_ref (as_a <gcall *> (stmt), &write))
 	    clear_live_bytes_for_ref (live_bytes, ref, &write);

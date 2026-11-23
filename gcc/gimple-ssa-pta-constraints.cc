@@ -1646,17 +1646,21 @@ handle_call_arg (gcall *stmt, tree arg, vec<ce_s> *results, int flags,
 
    IMPLICIT_EAF_FLAGS are added to each function argument.  If
    WRITES_GLOBAL_MEMORY is true function is assumed to possibly write to global
-   memory.  Similar for READS_GLOBAL_MEMORY.  */
+   memory.  Similar for READS_GLOBAL_MEMORY.  If CALLEE_INFO is false, don't
+   narrow down these effects with the callee's summary or the call's argument
+   flags.  */
 
 static void
 handle_rhs_call (gcall *stmt, vec<ce_s> *results,
 		 int implicit_eaf_flags,
 		 bool writes_global_memory,
-		 bool reads_global_memory)
+		 bool reads_global_memory,
+		 bool callee_info = true)
 {
-  determine_global_memory_access (stmt, &writes_global_memory,
-				  &reads_global_memory,
-				  NULL);
+  if (callee_info)
+    determine_global_memory_access (stmt, &writes_global_memory,
+				    &reads_global_memory,
+				    NULL);
 
   varinfo_t callescape = new_var_info (NULL_TREE, "callescape", true);
 
@@ -1682,7 +1686,7 @@ handle_rhs_call (gcall *stmt, vec<ce_s> *results,
   for (unsigned i = 0; i < gimple_call_num_args (stmt); ++i)
     {
       tree arg = gimple_call_arg (stmt, i);
-      int flags = gimple_call_arg_flags (stmt, i);
+      int flags = callee_info ? gimple_call_arg_flags (stmt, i) : 0;
       handle_call_arg (stmt, arg, results,
 		       flags | implicit_eaf_flags,
 		       callescape->id, writes_global_memory);
@@ -1692,7 +1696,7 @@ handle_rhs_call (gcall *stmt, vec<ce_s> *results,
   if (gimple_call_chain (stmt))
     handle_call_arg (stmt, gimple_call_chain (stmt), results,
 		     implicit_eaf_flags
-		     | gimple_call_static_chain_flags (stmt),
+		     | (callee_info ? gimple_call_static_chain_flags (stmt) : 0),
 		     callescape->id, writes_global_memory);
 
   /* And if we applied NRV the address of the return slot escapes as well.  */
@@ -1700,7 +1704,7 @@ handle_rhs_call (gcall *stmt, vec<ce_s> *results,
       && gimple_call_lhs (stmt) != NULL_TREE
       && TREE_ADDRESSABLE (TREE_TYPE (gimple_call_lhs (stmt))))
     {
-      int flags = gimple_call_retslot_flags (stmt);
+      int flags = callee_info ? gimple_call_retslot_flags (stmt) : 0;
       const int relevant_flags = EAF_NO_DIRECT_ESCAPE
 				 | EAF_NOT_RETURNED_DIRECTLY;
 
@@ -2271,6 +2275,18 @@ find_func_aliases_for_builtin_call (struct function *fn, gcall *t)
   return false;
 }
 
+/* Return true if call T can transfer control back into FN through a longjmp or
+   a nonlocal goto.  This is call_can_make_abnormal_goto with the function
+   passed in, since IPA PTA runs without cfun.  */
+
+static bool
+call_can_return_abnormally_p (struct function *fn, gcall *t)
+{
+  return ((fn->has_nonlocal_label || fn->calls_setjmp)
+	  && gimple_has_side_effects (t)
+	  && !(gimple_call_flags (t) & ECF_LEAF));
+}
+
 /* Create constraints for the call T.  */
 
 static void
@@ -2313,9 +2329,15 @@ find_func_aliases_for_call (struct function *fn, gcall *t)
       auto_vec<ce_s, 16> rhsc;
       int flags = gimple_call_flags (t);
 
+      /* A call that can return abnormally into FN may have stored through its
+	 arguments or let them escape before it jumped.  Its ECF flags and the
+	 callee's summary leave out what happens before a call that doesn't
+	 return, so treat it as an unknown call.  */
+      if (call_can_return_abnormally_p (fn, t))
+	handle_rhs_call (t, &rhsc, 0, true, true, false);
       /* Const functions can return their arguments and addresses
 	 of global memory but not of escaped memory.  */
-      if (flags & (ECF_CONST|ECF_NOVOPS))
+      else if (flags & (ECF_CONST|ECF_NOVOPS))
 	{
 	  if (gimple_call_lhs (t))
 	    handle_rhs_call (t, &rhsc, implicit_const_eaf_flags, false, false);
