@@ -154,11 +154,9 @@ set_inlining_locations (const diagnostics::context &,
 	 location for the original location and bump up NSYSLOCS if
 	 it's in a system header since it's not counted above.  */
       location_t sysloc = expansion_point_location_if_in_system_header (loc);
-      if (sysloc != loc)
-	{
-	  loc = sysloc;
-	  ++nsyslocs;
-	}
+      if (sysloc != loc || in_system_header_at (loc))
+	++nsyslocs;
+      loc = sysloc;
     }
   else
     {
