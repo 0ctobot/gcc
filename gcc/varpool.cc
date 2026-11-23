@@ -558,9 +558,13 @@ varpool_node::analyze (void)
   if (!analyzed)
     {
       gcc_assert (!in_lto_p || symtab->function_flags_ready);
-      /* Compute the alignment early so function body expanders are
-	 already informed about increased alignment.  */
-      align_variable (decl, 0);
+      /* Compute the alignment early so function body expanders are already
+	 informed about increased alignment.  An alias has no storage of its own
+	 to align, and the storage it names can be less aligned than the alias's
+	 own declaration would get, e.g., when only the target has the aligned
+	 attribute.  Leave an alias at the alignment of its declaration.  */
+      if (!alias)
+	align_variable (decl, 0);
     }
   if (alias)
     resolve_alias (varpool_node::get (alias_target));
