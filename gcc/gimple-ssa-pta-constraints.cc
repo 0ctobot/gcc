@@ -2531,6 +2531,16 @@ find_func_aliases (struct function *fn, gimple *origt)
       if ((lhsop = get_base_address (lhsop)) != NULL_TREE
 	  && DECL_P (lhsop))
 	{
+	  /* IPA mode only marks the ultimate alias target of a variable as an
+	     escape point, and a store through one of its aliases is a store to
+	     the target.  */
+	  if (VAR_P (lhsop) && (TREE_STATIC (lhsop) || DECL_EXTERNAL (lhsop)))
+	    {
+	      varpool_node *node = varpool_node::get (lhsop);
+	      if (node && node->alias && node->analyzed)
+		lhsop = node->ultimate_alias_target ()->decl;
+	    }
+
 	  varinfo_t vi = get_vi_for_tree (lhsop);
 	  if ((! in_ipa_mode && vi->is_global_var)
 	      || vi->is_ipa_escape_point)
