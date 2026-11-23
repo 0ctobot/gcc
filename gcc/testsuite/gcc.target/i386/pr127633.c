@@ -8,7 +8,7 @@ short w, y, z, ar, as, at, au, av, aw, ax = -156, ay, az, ba;
 long bb = -38, bc, bd, be, bf;
 double bg, bh, *bi;
 char bj;
-int a(unsigned bk, unsigned bl) {
+int a(int bk, int bl) {
   return bk^bl;
 }
 [[gnu::noinline,gnu::noclone]]
