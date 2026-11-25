@@ -4722,11 +4722,13 @@ static void clear_padding_type (clear_padding_struct *, tree,
 
 /* Clear padding for a bit-field FIELD.  Helper function for
    clear_padding_type (to handle bit-fields in RECORD_TYPE) and
-   clear_padding_union (to handle bit-fields in UNION_TYPE).  */
+   clear_padding_union (to handle bit-fields in UNION_TYPE).  REVERSE is
+   true if the aggregate has reverse scalar storage order, in which case
+   the bits are numbered as on a target of the opposite endianness.  */
 
 static HOST_WIDE_INT
 clear_padding_bitfield (clear_padding_struct *buf, tree field,
-			HOST_WIDE_INT pos, HOST_WIDE_INT cur_pos)
+			HOST_WIDE_INT pos, HOST_WIDE_INT cur_pos, bool reverse)
 {
   HOST_WIDE_INT fldsz = TYPE_PRECISION (TREE_TYPE (field));
   HOST_WIDE_INT bpos = tree_to_uhwi (DECL_FIELD_BIT_OFFSET (field));
@@ -4789,7 +4791,7 @@ clear_padding_bitfield (clear_padding_struct *buf, tree field,
   if (BYTES_BIG_ENDIAN != WORDS_BIG_ENDIAN)
     sorry_at (buf->loc, "PDP11 bit-field handling unsupported"
 			" in %qs", "__builtin_clear_padding");
-  else if (BYTES_BIG_ENDIAN)
+  else if (reverse ? !BYTES_BIG_ENDIAN : BYTES_BIG_ENDIAN)
     {
       /* Big endian.  */
       if (bpos + fldsz <= BITS_PER_UNIT)
@@ -4900,8 +4902,9 @@ clear_padding_union (clear_padding_struct *buf, tree type,
 	memset (union_buf->buf, ~0, start_size);
 	if (DECL_BIT_FIELD (field))
 	  {
-	    HOST_WIDE_INT cur_pos = clear_padding_bitfield (union_buf, field,
-							    0, 0);
+	    HOST_WIDE_INT cur_pos
+	      = clear_padding_bitfield (union_buf, field, 0, 0,
+					TYPE_REVERSE_STORAGE_ORDER (type));
 	    gcc_assert (cur_pos == fldsz);
 	  }
 	else
@@ -5132,7 +5135,8 @@ clear_padding_type (clear_padding_struct *buf, tree type,
 		    clear_padding_add_padding (buf, pos - cur_pos);
 		    cur_pos = pos;
 		  }
-		cur_pos = clear_padding_bitfield (buf, field, pos, cur_pos);
+		cur_pos = clear_padding_bitfield (buf, field, pos, cur_pos,
+						  TYPE_REVERSE_STORAGE_ORDER (type));
 	      }
 	    else if (DECL_SIZE_UNIT (field) == NULL_TREE)
 	      {
