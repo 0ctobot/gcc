@@ -240,6 +240,7 @@ extern tree default_builtin_tm_load_store (tree);
 extern int default_memory_move_cost (machine_mode, reg_class_t, bool);
 extern int default_register_move_cost (machine_mode, reg_class_t,
 				       reg_class_t);
+extern unsigned int default_callee_save_pair_regno (unsigned int);
 extern int default_callee_save_cost (spill_cost_type, unsigned int,
 				     machine_mode, unsigned int, int,
 				     const HARD_REG_SET &, bool);

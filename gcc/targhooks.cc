@@ -2165,6 +2165,14 @@ default_callee_save_cost (spill_cost_type spill_type, unsigned int,
   return mem_cost;
 }
 
+/* The default implementation of TARGET_CALLEE_SAVE_PAIR_REGNO.  */
+
+unsigned int
+default_callee_save_pair_regno (unsigned int)
+{
+  return INVALID_REGNUM;
+}
+
 /* The default implementation of TARGET_FRAME_ALLOCATION_COST.  */
 
 int

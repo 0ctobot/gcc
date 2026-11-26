@@ -17450,6 +17450,23 @@ aarch64_count_above_hard_fp_saves (const HARD_REG_SET &callee_saved_regs)
   return aarch64_count_saves (callee_saved_regs, POINTER_REGS);
 }
 
+/* Implement TARGET_CALLEE_SAVE_PAIR_REGNO.  aarch64_components_for_bb
+   saves a callee-saved register together with the register in the
+   adjacent frame slot, so that separately shrink-wrapped saves can still
+   use STP and LDP.  Register allocation doesn't know the final frame
+   layout, so assume the usual one, in which x19 and x20 share an STP,
+   as do x21 and x22 and so on, and likewise d8 and d9.  */
+
+static unsigned int
+aarch64_callee_save_pair_regno (unsigned int regno)
+{
+  if (IN_RANGE (regno, R19_REGNUM, R28_REGNUM))
+    return R19_REGNUM + ((regno - R19_REGNUM) ^ 1);
+  if (IN_RANGE (regno, V8_REGNUM, V15_REGNUM))
+    return V8_REGNUM + ((regno - V8_REGNUM) ^ 1);
+  return INVALID_REGNUM;
+}
+
 /* Implement TARGET_CALLEE_SAVE_COST.  */
 static int
 aarch64_callee_save_cost (spill_cost_type spill_type, unsigned int regno,
@@ -35584,6 +35601,9 @@ aarch64_libgcc_floating_mode_supported_p
 
 #undef TARGET_CALLEE_SAVE_COST
 #define TARGET_CALLEE_SAVE_COST aarch64_callee_save_cost
+
+#undef TARGET_CALLEE_SAVE_PAIR_REGNO
+#define TARGET_CALLEE_SAVE_PAIR_REGNO aarch64_callee_save_pair_regno
 
 #undef TARGET_FRAME_ALLOCATION_COST
 #define TARGET_FRAME_ALLOCATION_COST aarch64_frame_allocation_cost

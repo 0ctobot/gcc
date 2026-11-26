@@ -1866,6 +1866,49 @@ allocno_save_bb (ira_allocno_t a)
   return regno_save_bb[regno];
 }
 
+/* Return the allocated callee-saved register that the target saves together
+   with HARD_REGNO, or INVALID_REGNUM if there is none.  */
+
+static unsigned int
+callee_save_partner (int hard_regno)
+{
+  unsigned int partner = targetm.callee_save_pair_regno (hard_regno);
+  if (partner == INVALID_REGNUM
+      || partner == (unsigned int) hard_regno
+      || !TEST_HARD_REG_BIT (allocated_callee_save_regs, partner))
+    return INVALID_REGNUM;
+  return partner;
+}
+
+/* Return the blocks in which a save of HARD_REGNO is already expected.  Since
+   the target saves a register together with its pair register, these are the
+   blocks that either of them needs a save in.  */
+
+static auto_vec<basic_block>
+callee_save_blocks (int hard_regno)
+{
+  auto_vec<basic_block> bbs;
+  bbs.safe_splice (callee_save_bbs[hard_regno]);
+  unsigned int partner = callee_save_partner (hard_regno);
+  if (partner != INVALID_REGNUM)
+    for (basic_block bb : callee_save_bbs[partner])
+      if (!bbs.contains (bb))
+	bbs.safe_push (bb);
+  return bbs;
+}
+
+/* Return true if one of the saves in BBS is in SAVE_BB or in a block that
+   dominates it.  */
+
+static bool
+callee_save_bbs_cover_p (const vec<basic_block> &bbs, basic_block save_bb)
+{
+  for (basic_block bb : bbs)
+    if (bb == save_bb || dominated_by_p (CDI_DOMINATORS, save_bb, bb))
+      return true;
+  return false;
+}
+
 /* Return true if one of the saves already expected for HARD_REGNO is in
    SAVE_BB or in a block that dominates it, which makes a save in SAVE_BB
    redundant.  */
@@ -1873,10 +1916,23 @@ allocno_save_bb (ira_allocno_t a)
 static bool
 callee_save_covered_p (int hard_regno, basic_block save_bb)
 {
-  for (basic_block bb : callee_save_bbs[hard_regno])
-    if (bb == save_bb || dominated_by_p (CDI_DOMINATORS, save_bb, bb))
-      return true;
-  return false;
+  if (callee_save_bbs_cover_p (callee_save_bbs[hard_regno], save_bb))
+    return true;
+  unsigned int partner = callee_save_partner (hard_regno);
+  return (partner != INVALID_REGNUM
+	  && callee_save_bbs_cover_p (callee_save_bbs[partner], save_bb));
+}
+
+/* Return true if a save of HARD_REGNO is already expected in BB, either
+   for the register itself or for its pair register.  */
+
+static bool
+callee_save_expected_in_p (int hard_regno, basic_block bb)
+{
+  if (callee_save_bbs[hard_regno].contains (bb))
+    return true;
+  unsigned int partner = callee_save_partner (hard_regno);
+  return partner != INVALID_REGNUM && callee_save_bbs[partner].contains (bb);
 }
 
 /* Return the callee-saved registers that are already expected to be saved in
@@ -1884,7 +1940,8 @@ callee_save_covered_p (int hard_regno, basic_block save_bb)
    with their saves, such as an STP that saves a pair of registers on aarch64.
    A register that only colder code needs is left out, since separate
    shrink-wrapping saves it elsewhere, and pairing with it would move its save
-   into SAVE_BB as well.  */
+   into SAVE_BB as well.  A register whose pair register is saved in SAVE_BB
+   is included, since the target saves the two together.  */
 
 static HARD_REG_SET
 callee_saves_in_bb (basic_block save_bb)
@@ -1895,7 +1952,7 @@ callee_saves_in_bb (basic_block save_bb)
   HARD_REG_SET regs = {};
   for (int regno = 0; regno < FIRST_PSEUDO_REGISTER; regno++)
     if (TEST_HARD_REG_BIT (allocated_callee_save_regs, regno)
-	&& callee_save_bbs[regno].contains (save_bb))
+	&& callee_save_expected_in_p (regno, save_bb))
       SET_HARD_REG_BIT (regs, regno);
   return regs;
 }
@@ -1913,7 +1970,7 @@ callee_save_extra_freq (int hard_regno, basic_block save_bb)
 
   int freq = REG_FREQ_FROM_BB (save_bb);
 
-  for (basic_block bb : callee_save_bbs[hard_regno])
+  for (basic_block bb : callee_save_blocks (hard_regno))
     if (dominated_by_p (CDI_DOMINATORS, bb, save_bb))
       freq -= REG_FREQ_FROM_BB (bb);
   return MAX (freq, 0);
@@ -1930,11 +1987,13 @@ callee_save_extra_cost (int hard_regno, machine_mode mode, basic_block save_bb)
 {
   int nregs = hard_regno_nregs (hard_regno, mode);
   enum reg_class rclass = REGNO_REG_CLASS (hard_regno);
-  const HARD_REG_SET no_saves = {};
   int cost = 0;
 
   if (!regno_save_bb.exists ())
     return 0;
+
+  /* The callee-saved registers that a save in SAVE_BB can pair with.  */
+  HARD_REG_SET save_bb_regs = callee_saves_in_bb (save_bb);
 
   for (int i = 0; i < nregs; i++)
     {
@@ -1945,14 +2004,15 @@ callee_save_extra_cost (int hard_regno, machine_mode mode, basic_block save_bb)
 	  || (freq = callee_save_extra_freq (regno, save_bb)) == 0)
 	continue;
 
-      /* Pass an empty set of saved registers, which prices the save and the
-	 restore as a separate store and load.  Passing the registers saved in
-	 the prologue would let the target price them as sharing instructions
-	 with other saves there, which is unlikely for a save that
-	 shrink-wrapping places elsewhere.  */
+      /* Price the extra save as calculate_saved_regs_cost prices the save
+	 of a callee-saved register that nothing uses yet, letting it pair
+	 only with the registers expected to be saved in SAVE_BB.  Otherwise a
+	 register whose other saves are on an unrelated path looks more
+	 expensive than a new one, although both need the same save in
+	 SAVE_BB.  */
       int save_cost = targetm.callee_save_cost
 	(spill_cost_type::SAVE, regno, mode, 1,
-	 ira_memory_move_cost[mode][rclass][0] / nregs, no_saves, true);
+	 ira_memory_move_cost[mode][rclass][0] / nregs, save_bb_regs, true);
       /* Apply the same bias that assign_hard_reg gives to the save of a
 	 callee-saved register that nothing uses yet.  Otherwise the bias
 	 makes that register cheaper than one that is only saved in an
@@ -1964,7 +2024,7 @@ callee_save_extra_cost (int hard_regno, machine_mode mode, basic_block save_bb)
       cost += freq * save_cost;
       cost += freq * targetm.callee_save_cost
 	(spill_cost_type::RESTORE, regno, mode, 1,
-	 ira_memory_move_cost[mode][rclass][1] / nregs, no_saves, true);
+	 ira_memory_move_cost[mode][rclass][1] / nregs, save_bb_regs, true);
     }
   return cost;
 }

@@ -7165,6 +7165,20 @@ or deallocation cost returned by @code{TARGET_FRAME_ALLOCATION_COST},
 where appropriate.
 @end deftypefn
 
+@deftypefn {Target Hook} {unsigned int} TARGET_CALLEE_SAVE_PAIR_REGNO (unsigned int @var{regno})
+If separate shrink-wrapping saves callee-saved register @var{regno}
+together with another callee-saved register, so that wherever one of
+them needs a save both are saved there by a shared instruction, return
+the other register.  Return @code{INVALID_REGNUM} otherwise.
+
+The register allocator uses this hook to estimate where the save of a
+callee-saved register will be placed: when only colder code uses a
+register but its pair register is saved in the prologue, both are saved
+in the prologue.
+
+The default implementation returns @code{INVALID_REGNUM}.
+@end deftypefn
+
 @deftypefn {Target Hook} int TARGET_FRAME_ALLOCATION_COST (frame_cost_type @var{cost_type}, const HARD_REG_SET @var{&allocated_callee_regs})
 Return the cost of allocating or deallocating a frame for the sake of
 a spill; @var{cost_type} chooses between allocation and deallocation.

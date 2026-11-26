@@ -3978,6 +3978,22 @@ where appropriate.",
  default_callee_save_cost)
 
 DEFHOOK
+(callee_save_pair_regno,
+ "If separate shrink-wrapping saves callee-saved register @var{regno}\n\
+together with another callee-saved register, so that wherever one of\n\
+them needs a save both are saved there by a shared instruction, return\n\
+the other register.  Return @code{INVALID_REGNUM} otherwise.\n\
+\n\
+The register allocator uses this hook to estimate where the save of a\n\
+callee-saved register will be placed: when only colder code uses a\n\
+register but its pair register is saved in the prologue, both are saved\n\
+in the prologue.\n\
+\n\
+The default implementation returns @code{INVALID_REGNUM}.",
+ unsigned int, (unsigned int regno),
+ default_callee_save_pair_regno)
+
+DEFHOOK
 (frame_allocation_cost,
  "Return the cost of allocating or deallocating a frame for the sake of\n\
 a spill; @var{cost_type} chooses between allocation and deallocation.\n\
